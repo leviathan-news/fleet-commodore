@@ -936,6 +936,16 @@ def poll():
     except Exception as exc:
         sys.exit(f"ERROR: Failed getMe: {exc}")
 
+    # Clear any stale webhook left behind by a prior deploy. Without this,
+    # getUpdates returns 409 Conflict indefinitely if the token was ever
+    # used with a webhook (or an old poll session is still held on Telegram's
+    # side). We keep pending updates so we don't miss messages during
+    # restarts — only the webhook registration is dropped.
+    try:
+        tg_request("deleteWebhook", {"drop_pending_updates": False})
+    except Exception as exc:
+        log.warning("deleteWebhook at startup failed (non-fatal): %s", exc)
+
     while True:
         try:
             updates = tg_request("getUpdates", {
@@ -1039,8 +1049,21 @@ def poll():
             log.info("Shutting down")
             break
         except Exception as exc:
-            log.error("Poll error: %s", exc)
-            time.sleep(5)
+            # 409 Conflict = another getUpdates poller is active (or Telegram's
+            # server still holds a stale session). deleteWebhook is idempotent
+            # and harmless; call it to drop any lingering state and let the
+            # next iteration re-poll cleanly.
+            exc_msg = str(exc)
+            if "409" in exc_msg or "Conflict" in exc_msg:
+                log.warning("Poll 409 — dropping stale poller state and retrying")
+                try:
+                    tg_request("deleteWebhook", {"drop_pending_updates": False})
+                except Exception:
+                    pass
+                time.sleep(10)
+            else:
+                log.error("Poll error: %s", exc)
+                time.sleep(5)
 
 
 if __name__ == "__main__":
