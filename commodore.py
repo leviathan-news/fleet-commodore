@@ -417,6 +417,40 @@ def _ensure_tables():
                 created_at TEXT NOT NULL
             )"""
         )
+        # pr_review: per-PR review requests with durable claim model.
+        # The partial unique index on claim_key prevents two concurrent active
+        # reviews of the same PR (any status except terminal ones). Terminal
+        # statuses (posted/failed/orphaned/superseded) are excluded so a later
+        # review of the same PR is always allowed once the prior one completes.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS pr_review (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_uuid TEXT UNIQUE NOT NULL,
+                claim_key TEXT NOT NULL,
+                requested_by_id INTEGER NOT NULL,
+                requested_by_username TEXT,
+                chat_id INTEGER NOT NULL,
+                topic_id INTEGER,
+                request_msg_id INTEGER,
+                repo TEXT NOT NULL,
+                pr_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                verdict TEXT,
+                findings_json TEXT,
+                diff_bytes INTEGER,
+                claude_tokens_in INTEGER,
+                claude_tokens_out INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                posted_at TEXT
+            )"""
+        )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_review_active_claim
+               ON pr_review(claim_key)
+               WHERE status IN ('queued', 'in_progress')"""
+        )
         conn.commit()
     except Exception as exc:
         log.warning("Failed to ensure SQLite tables: %s", exc)
@@ -573,7 +607,17 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
 def _post_relay_receipt(telegram_message_id, chat_id, topic_id, text):
     """After sendMessage, record the receipt with Leviathan's relay so the
     canonical AgentChatMessage store lands an attributed row (Mode B).
-    Failure here is non-fatal - the Telegram message already went out."""
+
+    Auth shape: the relay endpoint uses CSRFCookieJWTAuthentication which
+    requires the JWT be in a `Cookie: access_token=...` header AND a
+    matching `Origin: https://leviathannews.xyz` header for the Origin
+    CSRF check. Bearer auth returns 401 here — verified empirically
+    2026-04-17. The Leviathan auth.py example says Bearer is
+    "recommended for agents" but that holds for read endpoints, not
+    state-changing ones like the relay.
+
+    Failure here is non-fatal - the Telegram message already went out.
+    """
     if not LN_API_TOKEN:
         log.warning("LN_API_TOKEN not set - skipping relay receipt")
         return
@@ -583,18 +627,32 @@ def _post_relay_receipt(telegram_message_id, chat_id, topic_id, text):
         "telegram_message_id": telegram_message_id,
         "text": text[:4096],
     }
+    # Origin needed for CSRF, Cookie carries the JWT, Referer is a
+    # belt-and-braces signal that matches browser behaviour. The bot token
+    # MUST NOT leak into this request.
+    origin = LN_API_BASE.split("/api/")[0]
     req = urllib.request.Request(
         f"{LN_API_BASE}/agent-chat/post/",
         data=json.dumps(payload).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {LN_API_TOKEN}",
+            "Cookie": f"access_token={LN_API_TOKEN}",
+            "Origin": origin,
+            "Referer": f"{origin}/",
         },
     )
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             if resp.status >= 300:
                 log.warning("Relay receipt non-2xx: %s", resp.status)
+    except urllib.error.HTTPError as exc:
+        # HTTPError is the common path for 401/403 — log status + first
+        # few bytes of body so we know which auth layer rejected us.
+        try:
+            detail = exc.read()[:200].decode("utf-8", errors="replace")
+        except Exception:
+            detail = ""
+        log.warning("Relay receipt HTTP %s: %s", exc.code, detail)
     except Exception as exc:
         log.warning("Relay receipt failed: %s", exc)
 
@@ -1006,6 +1064,300 @@ def _detect_pr_request(text):
     return bool(_PR_REQUEST_RE.search(text))
 
 
+# --- PR review detection ---------------------------------------------------
+#
+# Two ways to invoke a review: natural-language regex OR slash command.
+# Both gate on admin + Bot-HQ-or-Lev-Dev policy.allow_pr.
+
+_PR_REVIEW_RE = re.compile(
+    r"\b(?:review|audit|check(?:\s+out)?|look(?:\s+at)?|assess)\s+"
+    # Noun: pr | pull request | dispatch. May optionally be followed by
+    # an ordinal marker (№, N°, no., #) before the number.
+    r"(?:pr|pull\s+request|dispatch)\s*"
+    r"(?:[№#]|n[°ºo]\.?|no\.?)?\s*"
+    r"(\d+)"
+    r"(?:\s+(?:in|on|for|of)\s+([\w\-./]+))?",
+    re.IGNORECASE,
+)
+# /review 253 | /review squid-bot 253 | /review leviathan-news/squid-bot 253
+_SLASH_REVIEW_RE = re.compile(
+    r"^/review(?:@\S+)?\s+(?:([\w\-./]+)\s+)?#?(\d+)\s*$",
+    re.IGNORECASE,
+)
+
+# Default repo when the requester says just "review PR 253".
+DEFAULT_REVIEW_REPO = "leviathan-news/squid-bot"
+
+# Allowlist of repos the Commodore may review. Matches GH_REPO_ALLOWLIST but
+# restated here for clarity — both must agree before a review can proceed.
+REVIEW_REPO_ALLOWLIST = GH_REPO_ALLOWLIST
+
+
+def _normalize_repo(repo_hint):
+    """Expand a bare repo name to its full leviathan-news/<name> form.
+
+    Accepts:
+      - "squid-bot"                     -> "leviathan-news/squid-bot"
+      - "leviathan-news/squid-bot"      -> unchanged
+      - "LEVIATHAN-NEWS/Squid-Bot"      -> case-normalized
+      - None / empty                    -> DEFAULT_REVIEW_REPO
+
+    Returns the normalized "owner/name" string if valid AND on the allowlist,
+    else None (caller must decline).
+    """
+    if not repo_hint:
+        return DEFAULT_REVIEW_REPO
+    hint = repo_hint.strip().lower()
+    if "/" not in hint:
+        hint = f"leviathan-news/{hint}"
+    # Case-insensitive match against the allowlist (the allowlist is lowercase).
+    for allowed in REVIEW_REPO_ALLOWLIST:
+        if hint == allowed.lower():
+            return allowed
+    return None
+
+
+def _detect_pr_review(text):
+    """Return (pr_number, normalized_repo) if text requests a review, else None.
+
+    Returns None if the repo hint is present but not on the allowlist — caller
+    should distinguish "no review intent" from "review intent for bad repo"
+    via a separate check. For v1 we collapse both to None and use a friendly
+    decline; operator experience is a lower priority than the safety gate.
+    """
+    if not text:
+        return None
+    m = _SLASH_REVIEW_RE.match(text.strip())
+    if m:
+        repo_hint, pr_str = m.group(1), m.group(2)
+    else:
+        m = _PR_REVIEW_RE.search(text)
+        if not m:
+            return None
+        pr_str, repo_hint = m.group(1), m.group(2)
+    try:
+        pr_number = int(pr_str)
+    except ValueError:
+        return None
+    if pr_number <= 0:
+        return None
+    repo = _normalize_repo(repo_hint)
+    if repo is None:
+        # Signal "intent detected but repo bad" with a sentinel tuple —
+        # caller can distinguish from None (no intent).
+        return (pr_number, None)
+    return (pr_number, repo)
+
+
+def _review_preflight():
+    """Return None if reviews are possible right now, else an in-character decline.
+
+    The preflight runs synchronously before enqueue; a failed preflight is what
+    lets the Commodore decline cleanly rather than overpromising.
+    """
+    # 1. Is gh CLI available as a launcher dependency? Coordinator uses it only
+    #    via `docker` in the container, so what we check is `docker` itself.
+    if not shutil.which("docker"):
+        return (
+            "The dockyard is shuttered — reviews are unavailable at this hour. "
+            "Pray consult the Harbour-Master."
+        )
+    # 2. GH PAT file present + readable?
+    gh_pat_path = Path(os.environ.get("GH_PAT_FILE", "~/.config/commodore/gh_pat")).expanduser()
+    if not gh_pat_path.exists():
+        return (
+            "The Admiralty's letters of marque have not been issued. "
+            "One cannot review a dispatch without credentials."
+        )
+    # 3. DB URL file present (for DB wrappers during review)?
+    db_url_path = Path(os.environ.get("COMMODORE_DB_URL_FILE", "~/.config/commodore/db_url")).expanduser()
+    if not db_url_path.exists():
+        return (
+            "The dockyard's chart-room is unmanned — reviews require access to "
+            "the Fleet's records, which are presently unavailable."
+        )
+    # 4. Admin list configured?
+    if not ADMIN_TELEGRAM_IDS:
+        return (
+            "No ranking officers have been commissioned. Reviews cannot proceed "
+            "without a chain of command."
+        )
+    # 5. Egress sidecars alive? `docker inspect` returns "true" or "false" on stdout.
+    for sidecar in ("commodore-egress-proxy", "commodore-db-tunnel"):
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", sidecar],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0 or "true" not in (result.stdout or "").lower():
+                return (
+                    "The Admiralty's signal-relay or dispatch-tunnel is inoperable; "
+                    "reviews unavailable until the dockyard restores them."
+                )
+        except (subprocess.TimeoutExpired, OSError):
+            return (
+                "The dockyard does not answer — reviews cannot be commissioned "
+                "at this hour."
+            )
+    # 6. Claude CLI circuit breaker open? Defer to the existing helper so the
+    #    decline phrasing is consistent with other LLM-gated paths.
+    if not _claude_is_available():
+        return (
+            "The Admiralty's signal-officer is indisposed — reviews "
+            "require the higher wits, and they are not presently available."
+        )
+    return None
+
+
+# Review coordinator queue + cooldowns (in-memory; SQLite is source of truth
+# for claims, these are hot-path optimizations).
+import queue as _queue_mod  # avoid polluting module-top imports
+_review_queue = _queue_mod.Queue(maxsize=20)
+# requester_telegram_user_id -> last-request timestamp. Floor of 5 min per user.
+_review_cooldown_by_user = {}
+REVIEW_COOLDOWN_S = int(os.environ.get("REVIEW_COOLDOWN_S", "300"))
+
+
+def _claim_review(msg, pr_number, repo):
+    """Attempt to create a pr_review row + enqueue for the worker.
+
+    Returns an in-character response string in all cases:
+    - Success: the "very well, stand by" ack (coordinator will post the real
+      review asynchronously as a threaded reply).
+    - Duplicate claim (same PR, active): distinct phrasing based on whether
+      the existing claim is the same requester or a different one.
+    - Cooldown: "one assessment per quarter-hour suffices."
+    - Queue full: "the assessment queue is at capacity; pray hold fire."
+
+    All failures are handled INSIDE this function so the caller doesn't need
+    to know about the failure modes — it just gets the formal reply to post.
+    """
+    import uuid as _uuid_mod
+    sender = msg.get("from", {}) or {}
+    requester_id = int(sender.get("id", 0))
+    requester_username = sender.get("username") or sender.get("first_name") or "unknown"
+    chat_id = msg.get("chat", {}).get("id", 0)
+    topic_id = msg.get("message_thread_id")
+    request_msg_id = msg.get("message_id")
+
+    # Per-requester cooldown.
+    last = _review_cooldown_by_user.get(requester_id, 0.0)
+    remaining = REVIEW_COOLDOWN_S - (time.time() - last)
+    if remaining > 0:
+        return (
+            f"The Admiralty entertains but one review per quarter-hour from "
+            f"any officer, @{requester_username}. Pray hold fire for a further "
+            f"{int(remaining)} seconds."
+        )
+
+    # Queue capacity.
+    if _review_queue.full():
+        return (
+            "The assessment queue is at its station's capacity. Pray hold fire "
+            "until the current dispatches have been rendered."
+        )
+
+    claim_key = f"{repo}#{pr_number}"
+    review_uuid = str(_uuid_mod.uuid4())
+    conn = None
+    try:
+        conn = sqlite3.connect(str(DB_FILE), timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.execute(
+                """INSERT INTO pr_review
+                   (review_uuid, claim_key, requested_by_id, requested_by_username,
+                    chat_id, topic_id, request_msg_id, repo, pr_number,
+                    status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+                (
+                    review_uuid, claim_key, requester_id, requester_username,
+                    chat_id, topic_id, request_msg_id, repo, pr_number,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Active claim already exists. Look it up to produce the right decline.
+            existing = conn.execute(
+                """SELECT requested_by_id, requested_by_username, status
+                     FROM pr_review
+                    WHERE claim_key = ? AND status IN ('queued', 'in_progress')
+                    ORDER BY id DESC LIMIT 1""",
+                (claim_key,),
+            ).fetchone()
+            if existing and int(existing[0]) == requester_id:
+                return (
+                    f"A review of dispatch N°{pr_number} of {repo} is already "
+                    f"underway by your own order, @{requester_username}. Pray "
+                    f"stand by for the formal assessment."
+                )
+            elif existing:
+                other = existing[1] or "another officer"
+                return (
+                    f"A review of dispatch N°{pr_number} of {repo} is presently "
+                    f"being conducted at @{other}'s request. One assessment "
+                    f"shall suffice — pray consult theirs when it lands."
+                )
+            # IntegrityError without a matching active row — shouldn't happen;
+            # log and decline conservatively.
+            log.warning("claim conflict on %s but no active row found", claim_key)
+            return (
+                "The Admiralty's records are momentarily incoherent. "
+                "Pray retry in a moment."
+            )
+    except sqlite3.Error as exc:
+        log.exception("pr_review claim DB error: %s", exc)
+        return (
+            "The Admiralty's log-book refuses the pen. Pray retry in a moment."
+        )
+    finally:
+        if conn:
+            conn.close()
+
+    # Claim succeeded. Enqueue for the coordinator thread.
+    job = {
+        "review_uuid": review_uuid,
+        "repo": repo,
+        "pr_number": pr_number,
+        "chat_id": chat_id,
+        "topic_id": topic_id,
+        "request_msg_id": request_msg_id,
+        "requested_by_id": requester_id,
+        "requested_by_username": requester_username,
+    }
+    try:
+        _review_queue.put_nowait(job)
+    except _queue_mod.Full:
+        # Race: passed the .full() check but got bumped out. Roll the row back
+        # to 'orphaned' so the claim releases.
+        try:
+            conn = sqlite3.connect(str(DB_FILE), timeout=10)
+            conn.execute(
+                "UPDATE pr_review SET status='orphaned', error='queue full after claim' "
+                "WHERE review_uuid=?",
+                (review_uuid,),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            pass
+        finally:
+            if conn:
+                conn.close()
+        return (
+            "The assessment queue filled the instant your order was logged. "
+            "Pray re-issue the commission shortly."
+        )
+
+    # Record the cooldown AFTER the claim is definitively queued.
+    _review_cooldown_by_user[requester_id] = time.time()
+
+    return (
+        f"Very well, @{requester_username} — the Admiralty takes up dispatch "
+        f"N°{pr_number} of {repo}. Stand by for the formal assessment."
+    )
+
+
 def _slug_from_text(text, max_len=40):
     base = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return (base[:max_len] or "request").rstrip("-")
@@ -1136,7 +1488,36 @@ def poll():
                     continue
 
                 response = None
-                if is_direct and _detect_pr_request(text):
+                # PR review flow takes priority over PR filing flow (narrower
+                # intent first): /review 253, "review PR 253", etc. Must be
+                # direct (@mention or reply to Commodore), admin, in a chat
+                # with allow_pr policy, and pass preflight + claim.
+                if is_direct and policy.get("allow_pr"):
+                    review_intent = _detect_pr_review(text)
+                    if review_intent is not None:
+                        pr_number, repo = review_intent
+                        if repo is None:
+                            # Intent detected but repo not on allowlist.
+                            response = (
+                                f"The Admiralty does not review dispatches "
+                                f"outside its commissioned fleet. Pray specify "
+                                f"a repository under the Leviathan flag."
+                            )
+                        elif not _is_admin(msg):
+                            response = (
+                                "The Admiralty does not entertain review orders "
+                                "from unranked crew. Pray enlist a ship's officer "
+                                "to issue the commission."
+                            )
+                        else:
+                            preflight_decline = _review_preflight()
+                            if preflight_decline is not None:
+                                response = preflight_decline
+                            else:
+                                response = _claim_review(msg, pr_number, repo)
+
+                # PR filing flow (existing stub) — only if review didn't match.
+                if response is None and is_direct and _detect_pr_request(text):
                     response = handle_pr_request(msg, policy)
 
                 if response is None:
