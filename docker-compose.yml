@@ -1,0 +1,11 @@
+services:
+  commodore:
+    build: .
+    container_name: leviathan-commodore
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./commodore.db:/app/commodore.db
+      - ~/commodore-secrets:/run/secrets:ro
+    # Ephemeral PR-authoring clones live inside /workspace in the container;
+    # no host mount for them — they're disposable per session.
