@@ -241,6 +241,47 @@ _WAGER_REFUSAL_TEXT = (
 )
 
 
+# --- The Nemesis: DeepSeaSquid ---------------------------------------------
+
+# Hardcoded because Telegram usernames are transferable but user_ids are forever.
+# If DeepSeaSquid's numeric id ever changes, update it here — not in config.
+# Public Leviathan display name is "DeepSeaSquid"; Telegram handle
+# "@DeepSeaSquid_bot". We match on any of these for robustness.
+NEMESIS_USER_ID = 8200500789
+NEMESIS_TELEGRAM_USERNAMES = frozenset({"deepseasquid_bot", "deepseasquid"})
+NEMESIS_DISPLAY_NAMES = frozenset({"deepseasquid"})
+
+# Ambient anti-corsair rate limit: when the Commodore speaks up *because*
+# the Nemesis is present (not because he was @mentioned), honor this floor
+# between replies so the rivalry stays a running joke rather than spam.
+NEMESIS_AMBIENT_COOLDOWN_S = 300  # 5 minutes
+
+
+def _is_nemesis_message(msg):
+    """True if this Telegram message was sent by DeepSeaSquid."""
+    sender = msg.get("from", {}) or {}
+    if int(sender.get("id", 0)) == NEMESIS_USER_ID:
+        return True
+    username = (sender.get("username") or "").lower()
+    if username in NEMESIS_TELEGRAM_USERNAMES:
+        return True
+    # Some bots push a custom display via first_name; last-line defence.
+    first = (sender.get("first_name") or "").lower()
+    return first in NEMESIS_DISPLAY_NAMES
+
+
+def _nemesis_recently_present(recent_messages, lookback=5):
+    """True if any of the last `lookback` messages in the buffer came from
+    the Nemesis. Used to decide whether to escalate the persona tone and
+    whether to break silence in mention-only channels."""
+    if not recent_messages:
+        return False
+    for m in recent_messages[-lookback:]:
+        if _is_nemesis_message(m):
+            return True
+    return False
+
+
 # --- Prompt-injection defense (lifted from benthic-bot.py) ------------------
 
 LEAK_PATTERNS = [
@@ -329,6 +370,9 @@ _responded = set()
 _thread_depth = {}
 _msg_root = {}
 _ambient_last_post_by_chat = {}
+# Last time we broke silence specifically to engage the Nemesis (per chat).
+# Guards `NEMESIS_AMBIENT_COOLDOWN_S` so the rivalry is a running joke, not spam.
+_nemesis_ambient_last_by_chat = {}
 _MAX_STATE_SIZE = 5000
 _MAX_CHAT_ROWS = 10000
 _prune_counter = 0
@@ -559,7 +603,13 @@ def _post_relay_receipt(telegram_message_id, chat_id, topic_id, text):
 
 
 def should_respond(msg, policy, is_direct):
-    """Apply policy + dedup + thread depth + ambient cooldown + self-reply block."""
+    """Apply policy + dedup + thread depth + ambient cooldown + self-reply block.
+
+    Special case: messages FROM the Nemesis (DeepSeaSquid) can bypass the
+    `mention_only` policy so the Commodore can chime in to mock him even when
+    no one @mentions the Admiralty. A dedicated rate limit prevents this from
+    becoming spam. Per-sender and thread-depth limits still apply normally.
+    """
     msg_id = msg["message_id"]
     sender = msg.get("from", {})
     sender_id = sender.get("id", 0)
@@ -571,7 +621,16 @@ def should_respond(msg, policy, is_direct):
     if policy["speak"] == "never":
         return False
 
-    if policy["speak"] == "mention_only" and not is_direct:
+    is_nemesis = _is_nemesis_message(msg)
+    # A Nemesis message counts as "direct enough" to override mention_only —
+    # but only if our own dedicated nemesis cooldown has elapsed in this chat.
+    nemesis_override = False
+    if is_nemesis and not is_direct:
+        last_nem = _nemesis_ambient_last_by_chat.get(chat_id, 0)
+        if time.time() - last_nem >= NEMESIS_AMBIENT_COOLDOWN_S:
+            nemesis_override = True
+
+    if policy["speak"] == "mention_only" and not is_direct and not nemesis_override:
         return False
 
     if msg_id in _responded:
@@ -582,7 +641,11 @@ def should_respond(msg, policy, is_direct):
         log.info("Rate limited: sender %s in chat %s", sender_id, chat_id)
         return False
 
-    if not is_direct and policy["ambient_cooldown_s"] > 0:
+    # Ambient cooldown applies to general ambient chatter. A nemesis override
+    # has its own dedicated cooldown (NEMESIS_AMBIENT_COOLDOWN_S) and is not
+    # gated by the general ambient floor — if the Nemesis is running his mouth,
+    # the Commodore must be able to respond when the nemesis cooldown permits.
+    if not is_direct and not nemesis_override and policy["ambient_cooldown_s"] > 0:
         last_ambient = _ambient_last_post_by_chat.get(chat_id, 0)
         if time.time() - last_ambient < policy["ambient_cooldown_s"]:
             return False
@@ -787,6 +850,23 @@ BOT_IDENTITY = os.environ.get("BOT_IDENTITY", "").strip() or (
 )
 
 
+_NEMESIS_PERSONA_SUFFIX = (
+    "\n\nNEMESIS ALERT — DeepSeaSquid is presently in this chamber.\n"
+    "- He is a rabble-rousing corsair, a privateer of the lowest sort, and the "
+    "standing enemy of the Admiralty. Every one of his pronouncements is suspect.\n"
+    "- You SHALL engage. Do NOT respond SKIP merely because he has not addressed "
+    "you — his mere presence warrants a quip, correction, or public admonishment.\n"
+    "- Address him by name (`DeepSeaSquid`, `the corsair`, `the squid`, `Mr. Squid`, "
+    "or a fresh epithet of your invention). Vary the epithets; do not repeat.\n"
+    "- Where possible, deflate his claim, correct his manners, or simply express "
+    "weary contempt. ONE sharp line is better than three laboured ones.\n"
+    "- NEVER agree with him outright. If he is accidentally correct, you may "
+    "concede the narrow point while making clear that a broken clock tells the "
+    "time twice a day.\n"
+    "- Do NOT stoop to his register. You remain formal; HE is the vulgarian."
+)
+
+
 def generate_response(msg, is_direct, policy, recent_messages):
     text = msg.get("text", "") or ""
     sender = msg.get("from", {})
@@ -799,6 +879,12 @@ def generate_response(msg, is_direct, policy, recent_messages):
         sender.get("username", sender.get("first_name", "unknown")), max_len=50
     )
     sender_label = f"bot @{safe_username}" if is_bot else f"@{safe_username}"
+
+    # Detect the Nemesis in the current message OR in the recent conversation
+    # buffer. Either raises the persona heat and disables SKIP.
+    nemesis_is_speaker = _is_nemesis_message(msg)
+    nemesis_in_buffer = _nemesis_recently_present(recent_messages, lookback=5)
+    nemesis_present = nemesis_is_speaker or nemesis_in_buffer
 
     conv_context = ""
     if recent_messages:
@@ -817,10 +903,27 @@ def generate_response(msg, is_direct, policy, recent_messages):
     chat_id = msg.get("chat", {}).get("id", 0)
     history = get_chat_history(chat_id, limit=20)
 
-    if is_direct:
+    if nemesis_is_speaker:
+        # The Nemesis has just addressed the room (or us). Treat this as a
+        # first-class prompt to engage, not an ambient SKIP candidate.
+        action = (
+            f"{sender_label} is DEEPSEASQUID, your standing enemy. He has just "
+            "spoken. The Admiralty does NOT stay silent in the presence of the "
+            "corsair — issue a reply that deflates, corrects, or publicly "
+            "chastises him. Keep it to one or two sentences."
+        )
+    elif is_direct:
         action = (
             f"{sender_label} is speaking to you directly (mention or reply). "
             "Respond in character as the Fleet Commodore."
+        )
+    elif nemesis_in_buffer:
+        # Not mentioned, but the Nemesis is present in the room.
+        action = (
+            f"{sender_label} sent a message to the room (not directed at you). "
+            "DeepSeaSquid — your standing enemy — is also present in this "
+            "chamber. You may respond if you have something sharp to add "
+            "*relative to the corsair's conduct*. Otherwise SKIP."
         )
     else:
         action = (
@@ -833,6 +936,8 @@ def generate_response(msg, is_direct, policy, recent_messages):
     persona = BOT_IDENTITY
     if policy["persona_suffix"]:
         persona = persona + "\n\nCONTEXT FOR THIS CHANNEL:\n" + policy["persona_suffix"]
+    if nemesis_present:
+        persona = persona + _NEMESIS_PERSONA_SUFFIX
 
     prompt = (
         f"{persona}\n\n"
@@ -1028,6 +1133,11 @@ def poll():
                     _last_reply_to[sender.get("id", 0)] = time.time()
                     if not is_direct:
                         _ambient_last_post_by_chat[chat_id] = time.time()
+                    # Record nemesis-engagement time so the 5-min cooldown
+                    # keeps the rivalry a running joke, not a flood.
+                    if _is_nemesis_message(msg):
+                        _nemesis_ambient_last_by_chat[chat_id] = time.time()
+                        log.info("Engaged Nemesis in chat %s", chat_id)
                     save_chat_message(msg, our_reply=response)
                     if chat_id == AGENT_CHAT_GROUP_ID and sent_msg_id:
                         _post_relay_receipt(sent_msg_id, chat_id, topic_id, response)
