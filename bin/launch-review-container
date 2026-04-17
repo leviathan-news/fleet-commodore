@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""launch-review-container — Fleet Commodore review launcher.
+
+Secret-free boundary enforcer. Invoked by the Commodore coordinator thread
+as a child process (via subprocess.run). Stdin: job JSON. Stdout: one JSON
+object with review findings or a structured error.
+
+What this process does that the parent MUST NOT do:
+
+  1. Read ~/.config/commodore/gh_pat (GitHub PAT)
+  2. Read ~/.config/commodore/db_url (Postgres URL)
+  3. Read the host's Claude-auth state (~/.claude/.credentials.json
+     + ~/.claude.json) so the containerised Claude CLI inherits the
+     OAuth token set on the Mini. (This is the Jenbot pattern — the
+     Commodore uses Claude Code OAuth, NOT an Anthropic API key.)
+  4. Build a temporary env-file (mode 0o600) with those secrets +
+     review-specific vars.
+  5. `docker run --rm` the reviewer image on the commodore-egress network
+     with the env-file, a per-review writable HOME-tmpfs, a fresh
+     writable copy of the claude-auth state, and a 10-minute wall
+     timeout.
+  6. On timeout, EXPLICITLY `docker kill` the container before returning
+     so the lease-model recovery doesn't see a ghost container.
+  7. Return exactly ONE JSON object on stdout; stderr goes to a
+     per-review log file, never to the parent.
+
+Exit codes: 0 ok, 1 child_exit, 2 invalid_uuid, 3 missing_credentials,
+4 timeout, 5 launcher_internal.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+# --- Configuration ---------------------------------------------------------
+
+DOCKER = os.environ.get("COMMODORE_DOCKER", "/usr/local/bin/docker")
+REVIEWER_IMAGE = os.environ.get("COMMODORE_REVIEWER_IMAGE", "commodore-reviewer:latest")
+EGRESS_NETWORK = os.environ.get("COMMODORE_EGRESS_NETWORK", "commodore-egress")
+PROXY_HOST = os.environ.get("COMMODORE_EGRESS_PROXY_HOST", "commodore-egress-proxy")
+PROXY_PORT = int(os.environ.get("COMMODORE_EGRESS_PROXY_PORT", "8888"))
+
+# Per-review wall timeout. The coordinator thread sets this via env so it
+# stays in sync with the poll-loop's expectations.
+REVIEW_TIMEOUT_S = int(os.environ.get("COMMODORE_REVIEW_TIMEOUT_S", "600"))
+
+# Credential files (NEVER paths constructed from stdin or argv).
+GH_PAT_FILE = Path(os.environ.get("COMMODORE_GH_PAT_FILE", "~/.config/commodore/gh_pat")).expanduser()
+DB_URL_FILE = Path(os.environ.get("COMMODORE_DB_URL_FILE", "~/.config/commodore/db_url")).expanduser()
+
+# Claude-auth state (Jenbot pattern — mount host's OAuth state read-only).
+# The host directory is a pre-populated snapshot of ~/.claude/ with the
+# OAuth tokens already present. bin/setup-commodore-claude-auth (future)
+# will automate the copy-and-refresh.
+CLAUDE_AUTH_DIR = Path(os.environ.get("COMMODORE_CLAUDE_AUTH_DIR", "~/.config/commodore/claude-auth")).expanduser()
+CLAUDE_CONFIG_FILE = Path(os.environ.get("COMMODORE_CLAUDE_CONFIG_FILE", "~/.config/commodore/dot-claude.json")).expanduser()
+
+# Log dir for per-review stderr (caller should have mkdir'd).
+LOG_DIR = Path(os.environ.get("COMMODORE_REVIEW_LOG_DIR", str(Path.home() / "dev/leviathan/fleet-commodore/logs/reviews")))
+
+
+# --- Single-exit emitter ---------------------------------------------------
+
+def emit(obj: dict, exit_code: int = 0) -> "None":
+    """ONE JSON object to stdout. stderr stays clean (log file only)."""
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+    sys.exit(exit_code)
+
+
+def extract_last_json(text: str) -> "dict | None":
+    """Find the last balanced {...} in a stream and json.loads() it.
+
+    Review container stdout may contain Claude-CLI verbose output before
+    the final review JSON. We scan for the LAST balanced brace pair and
+    parse that. Returns None if nothing parseable.
+    """
+    depth = 0
+    start = -1
+    last_valid = None
+    for i, ch in enumerate(text or ""):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    last_valid = json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    pass
+                start = -1
+    return last_valid
+
+
+# --- Main ------------------------------------------------------------------
+
+def main() -> "None":
+    # Validate review_uuid argv. Accept only [a-f0-9-] to prevent shell-meta
+    # injection via the container name argument.
+    if len(sys.argv) < 2:
+        emit({"error": "missing_uuid"}, exit_code=2)
+    review_uuid = sys.argv[1]
+    if not re.fullmatch(r"[a-f0-9-]{8,40}", review_uuid):
+        emit({"error": "invalid_uuid", "detail": "launcher requires [a-f0-9-] uuid"}, exit_code=2)
+    container_name = f"commodore-review-{review_uuid}"
+
+    # Secret reads — the boundary. Fail fast with distinct errors.
+    try:
+        gh_pat = GH_PAT_FILE.read_text().strip()
+        db_url = DB_URL_FILE.read_text().strip()
+    except FileNotFoundError as exc:
+        emit({"error": "missing_credentials", "detail": f"{exc.__class__.__name__}: {exc}"}, exit_code=3)
+    except PermissionError as exc:
+        emit({"error": "missing_credentials", "detail": f"permission denied: {exc}"}, exit_code=3)
+
+    # Claude-auth state: we copy (not bind-mount the host dir) into a per-review
+    # scratch directory so the container can WRITE to it (Claude CLI mutates
+    # .claude/ during a session). The scratch dir is discarded at exit.
+    if not CLAUDE_AUTH_DIR.is_dir() or not CLAUDE_CONFIG_FILE.is_file():
+        emit({
+            "error": "missing_claude_auth",
+            "detail": (
+                f"Claude auth state not staged. Expected dir at "
+                f"{CLAUDE_AUTH_DIR} and file at {CLAUDE_CONFIG_FILE}. "
+                "Run bin/setup-commodore-claude-auth (task #15 follow-up)."
+            ),
+        }, exit_code=3)
+
+    # Job JSON from stdin.
+    try:
+        job_raw = sys.stdin.read()
+        job = json.loads(job_raw) if job_raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        emit({"error": "bad_job_json", "detail": str(exc)}, exit_code=5)
+
+    for req in ("repo", "pr_number"):
+        if req not in job:
+            emit({"error": "missing_job_field", "field": req}, exit_code=5)
+
+    # Per-review scratch for writable claude-auth copy + stderr log.
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stderr_log = LOG_DIR / f"{review_uuid}.stderr"
+
+    with tempfile.TemporaryDirectory(prefix=f"commodore-review-{review_uuid}-") as scratch:
+        scratch_path = Path(scratch)
+        claude_copy = scratch_path / "claude-auth"
+        shutil.copytree(CLAUDE_AUTH_DIR, claude_copy)
+        claude_json_copy = scratch_path / "dot-claude.json"
+        shutil.copy2(CLAUDE_CONFIG_FILE, claude_json_copy)
+
+        # Env-file (mode 0o600, deleted in finally).
+        env_file = None
+        proc = None
+        try:
+            umask_prev = os.umask(0o077)
+            try:
+                env_tmp = tempfile.NamedTemporaryFile(
+                    mode="w", delete=False, prefix=f"commodore-review-env-{review_uuid}-", dir="/tmp",
+                )
+                env_file = env_tmp.name
+                os.chmod(env_file, 0o600)
+                env_tmp.write(f"GH_TOKEN={gh_pat}\n")
+                env_tmp.write(f"COMMODORE_DB_URL={db_url}\n")
+                env_tmp.write(f"HTTPS_PROXY=http://{PROXY_HOST}:{PROXY_PORT}\n")
+                env_tmp.write(f"HTTP_PROXY=http://{PROXY_HOST}:{PROXY_PORT}\n")
+                env_tmp.write("NO_PROXY=localhost,127.0.0.1,commodore-db-tunnel\n")
+                env_tmp.write(f"REVIEW_UUID={review_uuid}\n")
+                env_tmp.write(f"REPO={job['repo']}\n")
+                env_tmp.write(f"PR_NUMBER={job['pr_number']}\n")
+                env_tmp.close()
+            finally:
+                os.umask(umask_prev)
+
+            cmd = [
+                DOCKER, "run", "--rm",
+                "--name", container_name,
+                "--network", EGRESS_NETWORK,
+                "--read-only",
+                "--tmpfs", "/tmp:rw,exec,nosuid,size=50m",
+                "--tmpfs", "/home/reviewer:rw,exec,nosuid,size=50m,uid=1000,gid=1000",
+                # Mount the writable per-review claude-auth COPY into the
+                # tmpfs HOME. The container can mutate it; we throw it away
+                # at exit regardless. The host's ~/.claude/ is never touched.
+                "-v", f"{claude_copy}:/home/reviewer/.claude:rw",
+                "-v", f"{claude_json_copy}:/home/reviewer/.claude.json:rw",
+                "--memory", "512m",
+                "--cpus", "1.0",
+                "--security-opt", "no-new-privileges",
+                "--env-file", env_file,
+                REVIEWER_IMAGE,
+            ]
+
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=json.dumps(job),
+                    capture_output=True, text=True,
+                    timeout=REVIEW_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                # CRITICAL: --rm only cleans up on normal exit. A hung
+                # container must be killed explicitly or the lease model
+                # breaks (recovery would see it as still-running forever).
+                subprocess.run([DOCKER, "kill", container_name],
+                               capture_output=True, timeout=30)
+                subprocess.run([DOCKER, "rm", "-f", container_name],
+                               capture_output=True, timeout=30)
+                emit({
+                    "error": "timeout",
+                    "detail": f"review exceeded {REVIEW_TIMEOUT_S}s; container killed",
+                    "review_uuid": review_uuid,
+                }, exit_code=4)
+
+            # stderr → log file only. NEVER to stdout (may echo tokens
+            # inside Claude CLI error messages).
+            if proc and proc.stderr:
+                try:
+                    stderr_log.write_text(proc.stderr[:200_000])
+                except OSError:
+                    pass
+
+            # Parse ONE final JSON object from the child's stdout.
+            payload = extract_last_json(proc.stdout if proc else "")
+            if proc and proc.returncode == 0 and payload is not None:
+                emit(payload, exit_code=0)
+            else:
+                emit({
+                    "error": "child_exit",
+                    "review_uuid": review_uuid,
+                    "returncode": proc.returncode if proc else None,
+                    "stdout_was_parseable": payload is not None,
+                    "stderr_log": str(stderr_log),
+                }, exit_code=1)
+
+        finally:
+            # Always clean up.
+            if env_file:
+                try:
+                    os.unlink(env_file)
+                except OSError:
+                    pass
+            # If the container still exists (e.g. our `docker kill` missed
+            # the window), force-remove. `--rm` handles the clean path;
+            # this is idempotent belt-and-braces.
+            if proc is None or (proc is not None and proc.returncode != 0):
+                subprocess.run([DOCKER, "rm", "-f", container_name],
+                               capture_output=True, timeout=10)
+
+
+if __name__ == "__main__":
+    main()
