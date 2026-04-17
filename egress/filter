@@ -1,0 +1,31 @@
+# tinyproxy FilterDefaultDeny allowlist for the review container.
+#
+# These are extended regex (anchored implicitly by tinyproxy); only CONNECT
+# host matches are checked (ConnectPort 443 in tinyproxy.conf restricts
+# to HTTPS). Anything not matched here is denied with a 403.
+#
+# Rebuild the egress-proxy image and recreate its container whenever these
+# change (or if Anthropic/GitHub introduce new subdomains).
+
+# --- GitHub ---------------------------------------------------------------
+# api.github.com — REST API for `gh` repo/pr queries.
+# codeload.github.com — tarball/zip downloads, some gh flows.
+# uploads.github.com — used by gh for some read paths; harmless read-only.
+# raw.githubusercontent.com — raw file fetches by gh.
+# objects.githubusercontent.com — release assets.
+^api\.github\.com$
+^codeload\.github\.com$
+^uploads\.github\.com$
+^raw\.githubusercontent\.com$
+^objects\.githubusercontent\.com$
+# Catch-all for any other *.github.com subdomain gh may touch.
+^[a-z0-9-]+\.github\.com$
+
+# --- Anthropic ------------------------------------------------------------
+# Claude Code CLI contacts api.anthropic.com for completions.
+^api\.anthropic\.com$
+^[a-z0-9-]+\.anthropic\.com$
+
+# NOTE: Postgres (DigitalOcean managed DB host) is NOT here. libpq bypasses
+# HTTP_PROXY entirely; Postgres traffic goes through the db-tunnel sidecar
+# on its own connection. See db-tunnel.Dockerfile.

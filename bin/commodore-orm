@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""commodore-orm — Django ORM snippet runner for the review container.
+
+Accepts a small Python expression (or short block) on stdin, runs it
+inside a Django-bootstrapped process, returns the repr'd result as JSON.
+
+Defense layers:
+  1. Snippet text is grep'd for obvious mutation markers (save, delete,
+     create, update, bulk_create, bulk_update, raw(, cursor(, connection.,
+     transaction.) — rejected without execution.
+  2. django.setup() uses a settings module that has DEFAULT_DATABASE
+     pointing at COMMODORE_DB_URL (the read-only role). Even if the grep
+     is bypassed, the DB role refuses writes.
+  3. Result cap: if output is a QuerySet, it's wrapped in list()[:500].
+  4. Statement timeout on the connection (same 3s as commodore-db).
+
+This file is v1 STUB: parser gate present, Django bootstrap is implemented
+in task #16 (needs live DB + Django env inside the image).
+
+Exit codes:
+  0 — snippet ran, JSON on stdout.
+  1 — parser/mutation rejection.
+  2 — Django error.
+  3 — timeout.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+
+
+# Patterns that indicate the snippet is trying to mutate state. These are
+# substring checks; not bulletproof (getattr indirection can evade), but
+# the DB role is the REAL backstop — this is "catch accidents."
+_MUTATION_MARKERS = (
+    r"\bsave\(",
+    r"\bdelete\(",
+    r"\bcreate\(",
+    r"\bupdate\(",
+    r"\bbulk_create\(",
+    r"\bbulk_update\(",
+    r"\bget_or_create\(",
+    r"\bupdate_or_create\(",
+    r"\braw\(",
+    r"\bcursor\(",
+    r"\bconnection\.",
+    r"\btransaction\.",
+    r"\bcall_command\b",
+    # Python-level escape hatches that would also indicate mischief.
+    r"\bexec\(",
+    r"\beval\(",
+    r"\b__import__\(",
+    r"\bopen\(",
+    r"\bsubprocess\.",
+)
+_MUTATION_RE = re.compile("|".join(_MUTATION_MARKERS))
+
+
+def emit(obj: dict, exit_code: int = 0) -> "None":
+    sys.stdout.write(json.dumps(obj, default=str) + "\n")
+    sys.stdout.flush()
+    sys.exit(exit_code)
+
+
+def is_read_only_snippet(snippet: str) -> "tuple[bool, str]":
+    if not snippet or not snippet.strip():
+        return False, "empty snippet"
+    m = _MUTATION_RE.search(snippet)
+    if m:
+        return False, f"mutation marker rejected: {m.group(0)!r}"
+    return True, "no mutation markers"
+
+
+def main() -> "None":
+    snippet = sys.stdin.read()
+    ok, reason = is_read_only_snippet(snippet)
+    if not ok:
+        emit({"error": "not_read_only", "reason": reason}, exit_code=1)
+
+    db_url = os.environ.get("COMMODORE_DB_URL")
+    if not db_url:
+        emit({"error": "missing_db_url", "reason": "COMMODORE_DB_URL env var not set"}, exit_code=2)
+
+    # v1 STUB: task #16 wires Django bootstrap + exec the snippet in a
+    # sandboxed namespace. For now, report the gate passed.
+    emit({
+        "status": "parser_passed_stub",
+        "reason": reason,
+        "message": "Parser gate passed. Django bootstrap + eval implemented in task #16.",
+    }, exit_code=0)
+
+
+if __name__ == "__main__":
+    main()

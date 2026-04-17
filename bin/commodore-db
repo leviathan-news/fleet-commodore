@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""commodore-db — read-only SQL wrapper for the review container.
+
+Reads a single SQL statement from stdin, validates it is a pure read
+(SELECT / EXPLAIN / CTE-with-SELECT-tail), executes via psycopg against
+COMMODORE_DB_URL, returns JSON on stdout.
+
+Defense layers:
+  1. Parser (sqlparse): reject non-SELECT, multi-statement, DML, DDL.
+  2. DB role: commodore_reader has `default_transaction_read_only = on`
+     and no GRANTs beyond SELECT. This is the real backstop.
+  3. statement_timeout = 3 seconds. Runaway queries die fast.
+  4. Row cap = 500. Wrapper appends LIMIT if missing; otherwise it
+     truncates results at 500 rows and sets truncated=true.
+
+Exit codes:
+  0 — query ran, JSON on stdout.
+  1 — parser rejection. JSON error on stdout.
+  2 — DB error. JSON error on stdout.
+  3 — timeout. JSON error on stdout.
+
+This file is v1 STUB: scaffolding + parser gate present, actual psycopg
+execution is implemented in task #16 (needs live DB to test against).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+
+MAX_ROWS = 500
+STATEMENT_TIMEOUT_MS = 3000
+
+
+def emit(obj: dict, exit_code: int = 0) -> "None":
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+    sys.exit(exit_code)
+
+
+def is_read_only_sql(sql: str) -> "tuple[bool, str]":
+    """Return (is_read_only, reason). Uses sqlparse to reject non-SELECT.
+
+    Accepted shapes:
+      - Single SELECT (with or without CTEs whose inner stmts are also SELECT)
+      - Single EXPLAIN or EXPLAIN ANALYZE
+      - EMPTY input → rejected with clear reason
+    Rejected:
+      - UPDATE, DELETE, INSERT, MERGE, COPY, TRUNCATE, DROP, CREATE, ALTER,
+        GRANT, REVOKE, VACUUM, ANALYZE (no EXPLAIN), BEGIN/COMMIT/ROLLBACK,
+        SET (affects session state), CALL / DO (procedural)
+      - Multi-statement input (two statements separated by ;)
+    """
+    try:
+        import sqlparse
+    except ImportError:
+        return False, "sqlparse not installed in container (bug in Dockerfile)"
+
+    if not sql or not sql.strip():
+        return False, "empty input"
+
+    statements = [s for s in sqlparse.parse(sql) if s.tokens]
+    if not statements:
+        return False, "no parseable statement"
+    if len(statements) > 1:
+        return False, f"multiple statements ({len(statements)}); send one at a time"
+
+    stmt = statements[0]
+    stmt_type = stmt.get_type()  # DML, DDL, SELECT, UNKNOWN, etc.
+
+    # sqlparse returns 'SELECT' for plain SELECTs, 'UNKNOWN' for CTEs or EXPLAIN.
+    # For UNKNOWN, inspect the first non-whitespace token.
+    if stmt_type == "SELECT":
+        return True, "SELECT"
+
+    # Look at the leading keyword for everything else.
+    first_kw = None
+    for tok in stmt.tokens:
+        if tok.is_whitespace:
+            continue
+        first_kw = tok.normalized.upper().split()[0] if tok.normalized else None
+        break
+
+    if first_kw in ("WITH",):
+        # CTE — accept. The DB role enforces read-only on the actual execution,
+        # so even a cleverly-crafted CTE-wrapping-DML will fail there too.
+        return True, "WITH (CTE)"
+    if first_kw in ("EXPLAIN",):
+        return True, "EXPLAIN"
+
+    return False, f"non-SELECT statement type: {first_kw or stmt_type or 'UNKNOWN'}"
+
+
+def main() -> "None":
+    sql = sys.stdin.read()
+    ok, reason = is_read_only_sql(sql)
+    if not ok:
+        emit({"error": "not_read_only", "reason": reason}, exit_code=1)
+
+    db_url = os.environ.get("COMMODORE_DB_URL")
+    if not db_url:
+        emit({"error": "missing_db_url", "reason": "COMMODORE_DB_URL env var not set"}, exit_code=2)
+
+    # v1 STUB: parser passed. Task #16 implements psycopg execution, row cap,
+    # and statement timeout enforcement. For image smoke tests + unit tests,
+    # the parser-only gate is sufficient.
+    emit({
+        "status": "parser_passed_stub",
+        "reason": reason,
+        "max_rows": MAX_ROWS,
+        "statement_timeout_ms": STATEMENT_TIMEOUT_MS,
+        "message": "Parser gate passed. psycopg execution implemented in task #16.",
+    }, exit_code=0)
+
+
+if __name__ == "__main__":
+    main()

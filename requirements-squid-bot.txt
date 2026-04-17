@@ -1,0 +1,5 @@
+# Placeholder — populated by bin/build-reviewer-image.sh right before
+# `docker build` to vendor the current squid-bot requirements.txt for
+# commodore-orm (Django + models). When this file is empty, the reviewer
+# image still builds; commodore-orm will fail at runtime with a clear
+# "Django not installed" error rather than silently.

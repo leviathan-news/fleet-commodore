@@ -1,0 +1,11 @@
+# Fleet Commodore review-worker runtime deps (installed into the image).
+# Keep this file small and stable so Dockerfile layer caching works.
+# Django + squid-bot deps for commodore-orm live in requirements-squid-bot.txt,
+# pulled in during the build by bin/build-reviewer-image.sh.
+
+# SQL parser + DB driver for commodore-db wrapper (read-only SELECT gate).
+sqlparse>=0.4.4,<0.6
+psycopg2-binary>=2.9,<3
+
+# HTTP client for review_worker.py (gh, LN API).
+requests>=2.32,<3
