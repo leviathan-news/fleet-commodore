@@ -621,6 +621,51 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
 _last_ln_refresh_attempt = 0.0
 _LN_REFRESH_MIN_INTERVAL_S = 300
 
+# Proactively refresh when the JWT is within this many seconds of expiry,
+# rather than waiting for the first 401. Leviathan JWTs last 60 minutes
+# (verified by decoding payload.exp 2026-04-18); 300s headroom means we
+# catch rotation before a real request sees the expiry. Purely preventive —
+# the reactive 401-catch path is still the backstop.
+_LN_REFRESH_PROACTIVE_HEADROOM_S = 300
+
+
+def _ln_jwt_expires_in():
+    """Return seconds until the current LN_API_TOKEN expires, or None if
+    the token can't be decoded. Safe to call without hitting the network —
+    just peeks at the base64 payload. Signature is NOT verified (we don't
+    need to; the server verifies on every use, and a tampered token would
+    fail server-side anyway)."""
+    global LN_API_TOKEN
+    if not LN_API_TOKEN:
+        return None
+    try:
+        parts = LN_API_TOKEN.split(".")
+        if len(parts) < 2:
+            return None
+        import base64
+        payload_b64 = parts[1]
+        # JWT base64 is URL-safe with no padding.
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = payload.get("exp")
+        if not isinstance(exp, (int, float)):
+            return None
+        return int(exp - time.time())
+    except Exception:
+        return None
+
+
+def _maybe_proactively_refresh_ln_token():
+    """Refresh LN_API_TOKEN if it's near expiry. Called inline before each
+    relay attempt so the first 401 from an aged token is mostly avoided.
+    Silent no-op if the token still has headroom."""
+    remaining = _ln_jwt_expires_in()
+    if remaining is None:
+        return  # unknown shape — don't speculate
+    if remaining < _LN_REFRESH_PROACTIVE_HEADROOM_S:
+        log.info("LN_API_TOKEN expiring in %ds; proactively refreshing", remaining)
+        _refresh_ln_api_token()
+
 
 def _refresh_ln_api_token():
     """Sign a fresh nonce with the Commodore's wallet and obtain a new JWT.
@@ -744,6 +789,9 @@ def _post_relay_receipt(telegram_message_id, chat_id, topic_id, text):
     if not LN_API_TOKEN:
         log.warning("LN_API_TOKEN not set - skipping relay receipt")
         return
+    # Proactive refresh BEFORE the send if the token is near expiry.
+    # Cheaper than letting the server 401 us.
+    _maybe_proactively_refresh_ln_token()
     _do_relay_receipt(telegram_message_id, chat_id, topic_id, text, allow_refresh=True)
 
 
