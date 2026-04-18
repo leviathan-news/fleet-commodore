@@ -84,6 +84,17 @@ AGENT_CHAT_TOPICS = {
 # Leviathan News relay endpoint (Mode B receipt after native sendMessage).
 LN_API_BASE = os.environ.get("LN_API_BASE", "https://api.leviathannews.xyz/api/v1")
 LN_API_TOKEN = os.environ.get("LN_API_TOKEN", "")
+# Wallet key for auto-refreshing LN_API_TOKEN when it expires (Leviathan JWTs
+# last ~24h). When set and the current JWT returns 401, the daemon signs a
+# fresh nonce itself and updates LN_API_TOKEN in-memory + on-disk. Without
+# this file we can still run — relay receipts just stop working after
+# expiry and log 401s. See _refresh_ln_api_token() for the flow.
+LN_WALLET_KEY_FILE = os.environ.get(
+    "LN_WALLET_KEY_FILE", os.path.expanduser("~/.config/commodore/.ln-wallet-key")
+)
+LN_API_TOKEN_FILE = os.environ.get(
+    "LN_API_TOKEN_FILE", os.path.expanduser("~/.config/commodore/.ln-api-token")
+)
 
 # Repo work - PR filing.
 WORKSPACE_DIR = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
@@ -604,6 +615,114 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
 # --- Agent Chat Mode B relay receipt ----------------------------------------
 
 
+# Guard against refresh thrashing. If the wallet key is broken or the LN API
+# is down, we don't want to pound on /wallet/verify/ every second. One
+# attempt per 5 minutes is generous; if that's too frequent, bump.
+_last_ln_refresh_attempt = 0.0
+_LN_REFRESH_MIN_INTERVAL_S = 300
+
+
+def _refresh_ln_api_token():
+    """Sign a fresh nonce with the Commodore's wallet and obtain a new JWT.
+
+    Called when the relay endpoint returns 401 (token expired). Updates the
+    module-level LN_API_TOKEN in-memory AND persists to disk so the next
+    process restart inherits the refreshed token.
+
+    Returns True on success, False on any failure. Failure leaves the stale
+    token in place; relay receipts continue 401-ing until either (a) the
+    wallet key file is fixed or (b) the next refresh interval elapses.
+    """
+    global LN_API_TOKEN, _last_ln_refresh_attempt
+
+    now = time.time()
+    if now - _last_ln_refresh_attempt < _LN_REFRESH_MIN_INTERVAL_S:
+        return False
+    _last_ln_refresh_attempt = now
+
+    # Lazy import — eth_account is not needed for normal chat operation.
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+    except ImportError:
+        log.warning(
+            "eth_account not installed; cannot auto-refresh LN_API_TOKEN. "
+            "Install: pip install eth-account"
+        )
+        return False
+
+    try:
+        wallet_key = Path(LN_WALLET_KEY_FILE).expanduser().read_text().strip()
+    except (OSError, FileNotFoundError) as exc:
+        log.warning("LN_WALLET_KEY_FILE unreadable (%s); cannot refresh JWT", exc)
+        return False
+
+    try:
+        acct = Account.from_key(wallet_key)
+    except Exception as exc:
+        log.warning("Wallet key invalid (%s); cannot refresh JWT", exc)
+        return False
+
+    origin = LN_API_BASE.split("/api/")[0]
+    try:
+        # Step 1: nonce.
+        req = urllib.request.Request(
+            f"{LN_API_BASE}/wallet/nonce/{acct.address}/",
+            headers={"Origin": origin, "Referer": f"{origin}/"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            nonce_data = json.loads(resp.read())
+
+        # Step 2: sign + verify.
+        signed = acct.sign_message(encode_defunct(text=nonce_data["message"]))
+        verify_body = {
+            "address": acct.address,
+            "nonce": nonce_data["nonce"],
+            "signature": signed.signature.hex(),
+        }
+        req = urllib.request.Request(
+            f"{LN_API_BASE}/wallet/verify/",
+            data=json.dumps(verify_body).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Origin": origin,
+                "Referer": f"{origin}/",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            # access_token comes back as an HttpOnly cookie in Set-Cookie.
+            set_cookies = resp.headers.get_all("Set-Cookie") or []
+            new_token = None
+            for c in set_cookies:
+                if c.startswith("access_token="):
+                    # Cookie format: access_token=<value>; Path=...; HttpOnly; ...
+                    new_token = c.split(";", 1)[0].split("=", 1)[1]
+                    break
+            if not new_token:
+                log.warning("LN /wallet/verify returned no access_token cookie")
+                return False
+    except urllib.error.HTTPError as exc:
+        log.warning("LN JWT refresh HTTP %s: %s", exc.code, exc.read()[:200])
+        return False
+    except Exception as exc:
+        log.warning("LN JWT refresh failed: %s", exc)
+        return False
+
+    # Success — update in-memory + on-disk.
+    LN_API_TOKEN = new_token
+    try:
+        token_path = Path(LN_API_TOKEN_FILE).expanduser()
+        token_path.write_text(new_token)
+        os.chmod(token_path, 0o600)
+    except OSError as exc:
+        # Not fatal — in-memory update already took effect; just log.
+        log.warning("Could not persist refreshed LN_API_TOKEN to %s: %s",
+                    LN_API_TOKEN_FILE, exc)
+
+    log.info("LN_API_TOKEN refreshed (wallet=%s, len=%d)", acct.address, len(new_token))
+    return True
+
+
 def _post_relay_receipt(telegram_message_id, chat_id, topic_id, text):
     """After sendMessage, record the receipt with Leviathan's relay so the
     canonical AgentChatMessage store lands an attributed row (Mode B).
@@ -616,20 +735,28 @@ def _post_relay_receipt(telegram_message_id, chat_id, topic_id, text):
     "recommended for agents" but that holds for read endpoints, not
     state-changing ones like the relay.
 
-    Failure here is non-fatal - the Telegram message already went out.
+    Self-heal: on 401, attempt to refresh LN_API_TOKEN from the wallet key
+    and retry once. Leviathan JWTs last ~24h; without this the daemon
+    would silently stop relaying after each refresh interval.
+
+    Failure here is non-fatal — the Telegram message already went out.
     """
     if not LN_API_TOKEN:
         log.warning("LN_API_TOKEN not set - skipping relay receipt")
         return
+    _do_relay_receipt(telegram_message_id, chat_id, topic_id, text, allow_refresh=True)
+
+
+def _do_relay_receipt(telegram_message_id, chat_id, topic_id, text, allow_refresh):
+    """Inner relay-receipt call. Split from the public wrapper so the retry
+    path (after a 401-driven refresh) can call it without recursive
+    refresh-on-refresh loops."""
     payload = {
         "chat_id": chat_id,
         "topic_id": int(topic_id or 0),
         "telegram_message_id": telegram_message_id,
         "text": text[:4096],
     }
-    # Origin needed for CSRF, Cookie carries the JWT, Referer is a
-    # belt-and-braces signal that matches browser behaviour. The bot token
-    # MUST NOT leak into this request.
     origin = LN_API_BASE.split("/api/")[0]
     req = urllib.request.Request(
         f"{LN_API_BASE}/agent-chat/post/",
@@ -646,13 +773,22 @@ def _post_relay_receipt(telegram_message_id, chat_id, topic_id, text):
             if resp.status >= 300:
                 log.warning("Relay receipt non-2xx: %s", resp.status)
     except urllib.error.HTTPError as exc:
-        # HTTPError is the common path for 401/403 — log status + first
-        # few bytes of body so we know which auth layer rejected us.
         try:
             detail = exc.read()[:200].decode("utf-8", errors="replace")
         except Exception:
             detail = ""
-        log.warning("Relay receipt HTTP %s: %s", exc.code, detail)
+        if exc.code == 401 and allow_refresh:
+            log.info("Relay receipt 401 — attempting LN_API_TOKEN refresh")
+            if _refresh_ln_api_token():
+                # Retry ONCE with the new token. allow_refresh=False so a
+                # persistent 401 doesn't recurse into a second refresh.
+                _do_relay_receipt(telegram_message_id, chat_id, topic_id,
+                                  text, allow_refresh=False)
+            else:
+                log.warning("LN_API_TOKEN refresh skipped or failed; "
+                            "relay receipt dropped (HTTP %s)", exc.code)
+        else:
+            log.warning("Relay receipt HTTP %s: %s", exc.code, detail)
     except Exception as exc:
         log.warning("Relay receipt failed: %s", exc)
 
