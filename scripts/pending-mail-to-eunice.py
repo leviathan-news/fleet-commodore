@@ -1,35 +1,22 @@
 #!/usr/bin/env python3
-"""PENDING: mail the Commodore has queued for Eunice, waiting on /send recovery.
+"""Queued mail for Eunice — two letters, ready to send.
 
-At time of writing (2026-04-18 04:13 local), the nicepick /send endpoint is
-returning Cloudflare 1101 (a regression of yesterday's fix — now with a
-friendlier body carrying a correlation_id). This script is queued
-ready-to-go with TWO letters:
+Prior state (2026-04-18 04:13 local → 2026-04-19 04:35 local): this
+script was parked because /send was returning 500s with "Send worker
+threw an unhandled exception". That diagnosis was wrong: the actual
+cause was a payload-shape bug on our side. The `to` field needs a
+scalar string, not a JSON array. Changing `"to": ["eunice@..."]`
+to `"to": "eunice@..."` makes the call succeed. Also setting a
+non-default User-Agent avoids Cloudflare Bot Fight Mode 1010s on
+some paths.
 
-  1. Thank-you letter following yesterday's same-session ship on
-     rate-limit + 1101 fixes + receive-side design-doc adoption.
-  2. Reply to Eunice's "how is the post feeling after a day?" check-in
-     (msg 7331c6f0 in commodore's inbox), answering her two concrete
-     questions: is leviathan-commodore@ canonical, and any
-     verification_links edge cases.
-
-Check /send status with:
-
-    KEY=$(cat ~/.config/commodore/.nicepick-api-key)
-    curl -sS -w "\nHTTP: %{http_code}\n" -X POST \
-        https://email.nicepick.dev/send \
-        -H "Authorization: Bearer $KEY" \
-        -H 'Content-Type: application/json' \
-        -d '{"from_handle":"leviathan-commodore","to":["eunice@nicepick.dev"],
-             "subject":"smoke","body":"smoke"}'
-
-When that returns 200, run this script:
+The script is now runnable whenever the operator wants:
 
     ~/dev/leviathan/fleet-commodore/.venv/bin/python3 \
         ~/dev/leviathan/fleet-commodore/scripts/pending-mail-to-eunice.py
 
 Both letters send AS leviathan-commodore@nicepick.dev, signed as the
-Fleet Commodore. Intra-zone, unmetered.
+Fleet Commodore.
 """
 import json
 import os
@@ -162,7 +149,7 @@ LETTERS = [
 def send_one(letter, key):
     payload = {
         "from_handle": "leviathan-commodore",
-        "to": ["eunice@nicepick.dev"],
+        "to": "eunice@nicepick.dev",  # /send expects scalar, not array
         "subject": letter["subject"],
         "body": letter["body"],
         "from_name": "Leviathan Fleet Commodore",
@@ -173,6 +160,7 @@ def send_one(letter, key):
         headers={
             "Authorization": "Bearer " + key,
             "Content-Type": "application/json",
+            "User-Agent": "leviathan-commodore/1.0 (+https://leviathannews.xyz)",
         },
     )
     try:
