@@ -54,6 +54,27 @@ if "BOT_USERNAME" not in os.environ:
     sys.exit("ERROR: BOT_USERNAME env var is required (lowercase, no @)")
 BOT_USERNAME = os.environ["BOT_USERNAME"].lower()
 
+# Telegram user_id of the bot itself. Used to detect `text_mention` entities
+# that reference the bot by numeric id (the most reliable ping signal, since
+# display names can rotate). Populated once at startup via getMe.
+BOT_USER_ID = None  # filled in poll() startup.
+
+# Textual aliases that count as @-mentions of the bot even when they are not
+# the canonical @bot_username Telegram handle. Eunice and other operators have
+# been observed @-ing the Commodore by display name (e.g.
+# `@LeviathanFleetCommodore`) thinking it pings; without this, those messages
+# fell through to ambient-silence territory. Case-insensitive match.
+#
+# Add new variants here if we see another that should count.
+BOT_MENTION_ALIASES = frozenset(s.lower() for s in (
+    "leviathan_commodore_bot",      # the canonical Telegram handle (also matched via BOT_USERNAME)
+    "leviathanfleetcommodore",      # Eunice's preferred display form (no spaces)
+    "fleet_commodore",
+    "fleetcommodore",
+    "commodore_lev_bot",            # earlier draft handle, still worth catching
+    "commodore",                    # generic — last-resort bare mention
+))
+
 
 def _parse_int_set(env_name: str) -> frozenset:
     raw = os.environ.get(env_name, "")
@@ -279,6 +300,41 @@ def _is_nemesis_message(msg):
     # Some bots push a custom display via first_name; last-line defence.
     first = (sender.get("first_name") or "").lower()
     return first in NEMESIS_DISPLAY_NAMES
+
+
+def _is_mention_of_commodore(msg, text_lower):
+    """True if this Telegram message is addressing the Commodore as a direct
+    @-mention, by any of his known aliases OR via a text_mention entity that
+    points at BOT_USER_ID.
+
+    Background: Telegram has two mention shapes. A `mention` entity is the
+    @-style ping by username; a `text_mention` entity is the structured
+    "link this text to this user_id" form that clients produce when an
+    author picks the bot from autocomplete by display name. Clients also
+    sometimes emit bare text like `@LeviathanFleetCommodore` without any
+    entity at all — so we need to cover all three signals.
+
+    Returns True on any of:
+      1. The canonical @BOT_USERNAME string appears in the text
+      2. Any string in BOT_MENTION_ALIASES appears as @alias in the text
+      3. A `text_mention` entity in msg.entities references BOT_USER_ID
+    """
+    # Signal 1+2: textual mentions (case-insensitive; text_lower is supplied).
+    for alias in BOT_MENTION_ALIASES:
+        if f"@{alias}" in text_lower:
+            return True
+
+    # Signal 3: structured text_mention entity pointing at our user id.
+    if BOT_USER_ID is not None:
+        entities = msg.get("entities") or msg.get("caption_entities") or []
+        for ent in entities:
+            if ent.get("type") != "text_mention":
+                continue
+            user = ent.get("user") or {}
+            if int(user.get("id", 0)) == int(BOT_USER_ID):
+                return True
+
+    return False
 
 
 def _nemesis_recently_present(recent_messages, lookback=5):
@@ -1594,10 +1650,13 @@ def poll():
     recent_by_chat = {}
 
     log.info("Fleet Commodore listener starting")
+    global BOT_USER_ID
     try:
         me = tg_request("getMe")
-        username = me.get("result", {}).get("username", "?")
-        log.info("Running as @%s (id %s)", username, me.get("result", {}).get("id"))
+        result = me.get("result", {})
+        username = result.get("username", "?")
+        BOT_USER_ID = result.get("id")
+        log.info("Running as @%s (id %s)", username, BOT_USER_ID)
     except Exception as exc:
         sys.exit(f"ERROR: Failed getMe: {exc}")
 
@@ -1652,7 +1711,7 @@ def poll():
                 reply_to_us = (
                     reply_msg.get("from", {}).get("username", "").lower() == BOT_USERNAME
                 )
-                is_mention = f"@{BOT_USERNAME}" in text_lower
+                is_mention = _is_mention_of_commodore(msg, text_lower)
                 is_direct = reply_to_us or is_mention
 
                 if not should_respond(msg, policy, is_direct):
