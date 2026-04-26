@@ -2084,9 +2084,14 @@ _PLAN_REFINE_RE = re.compile(
 _SHIP_RE = re.compile(r"^/ship(?:@\S+)?\b|^ship\s+it\b", re.IGNORECASE)
 _ABANDON_RE = re.compile(r"^/abandon(?:@\S+)?\b|^abandon\s+plan\b", re.IGNORECASE)
 _QA_RE = re.compile(
+    # Slash command always wins.
     r"^/ask(?:@\S+)?\s+(.+)|"
-    r"^(?:how\s+(?:many|much)|how|what|why|when|where|which)\b",
-    re.IGNORECASE,
+    # Or any text containing a wh-word followed by something ending in `?`.
+    # This matches "@bot, According to the news table, what's the top story?"
+    # as well as bare "How many articles published in April?". The is_direct
+    # gate upstream prevents non-mention questions from triggering Q&A.
+    r"\b(?:how\s+(?:many|much)|how|what(?:'s)?|why|when|where|which)\b.*\?",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -3296,6 +3301,36 @@ def poll():
                 # PR filing flow (existing stub) — only if review didn't match.
                 if response is None and is_direct and _detect_pr_request(text):
                     response = handle_pr_request(msg, policy)
+
+                # v6 conversational pipelines. Each handler enforces its own
+                # auth gate (_can_ship / _can_plan / _can_qa) so wrong-channel
+                # callers receive an in-character decline rather than silence.
+                #
+                # Order matters: ship/abandon/plan are slash-command-y and
+                # narrow; Q&A is broad and goes last so it catches anything
+                # ending in `?` that wasn't claimed by the other paths.
+                if response is None and is_direct:
+                    stripped = text.strip()
+                    # Strip leading mention so regexes anchor cleanly.
+                    stripped_no_mention = re.sub(
+                        r"^@\S+\s*[,:]?\s*", "", stripped, count=1,
+                    )
+
+                    if _SHIP_RE.match(stripped_no_mention):
+                        response = handle_ship(msg)
+                    elif _ABANDON_RE.match(stripped_no_mention):
+                        response = handle_abandon(msg)
+                    elif _PLAN_REFINE_RE.match(stripped_no_mention):
+                        response = handle_plan_message(msg, stripped_no_mention)
+                    else:
+                        # Q&A: slash form takes the captured group as the
+                        # question; natural form passes the whole post-mention
+                        # text. Q&A is gated to Bot HQ ∪ Lev Dev ∪ Agent Chat
+                        # ∪ admin DM by _can_qa inside handle_qa.
+                        qa_match = _QA_RE.search(stripped_no_mention)
+                        if qa_match:
+                            question = qa_match.group(1) or stripped_no_mention
+                            response = handle_qa(msg, question.strip())
 
                 if response is None:
                     response = generate_response(
