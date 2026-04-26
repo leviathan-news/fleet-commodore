@@ -300,6 +300,35 @@ No reviewer-image rebuild is needed for this — the tunnel is independent.
 
 ## Troubleshooting
 
+### Reviewer image build fails
+
+If `./bin/build-reviewer-image.sh` fails during `apt-get` on the Mini, two
+known causes (both fixed in commits 011dd0e and f6c13be, but worth knowing
+when bumping base images):
+
+- **`Sub-process returned an error code (100)` early — hook misfires.**
+  The base image's `/etc/apt/apt.conf.d/docker-clean` Post-Invoke hook
+  calls `rm -f` against globs that fail on certain Docker storage drivers.
+  Fix: `RUN echo > /etc/apt/apt.conf.d/docker-clean` early in the
+  Dockerfile (already present).
+
+- **`lzma error: Cannot allocate memory` during `dpkg --unpack`.** The
+  Mini's Docker Desktop VM has 2 GiB allocated, which is below trixie
+  (Debian 13)'s lzma-decompression working-set requirement for the bigger
+  packages. Pin to `python:3.11-slim-bookworm` instead of bare `:slim`
+  (already done). If you bump the base, verify the build still works
+  within 2 GiB. Bumping the VM allocation in Docker Desktop preferences
+  is the long-term fix.
+
+To diagnose a NEW build failure, capture the full log:
+
+```bash
+docker build -f reviewer.Dockerfile -t test-build . > /tmp/build.log 2>&1
+tail -50 /tmp/build.log
+```
+
+The actual dpkg error message often appears mid-output, NOT at the end.
+
 ### Review never posts
 
 Check in order:
