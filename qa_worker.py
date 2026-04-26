@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +34,10 @@ from pathlib import Path
 
 # --- Configuration ---------------------------------------------------------
 
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/usr/local/bin/claude")
+# Resolve at import time. npm-global on different distros plants the
+# `claude` symlink at /usr/local/bin OR /usr/bin depending on prefix.
+# Hardcoding either is fragile; PATH lookup is robust.
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "/usr/bin/claude"
 
 # Container path for the result-scratch handoff. Bound by the launcher to
 # the host's RESULTS_DIR.
