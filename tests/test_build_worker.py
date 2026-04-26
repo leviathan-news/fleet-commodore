@@ -77,6 +77,54 @@ def test_partial_job_lists_missing_fields():
 
 # --- Atomic scratch-file write --------------------------------------------
 
+def test_scrub_secrets_redacts_token_in_url():
+    """Regression: 2026-04-26 a real gh_pat leaked to the build stderr log
+    via `git clone https://x-access-token:<pat>@github.com/...`. The scrub
+    helper MUST redact this exact shape before any persistence.
+
+    NB: fixture below uses a deliberately invalid token shape to dodge
+    GitHub's push-protection secret scanner (`zzz` prefix is not a real
+    PAT pattern but does match our `[A-Za-z0-9_]{20,}` capture group)."""
+    mod = _load_module()
+    fake_token = "zzz" + "A" * 60  # 63-char token-shaped string, not a real PAT
+    leaky = (
+        f"fatal: unable to access 'https://x-access-token:"
+        f"{fake_token}@github.com/leviathan-agent/fleet-commodore.git/'"
+    )
+    scrubbed = mod._scrub_secrets(leaky)
+    assert fake_token not in scrubbed
+    assert "x-access-token:<REDACTED>@" in scrubbed
+
+
+def test_scrub_secrets_redacts_bare_pat_prefixes():
+    """All five GitHub token prefixes must be redacted if they appear
+    bare. Fixtures use repeated A's to avoid tripping GitHub's
+    push-protection secret scanner — the regex doesn't care about
+    realism, just shape."""
+    mod = _load_module()
+    fake_body = "A" * 24
+    for prefix in ("github_pat_", "ghp_", "gho_", "ghs_", "ghu_"):
+        token = f"{prefix}{fake_body}"
+        scrubbed = mod._scrub_secrets(f"oops: {token} leaked")
+        assert token not in scrubbed
+        assert prefix in scrubbed  # the prefix is preserved
+        assert "<REDACTED>" in scrubbed
+
+
+def test_scrub_secrets_passthrough_for_non_secrets():
+    """Don't false-positive on innocent text that happens to contain
+    'token' or 'github'."""
+    mod = _load_module()
+    safe_inputs = [
+        "Cloning into 'foo'...",
+        "rc=128: fatal access denied",
+        "github.com is reachable",
+        "the token endpoint returned 401",
+    ]
+    for s in safe_inputs:
+        assert mod._scrub_secrets(s) == s
+
+
 def test_atomic_write_protocol(tmp_path):
     mod = _load_module()
     mod.RESULTS_DIR = tmp_path

@@ -93,13 +93,43 @@ def write_result_atomically(uuid: str, payload: dict) -> None:
 
 # --- Subprocess helpers ----------------------------------------------------
 
+_TOKEN_LEAK_RE = re.compile(
+    # x-access-token:<pat>@github.com style URLs
+    r"x-access-token:[^@\s]+@",
+    re.IGNORECASE,
+)
+_GH_PAT_RE = re.compile(
+    # github_pat_<long string> or ghp_<long string> appearing anywhere
+    r"\b(github_pat_|ghp_|gho_|ghs_|ghu_)[A-Za-z0-9_]{20,}",
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Mask any token shapes that could leak via stderr → log file.
+    The gh PAT shows up two ways: as `x-access-token:<pat>@github.com`
+    inside clone/push URLs, and as a bare `github_pat_<...>` if anything
+    ever echoes the env var. Both must be redacted before write."""
+    if not text:
+        return text
+    text = _TOKEN_LEAK_RE.sub("x-access-token:<REDACTED>@", text)
+    text = _GH_PAT_RE.sub(r"\1<REDACTED>", text)
+    return text
+
+
+def _safe_cmd_for_log(cmd):
+    """Stringify argv with token redaction."""
+    return _scrub_secrets(" ".join(str(a) for a in cmd))
+
+
 def run(cmd, *, cwd=None, env=None, timeout=GIT_TIMEOUT_S, check=True,
         log_label=None):
     """Run a subprocess with sensible defaults. Returns CompletedProcess.
-    On check=True and non-zero exit, prints stderr to our stderr (which
-    goes to the launcher's per-build log) and re-raises CalledProcessError."""
+    On check=True and non-zero exit, prints REDACTED stderr to our stderr
+    (which goes to the launcher's per-build log) and re-raises
+    CalledProcessError. NEVER write the cmd or stderr unredacted —
+    git clone URLs include the PAT inline."""
     if log_label:
-        sys.stderr.write(f"[{log_label}] {' '.join(cmd)}\n")
+        sys.stderr.write(f"[{log_label}] {_safe_cmd_for_log(cmd)}\n")
     proc = subprocess.run(
         cmd, cwd=cwd, env=env,
         capture_output=True, text=True, timeout=timeout,
@@ -107,12 +137,16 @@ def run(cmd, *, cwd=None, env=None, timeout=GIT_TIMEOUT_S, check=True,
     if proc.returncode != 0:
         sys.stderr.write(
             f"[{log_label or cmd[0]}] rc={proc.returncode}\n"
-            f"  stdout: {(proc.stdout or '')[:400]}\n"
-            f"  stderr: {(proc.stderr or '')[:400]}\n"
+            f"  stdout: {_scrub_secrets((proc.stdout or '')[:400])}\n"
+            f"  stderr: {_scrub_secrets((proc.stderr or '')[:400])}\n"
         )
         if check:
+            # Also scrub the exception payload — CalledProcessError repr
+            # may surface in upstream error envelopes.
+            scrubbed_stdout = _scrub_secrets(proc.stdout or "")
+            scrubbed_stderr = _scrub_secrets(proc.stderr or "")
             raise subprocess.CalledProcessError(
-                proc.returncode, cmd, proc.stdout, proc.stderr,
+                proc.returncode, cmd, scrubbed_stdout, scrubbed_stderr,
             )
     return proc
 
@@ -510,11 +544,15 @@ def main() -> "None":
         emit(payload, exit_code=0)
 
     except subprocess.CalledProcessError as exc:
+        # exc.stderr is already scrubbed (see run()); double-scrub
+        # everything else just in case the cmd token slipped in.
         payload = {
             "draft_uuid": job["draft_uuid"],
             "status": "failed",
             "stage": stage,
-            "error": f"{exc.cmd[0]} rc={exc.returncode}: {(exc.stderr or '')[:400]}",
+            "error": _scrub_secrets(
+                f"{exc.cmd[0]} rc={exc.returncode}: {(exc.stderr or '')[:400]}"
+            ),
         }
         try:
             write_result_atomically(job_uuid, payload)
@@ -526,7 +564,9 @@ def main() -> "None":
             "draft_uuid": job["draft_uuid"],
             "status": "failed",
             "stage": stage,
-            "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+            "error": _scrub_secrets(
+                f"{type(exc).__name__}: {str(exc)[:400]}"
+            ),
         }
         try:
             write_result_atomically(job_uuid, payload)

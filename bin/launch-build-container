@@ -81,6 +81,20 @@ RESULTS_DIR = Path(os.environ.get("COMMODORE_RESULTS_DIR", str(Path.home() / ".l
 
 # --- Single-exit emitter ---------------------------------------------------
 
+_TOKEN_LEAK_RE = re.compile(r"x-access-token:[^@\s]+@", re.IGNORECASE)
+_GH_PAT_RE = re.compile(r"\b(github_pat_|ghp_|gho_|ghs_|ghu_)[A-Za-z0-9_]{20,}")
+
+
+def _scrub_secrets_for_log(text: str) -> str:
+    """Belt-and-braces — strip token-in-URL and bare PAT prefixes from
+    anything we write to the per-build stderr log file."""
+    if not text:
+        return text
+    text = _TOKEN_LEAK_RE.sub("x-access-token:<REDACTED>@", text)
+    text = _GH_PAT_RE.sub(r"\1<REDACTED>", text)
+    return text
+
+
 def emit(obj: dict, exit_code: int = 0) -> "None":
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -231,7 +245,13 @@ def main() -> "None":
 
             if proc and proc.stderr:
                 try:
-                    stderr_log.write_text(proc.stderr[:200_000])
+                    # Defense-in-depth: scrub any token-shaped strings
+                    # (x-access-token:<pat>@github.com inside clone URLs,
+                    # bare github_pat_/ghp_/ghs_/ghu_/gho_ prefixes) before
+                    # writing to the log file. The worker also scrubs its
+                    # own stderr but a future worker might not.
+                    scrubbed = _scrub_secrets_for_log(proc.stderr[:200_000])
+                    stderr_log.write_text(scrubbed)
                 except OSError:
                     pass
 

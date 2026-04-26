@@ -562,6 +562,23 @@ def sweep_stale_tmp_files() -> int:
 DB_FILE = BASE_DIR / "commodore.db"
 
 
+_TOKEN_LEAK_RE = re.compile(r"x-access-token:[^@\s]+@", re.IGNORECASE)
+_GH_PAT_RE = re.compile(r"\b(github_pat_|ghp_|gho_|ghs_|ghu_)[A-Za-z0-9_]{20,}")
+
+
+def _scrub_secrets_for_db(text):
+    """Strip token-in-URL and bare PAT prefixes from anything we persist
+    to SQLite (build_job.error, etc). Worker stderr can include
+    `x-access-token:<pat>@github.com` from a failed git clone URL —
+    even though the worker scrubs its own stderr, if it crashes before
+    that path the raw container stderr can flow up via proc.stderr."""
+    if not text:
+        return text
+    text = _TOKEN_LEAK_RE.sub("x-access-token:<REDACTED>@", text)
+    text = _GH_PAT_RE.sub(r"\1<REDACTED>", text)
+    return text
+
+
 def _safe_column_add(conn, table, column, definition):
     """Idempotent ALTER TABLE ADD COLUMN. SQLite has no IF NOT EXISTS for columns."""
     try:
@@ -2829,10 +2846,16 @@ def _process_build(job_uuid: str) -> None:
         else:
             err = (result or {}).get("error") or (proc.stderr or "")[:500]
             stage = (result or {}).get("stage") or "unknown"
+            # Scrub any token-shaped strings before persisting to SQLite —
+            # proc.stderr can include `x-access-token:<pat>@github.com`
+            # from a failed git clone URL. The worker scrubs its own
+            # stderr but if it crashed before that path, raw container
+            # stderr leaks here.
+            scrubbed_err = _scrub_secrets_for_db(str(err)[:500])
             conn.execute(
                 "UPDATE build_job SET status='failed', error=?, "
                 "error_stage=?, finished_at=? WHERE job_uuid=?",
-                (str(err)[:500], stage, _now_iso(), job_uuid),
+                (scrubbed_err, stage, _now_iso(), job_uuid),
             )
             conn.commit()
             send_message_with_wal(
