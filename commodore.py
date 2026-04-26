@@ -1566,11 +1566,23 @@ def _is_admin(msg):
 # - _can_qa: Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ admin in DM. Read-only; can be
 #   wider safely.
 
+_PRIVILEGED_CHAT_IDS = (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID, AGENT_CHAT_GROUP_ID)
+_SHIP_CHAT_IDS = (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID)
+
+
 def _can_ship(msg) -> bool:
     """Authorization for /ship, /abandon, plan-refinement, PR-review.
-    Produces GitHub side effects. Bot HQ + admin only."""
+    Produces GitHub side effects. Admin in Bot HQ OR Lev Dev only.
+
+    Lev Dev is the room where dev work actually happens, so requiring a
+    walk back to Bot HQ for every PR was friction without benefit. Agent
+    Chat stays excluded — it's a public-facing room for agents to talk
+    among themselves, not for filing fleet PRs.
+    """
+    if not _is_admin(msg):
+        return False
     chat_id = msg.get("chat", {}).get("id", 0)
-    return chat_id == BOT_HQ_GROUP_ID and _is_admin(msg)
+    return bool(chat_id) and chat_id in _SHIP_CHAT_IDS
 
 
 def _can_plan(msg) -> bool:
@@ -1579,11 +1591,12 @@ def _can_plan(msg) -> bool:
 
 
 def _can_qa(msg) -> bool:
-    """Q&A is read-only. Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ admin in DM."""
+    """Q&A is read-only. Any privileged chat OR admin in DM. No admin
+    requirement in groups — anyone in Bot HQ / Lev Dev / Agent Chat may ask."""
     chat = msg.get("chat", {})
     chat_id = chat.get("id", 0)
     chat_type = chat.get("type", "")
-    if chat_id and chat_id in (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID, AGENT_CHAT_GROUP_ID):
+    if chat_id and chat_id in _PRIVILEGED_CHAT_IDS:
         return True
     if chat_type == "private" and _is_admin(msg):
         return True
