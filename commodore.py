@@ -2090,7 +2090,9 @@ _QA_RE = re.compile(
     # This matches "@bot, According to the news table, what's the top story?"
     # as well as bare "How many articles published in April?". The is_direct
     # gate upstream prevents non-mention questions from triggering Q&A.
-    r"\b(?:how\s+(?:many|much)|how|what(?:'s)?|why|when|where|which)\b.*\?",
+    # NB: include `who` and `whose` — operator questions about people/roles
+    # are common ("who are the editors online?", "whose call is this?").
+    r"\b(?:how\s+(?:many|much)|how|what(?:'s)?|why|when|where|which|who(?:'s|se)?)\b.*\?",
     re.IGNORECASE | re.DOTALL,
 )
 
