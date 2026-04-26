@@ -45,6 +45,30 @@ DB_URL_FILE = Path(os.environ.get("COMMODORE_DB_URL_FILE", "~/.config/commodore/
 
 CLAUDE_AUTH_DIR = Path(os.environ.get("COMMODORE_CLAUDE_AUTH_DIR", "~/.config/commodore/claude-auth")).expanduser()
 CLAUDE_CONFIG_FILE = Path(os.environ.get("COMMODORE_CLAUDE_CONFIG_FILE", "~/.config/commodore/dot-claude.json")).expanduser()
+# Source of truth for the host's live Claude OAuth. The launcher refreshes
+# the staged copies above from these paths every invocation so token
+# rotation by an interactive Claude session never leaves us with stale 401s.
+HOST_CLAUDE_DIR = Path(os.environ.get("COMMODORE_HOST_CLAUDE_DIR", "~/.claude")).expanduser()
+HOST_CLAUDE_CONFIG = Path(os.environ.get("COMMODORE_HOST_CLAUDE_CONFIG", "~/.claude.json")).expanduser()
+
+
+def refresh_staged_auth():
+    """Sync host's live Claude credentials into the staged paths. Called
+    every launch so OAuth rotation on the host doesn't strand the
+    container with a stale token."""
+    try:
+        if HOST_CLAUDE_DIR.is_dir() and (HOST_CLAUDE_DIR / ".credentials.json").is_file():
+            CLAUDE_AUTH_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+            shutil.copy2(HOST_CLAUDE_DIR / ".credentials.json",
+                         CLAUDE_AUTH_DIR / ".credentials.json")
+            os.chmod(CLAUDE_AUTH_DIR / ".credentials.json", 0o600)
+        if HOST_CLAUDE_CONFIG.is_file():
+            shutil.copy2(HOST_CLAUDE_CONFIG, CLAUDE_CONFIG_FILE)
+            os.chmod(CLAUDE_CONFIG_FILE, 0o600)
+    except OSError as exc:
+        # Don't crash the launcher — fall back to whatever's already staged.
+        # The container will surface the 401 if auth is still bad.
+        sys.stderr.write(f"refresh_staged_auth warning: {exc}\n")
 
 LOG_DIR = Path(os.environ.get("COMMODORE_QA_LOG_DIR", str(Path.home() / "dev/leviathan/fleet-commodore/logs/qa")))
 RESULTS_DIR = Path(os.environ.get("COMMODORE_RESULTS_DIR", str(Path.home() / ".local/state/commodore/results"))).expanduser()
@@ -115,6 +139,10 @@ def main() -> "None":
         emit({"error": "missing_credentials", "detail": f"{exc.__class__.__name__}: {exc}"}, exit_code=3)
     except PermissionError as exc:
         emit({"error": "missing_credentials", "detail": f"permission denied: {exc}"}, exit_code=3)
+
+    # Refresh staged OAuth from host's live ~/.claude — defends against
+    # token rotation since last container launch.
+    refresh_staged_auth()
 
     if not CLAUDE_AUTH_DIR.is_dir() or not CLAUDE_CONFIG_FILE.is_file():
         emit({

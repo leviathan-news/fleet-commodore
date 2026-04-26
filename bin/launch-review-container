@@ -61,6 +61,23 @@ DB_URL_FILE = Path(os.environ.get("COMMODORE_DB_URL_FILE", "~/.config/commodore/
 # will automate the copy-and-refresh.
 CLAUDE_AUTH_DIR = Path(os.environ.get("COMMODORE_CLAUDE_AUTH_DIR", "~/.config/commodore/claude-auth")).expanduser()
 CLAUDE_CONFIG_FILE = Path(os.environ.get("COMMODORE_CLAUDE_CONFIG_FILE", "~/.config/commodore/dot-claude.json")).expanduser()
+HOST_CLAUDE_DIR = Path(os.environ.get("COMMODORE_HOST_CLAUDE_DIR", "~/.claude")).expanduser()
+HOST_CLAUDE_CONFIG = Path(os.environ.get("COMMODORE_HOST_CLAUDE_CONFIG", "~/.claude.json")).expanduser()
+
+
+def refresh_staged_auth():
+    """Sync host's live Claude OAuth into the staged paths every launch."""
+    try:
+        if HOST_CLAUDE_DIR.is_dir() and (HOST_CLAUDE_DIR / ".credentials.json").is_file():
+            CLAUDE_AUTH_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+            shutil.copy2(HOST_CLAUDE_DIR / ".credentials.json",
+                         CLAUDE_AUTH_DIR / ".credentials.json")
+            os.chmod(CLAUDE_AUTH_DIR / ".credentials.json", 0o600)
+        if HOST_CLAUDE_CONFIG.is_file():
+            shutil.copy2(HOST_CLAUDE_CONFIG, CLAUDE_CONFIG_FILE)
+            os.chmod(CLAUDE_CONFIG_FILE, 0o600)
+    except OSError as exc:
+        sys.stderr.write(f"refresh_staged_auth warning: {exc}\n")
 
 # Log dir for per-review stderr (caller should have mkdir'd).
 LOG_DIR = Path(os.environ.get("COMMODORE_REVIEW_LOG_DIR", str(Path.home() / "dev/leviathan/fleet-commodore/logs/reviews")))
@@ -131,6 +148,8 @@ def main() -> "None":
     # Claude-auth state: we copy (not bind-mount the host dir) into a per-review
     # scratch directory so the container can WRITE to it (Claude CLI mutates
     # .claude/ during a session). The scratch dir is discarded at exit.
+    refresh_staged_auth()
+
     if not CLAUDE_AUTH_DIR.is_dir() or not CLAUDE_CONFIG_FILE.is_file():
         emit({
             "error": "missing_claude_auth",
