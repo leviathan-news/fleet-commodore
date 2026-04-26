@@ -27,6 +27,13 @@ FROM python:3.11-slim
 # nodejs, npm: Claude CLI + Codex CLI are Node global npm packages.
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Neutralize the python:3.11-slim base image's broken docker-clean hook,
+# which calls a Post-Invoke `rm -f` that fails on certain Docker storage
+# drivers (sub-process error, exit 100). The hook is a "save image space"
+# convenience; we don't need it. Without this, `apt-get update` exits 100
+# even after a successful network fetch. (Discovered 2026-04-26.)
+RUN echo > /etc/apt/apt.conf.d/docker-clean
+
 RUN apt-get update -qq \
  && apt-get install -y --no-install-recommends \
         bash git ca-certificates curl openssl procps gnupg lsb-release \
