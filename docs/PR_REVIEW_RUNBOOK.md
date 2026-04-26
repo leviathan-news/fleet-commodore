@@ -695,28 +695,53 @@ SELECT id, action_type, telegram_message_id, sent_at,
 
 ## DB role hardening (one-shot SQL)
 
-Append the following REVOKEs to the `commodore_reader` role provisioning
-block above. Run as DigitalOcean DB admin once per database:
+> **GOTCHA discovered 2026-04-26**: column-level `REVOKE SELECT (col)` is a
+> no-op if `GRANT SELECT ON ALL TABLES IN SCHEMA public` has already
+> expanded into per-column grants. The robust pattern is REVOKE-ALL +
+> re-GRANT the safe columns explicitly. The script below uses that pattern.
+
+Run as DigitalOcean DB admin (`doadmin`) once per database. The full
+provisioning script lives at `bin/provision-commodore-reader` (drop a copy
+on the Mini and run via `squid-env/bin/python`):
 
 ```sql
-REVOKE SELECT (email, unique_token) ON bot_user FROM commodore_reader;
-REVOKE SELECT ON bot_social_account FROM commodore_reader;
-REVOKE SELECT ON bot_webauthn_credential FROM commodore_reader;
-REVOKE SELECT ON bot_pending_account_claim FROM commodore_reader;
-REVOKE SELECT ON lnn_user_login_event FROM commodore_reader;
-REVOKE SELECT (ip_address, user_agent) ON lnn_click FROM commodore_reader;
+-- Whole-table REVOKEs (work as expected):
+REVOKE ALL ON django_session FROM commodore_reader;
+REVOKE ALL ON bot_social_account FROM commodore_reader;
+REVOKE ALL ON bot_webauthn_credential FROM commodore_reader;
+REVOKE ALL ON bot_pending_account_claim FROM commodore_reader;
+REVOKE ALL ON lnn_user_login_event FROM commodore_reader;  -- if exists
+
+-- Column-level: REVOKE-ALL + re-GRANT specific columns is the only
+-- pattern that survives the bulk-grant expansion.
+-- bot_user: keep id, telegram_account, etc; deny email, unique_token, password
+REVOKE ALL ON bot_user FROM commodore_reader;
+GRANT SELECT (id, telegram_account, ethereum_address, account_type, ...) -- enumerate
+       ON bot_user TO commodore_reader;
+
+-- lnn_click: keep id, news_id, etc; deny ip_address, user_agent
+REVOKE ALL ON lnn_click FROM commodore_reader;
+GRANT SELECT (id, news_id, source, ...)  -- enumerate
+       ON lnn_click TO commodore_reader;
 ```
 
-Verify (each query must error with `permission denied`):
+Verify (each sensitive query MUST error with `permission denied`; each
+allowed query MUST succeed):
 
 ```sql
 -- As commodore_reader:
-SELECT email FROM bot_user LIMIT 1;
-SELECT * FROM bot_social_account LIMIT 1;
-SELECT * FROM bot_webauthn_credential LIMIT 1;
-SELECT * FROM bot_pending_account_claim LIMIT 1;
-SELECT * FROM lnn_user_login_event LIMIT 1;
-SELECT ip_address FROM lnn_click LIMIT 1;
+SELECT count(*) FROM lnn_news;                 -- ALLOWED
+SELECT id FROM bot_user LIMIT 1;               -- ALLOWED
+SELECT email FROM bot_user LIMIT 1;            -- DENIED
+SELECT unique_token FROM bot_user LIMIT 1;     -- DENIED
+SELECT password FROM bot_user LIMIT 1;         -- DENIED
+SELECT * FROM bot_social_account LIMIT 1;      -- DENIED
+SELECT * FROM bot_webauthn_credential LIMIT 1; -- DENIED
+SELECT * FROM bot_pending_account_claim LIMIT 1; -- DENIED
+SELECT * FROM django_session LIMIT 1;          -- DENIED
+SELECT id FROM lnn_click LIMIT 1;              -- ALLOWED
+SELECT ip_address FROM lnn_click LIMIT 1;      -- DENIED
+SELECT user_agent FROM lnn_click LIMIT 1;      -- DENIED
 ```
 
 
