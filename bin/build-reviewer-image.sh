@@ -53,7 +53,7 @@ echo "=== Build 1/3: commodore-reviewer ==="
 # Image 2: commodore-egress-proxy (tinyproxy HTTPS allowlist, ~30 MB)
 # ---------------------------------------------------------------------------
 echo
-echo "=== Build 2/3: commodore-egress-proxy ==="
+echo "=== Build 2/4: commodore-egress-proxy (build/review network) ==="
 "$DOCKER" build \
     -f "$REPO_ROOT/egress-proxy.Dockerfile" \
     -t "commodore-egress-proxy:${GIT_SHA}" \
@@ -61,10 +61,22 @@ echo "=== Build 2/3: commodore-egress-proxy ==="
     "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
-# Image 3: commodore-db-tunnel (socat, ~15 MB) — needs DB_HOST at build time.
+# Image 3: commodore-qa-egress-proxy (Q&A network — same image shape, but
+# uses egress/qa-filter which excludes *.github.com).
 # ---------------------------------------------------------------------------
 echo
-echo "=== Build 3/3: commodore-db-tunnel ==="
+echo "=== Build 3/4: commodore-qa-egress-proxy (Q&A network) ==="
+"$DOCKER" build \
+    -f "$REPO_ROOT/egress-qa-proxy.Dockerfile" \
+    -t "commodore-qa-egress-proxy:${GIT_SHA}" \
+    -t "commodore-qa-egress-proxy:latest" \
+    "$REPO_ROOT"
+
+# ---------------------------------------------------------------------------
+# Image 4: commodore-db-tunnel (socat, ~15 MB) — needs DB_HOST at build time.
+# ---------------------------------------------------------------------------
+echo
+echo "=== Build 4/4: commodore-db-tunnel ==="
 if [[ -z "${DB_HOST:-}" ]]; then
     echo "WARN: DB_HOST not set; skipping db-tunnel build."
     echo "      Re-run with DB_HOST=<host> DB_PORT=<port> ./bin/build-reviewer-image.sh"
