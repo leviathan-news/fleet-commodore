@@ -165,6 +165,9 @@ def main() -> "None":
 
             cmd = [
                 DOCKER, "run", "--rm",
+                # -i forwards subprocess stdin to the container — without
+                # it the worker reads empty stdin and exits 2.
+                "-i",
                 "--name", container_name,
                 "--network", EGRESS_NETWORK,
                 "--read-only",

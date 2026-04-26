@@ -169,6 +169,10 @@ def main() -> "None":
 
             cmd = [
                 DOCKER, "run", "--rm",
+                # -i: forward our stdin to the container's stdin. Without
+                # this, docker detaches stdin and the worker reads "" and
+                # exits 2 with `no_job`. (Discovered 2026-04-26.)
+                "-i",
                 "--name", container_name,
                 "--network", EGRESS_NETWORK,
                 # Override the image's default ENTRYPOINT (review_worker.py).
