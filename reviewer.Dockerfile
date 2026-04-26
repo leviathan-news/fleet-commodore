@@ -110,6 +110,7 @@ WORKDIR /app
 # --- App payload -----------------------------------------------------------
 COPY --chown=reviewer:reviewer review_worker.py /app/review_worker.py
 COPY --chown=reviewer:reviewer qa_worker.py /app/qa_worker.py
+COPY --chown=reviewer:reviewer build_worker.py /app/build_worker.py
 COPY --chown=reviewer:reviewer bin/commodore-db /app/bin/commodore-db
 COPY --chown=reviewer:reviewer bin/commodore-orm /app/bin/commodore-orm
 RUN chmod +x /app/bin/commodore-db /app/bin/commodore-orm

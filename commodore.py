@@ -3326,9 +3326,22 @@ def poll():
                             else:
                                 response = _claim_review(msg, pr_number, repo)
 
-                # PR filing flow (existing stub) — only if review didn't match.
+                # "file a PR / open a PR / draft a PR" routes into the v6
+                # plan-refinement flow. The old v1 stub (handle_pr_request)
+                # is retained for grep purposes but no longer reachable from
+                # poll() — it announced a branch and did nothing.
                 if response is None and is_direct and _detect_pr_request(text):
-                    response = handle_pr_request(msg, policy)
+                    if _can_plan(msg):
+                        stripped = text.strip()
+                        stripped_no_mention = re.sub(
+                            r"^@\S+\s*[,:]?\s*", "", stripped, count=1,
+                        )
+                        response = handle_plan_message(msg, stripped_no_mention)
+                    else:
+                        response = (
+                            "The Fleet does not entertain pull-request orders "
+                            "from this quarter. Pray return to Bot HQ or Lev Dev."
+                        )
 
                 # v6 conversational pipelines. Each handler enforces its own
                 # auth gate (_can_ship / _can_plan / _can_qa) so wrong-channel

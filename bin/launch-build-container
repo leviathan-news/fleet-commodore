@@ -189,6 +189,10 @@ def main() -> "None":
                 "-i",
                 "--name", container_name,
                 "--network", EGRESS_NETWORK,
+                # Override the image's default ENTRYPOINT (review_worker.py).
+                # build_worker.py is COPYed alongside it; we just need to
+                # re-target the python invocation.
+                "--entrypoint", "python3",
                 "--read-only",
                 "--tmpfs", "/tmp:rw,exec,nosuid,size=200m",
                 "--tmpfs", "/home/reviewer:rw,exec,nosuid,size=200m,uid=1000,gid=1000",
@@ -201,6 +205,10 @@ def main() -> "None":
                 "--security-opt", "no-new-privileges",
                 "--env-file", env_file,
                 REVIEWER_IMAGE,
+                # The argv override: -u for unbuffered, build_worker.py as
+                # the actual entrypoint. The image COPYs build_worker.py to
+                # /app/build_worker.py (added in this commit).
+                "-u", "/app/build_worker.py",
             ]
 
             try:
