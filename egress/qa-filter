@@ -1,0 +1,23 @@
+# tinyproxy FilterDefaultDeny allowlist for the Q&A container.
+#
+# Distinct from egress/filter: the Q&A pipeline has NO GitHub access. The
+# bot's read-only Q&A oracle is the local docs/dev-journal corpus (mounted
+# read-only at /app/knowledge), the local Postgres reader role (via the
+# db-tunnel sidecar), and the public Leviathan website API.
+#
+# Mounting GH_TOKEN into Q&A would widen the blast radius of a successful
+# prompt-injection inside the container — see plan v6.
+
+# --- Anthropic ------------------------------------------------------------
+^api\.anthropic\.com$
+^[a-z0-9-]+\.anthropic\.com$
+
+# --- Leviathan public site ------------------------------------------------
+# Public news, tags, search APIs — no auth required, read-only.
+^leviathannews\.xyz$
+^[a-z0-9-]+\.leviathannews\.xyz$
+
+# NOTE: Postgres (read-only `commodore_reader` role on DigitalOcean managed
+# DB) is NOT here. It goes through commodore-db-tunnel on the same network.
+# NOTE: NO github.com subdomains. Q&A has no business pushing branches or
+# reading private repo content live; the docs corpus is mounted instead.

@@ -1,7 +1,13 @@
 # Fleet Commodore — PR Review Runbook
 
-Operator-facing runbook for the PR-review feature. Covers first-time setup,
-rotations, image rebuilds, troubleshooting, and shutdown.
+> **Scope (as of v6 plan):** despite the filename, this runbook now covers the
+> conversational-build, Q&A, recovery, and duplicate-cleanup operations as well
+> as PR review. The filename is preserved to avoid breaking live references at
+> `scripts/pending-mail-to-eunice.py:59` and elsewhere; a future isolated PR
+> can rename to `OPERATOR_RUNBOOK.md` with an exhaustive caller sweep.
+
+Operator-facing runbook covering first-time setup, rotations, image rebuilds,
+troubleshooting, and shutdown.
 
 ## Architecture recap
 
@@ -446,8 +452,288 @@ The DB URL is a read-only Postgres role with two tables denylisted.
 - **DB wrappers**: `bin/commodore-db`, `bin/commodore-orm`
 - **Dockerfiles**: `reviewer.Dockerfile`, `egress-proxy.Dockerfile`, `db-tunnel.Dockerfile`
 - **Build + setup scripts**: `bin/build-reviewer-image.sh`, `bin/setup-commodore-egress-network.sh`
-- **Plan archive**: `~/.claude/plans/eager-watching-balloon.md` (final implementation plan, v5)
+- **Plan archive**: `~/.claude/plans/eager-watching-balloon.md` (v1) and
+  `~/.claude/plans/valiant-squishing-crab.md` (v6 — current implementation plan)
 - **Dev journal entries** (squid-bot repo):
   - `dev-journal/entries/ai-agents/2026-04-17-fleet-commodore-shipping.md`
   - `dev-journal/entries/ai-agents/2026-04-16-fleet-commodore-wager-denylist.md`
 - **Upstream auth gap**: `leviathan-news/squid-bot#256` (agent auth docs vs reality)
+
+
+---
+
+
+## Per-pipeline durability contract (v6)
+
+Operators and reviewers MUST use this exact split in all comms (Bot HQ pin,
+deploy-time announcements, post-incident write-ups). Do NOT describe the
+system as "no double side-effects on any pipeline" — that overstates what
+the design delivers.
+
+- **Build pipeline: fully idempotent.** No duplicate PR is possible across
+  any crash window. Three independent pre-flights: scratch-file scan,
+  `gh pr list --head leviathan-agent:<branch>`, `outgoing_msg` log. The
+  GitHub side effect (the PR itself) is its own external oracle.
+
+- **Q&A pipeline: best-effort with a documented narrow window.** No silent
+  skip. **A single duplicate Telegram answer is possible** if the daemon
+  crashes between `outgoing_msg` intent insert and Telegram's response
+  being recorded. We surface duplicates rather than swallow them — operators
+  resolve via `bin/commodore-dup-cleanup`.
+
+- **Review pipeline: same contract as Q&A.** Same primitives, same residual
+  duplicate window, same cleanup recipe.
+
+This is the limit achievable without Telegram-side idempotency tokens.
+
+
+## Q&A egress: separate network
+
+Q&A runs on a dedicated network (`commodore-qa-egress`) with NO GitHub
+allowlist. The proxy image is `commodore-qa-egress-proxy:latest`, built
+from `egress/qa-filter` (which omits all `*.github.com` entries).
+
+```bash
+# Inspect the network membership
+docker network inspect commodore-qa-egress
+
+# Confirm no GitHub from inside (should print "PASS: api.github.com denied")
+./bin/setup-commodore-qa-egress-network.sh
+```
+
+Why: the Q&A worker has the docs/dev-journal corpus mounted read-only at
+`/app/knowledge` and the read-only Postgres reader role via the
+`commodore-qa-db-tunnel` sidecar. There is no concrete Q&A workload that
+needs live GitHub access. Mounting `GH_TOKEN` would widen blast radius for
+no gain.
+
+
+## Boot recovery
+
+When the daemon restarts, `_recover_jobs_on_boot()` runs ONCE before any
+worker thread starts pulling from queues. It:
+
+1. Sweeps `*.result.json.tmp` files in `~/.local/state/commodore/results/`
+   older than 60s. These are evidence of a worker crash mid-write; their
+   contents are guaranteed garbage by the atomic write protocol.
+2. Re-queues every `(queued | in_progress)` row in `build_job`, `qa_job`,
+   and `pr_review`. Workers' pre-flight branches detect already-completed
+   side effects via the scratch file or external oracle and reconcile
+   without producing a second side effect.
+
+What the operator sees on a restart that recovered work:
+```
+[INFO] sweep_stale_tmp_files: removed N orphaned .tmp files
+[INFO] recovery: {'build': X, 'qa': Y, 'review': Z, 'tmp_swept': N,
+                  'reconciled': R, 'requeued': Q}
+```
+
+Inspect what's in flight after a restart:
+```bash
+sqlite3 commodore.db "
+  SELECT 'build' AS pipe, status, attempt_count, target_repo, error
+    FROM build_job WHERE status NOT IN ('succeeded','failed','abandoned','orphaned')
+  UNION ALL
+  SELECT 'qa', status, attempt_count, NULL, declined_reason
+    FROM qa_job WHERE status NOT IN ('answered','declined','failed')
+  UNION ALL
+  SELECT 'review', status, attempt_count, repo, error
+    FROM pr_review WHERE status NOT IN ('posted','failed','orphaned','superseded')
+  ORDER BY 1, 2;
+"
+```
+
+
+## Per-action authorization model
+
+| Action | Predicate | Required chat | Required role |
+|---|---|---|---|
+| `let's plan ...` | `_can_plan` | Bot HQ | admin |
+| `ship it`, `/ship` | `_can_ship` | Bot HQ | admin |
+| `abandon plan`, `/abandon` | `_can_plan` | Bot HQ | admin |
+| `review PR N`, `/review N` | `_can_ship` (same as PR-file) | Bot HQ | admin |
+| `/ask ...`, "how/what/why ..." | `_can_qa` | Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ admin DM | none |
+
+Out-of-policy callers receive an in-character decline pointing them to the
+correct chat. The predicates live in `commodore.py` near `_is_admin()`.
+
+
+## Idempotency keys and manual retry
+
+Every job table has `idempotency_key` and `side_effect_completed_at`:
+
+- `build_job.idempotency_key = sha256(target_repo + target_branch + plan_body)`
+- `qa_job.idempotency_key = sha256(chat_id + thread_id + request_msg_id + question)`
+- `pr_review.idempotency_key` (legacy rows have empty key, exempt from unique index)
+
+To force a retry of a specific job (operator override):
+```sql
+-- Build: clear the side-effect flag, requeue
+UPDATE build_job
+   SET side_effect_completed_at = NULL, status = 'queued', pr_url = NULL
+ WHERE job_uuid = '<uuid>';
+-- Then bounce the daemon: tmux kill-window -t leviathan:commodore
+```
+
+Inspect:
+```sql
+SELECT id, status, idempotency_key, side_effect_completed_at, pr_url, error
+  FROM build_job ORDER BY id DESC LIMIT 10;
+```
+
+
+## Result scratch directory (`~/.local/state/commodore/results/`)
+
+Owned by the coordinator user, mode `0o700`. Workers write
+`<uuid>.result.json` here as their first irreversible act (e.g. immediately
+after `gh pr create` returns 201). The COORDINATOR reads + unlinks after
+recording the outcome to SQLite. The launcher MUST NOT delete files here.
+
+Atomic write protocol (POSIX `rename(2)` is atomic on the same filesystem):
+1. Write to `<uuid>.result.json.tmp` + `fsync(fd)`
+2. `os.rename(tmp, final)`
+3. `fsync(dir_fd)`
+
+Operator should never see `.tmp` files outside a sub-second window. A `.tmp`
+file persisting >60s is evidence of a worker crash mid-write — boot recovery
+sweeps these. To check for stale orphans manually:
+```bash
+find ~/.local/state/commodore/results/ -mtime +7 -name '*.json'
+# Anything here is either an unrecovered side-effect or operator-leftover.
+```
+
+
+## Outgoing-message write-ahead log (`outgoing_msg`)
+
+The dedup oracle for QA/review. Every Telegram send issued on behalf of a
+job goes through `send_message_with_wal`, which:
+1. INSERT OR IGNORE intent row keyed by `(job_table, job_uuid, intent_id)`.
+2. Telegram POST.
+3. UPDATE row with `telegram_message_id` + `sent_at` (or `error`).
+
+Operator queries:
+```sql
+-- In-flight (intent recorded, response not yet returned)
+SELECT job_table, job_uuid, action_type, dedup_token, intent_recorded_at
+  FROM outgoing_msg
+ WHERE telegram_message_id IS NULL
+ ORDER BY id DESC LIMIT 20;
+
+-- Recent confirmed
+SELECT job_table, job_uuid, action_type, telegram_message_id, sent_at
+  FROM outgoing_msg
+ WHERE telegram_message_id IS NOT NULL
+ ORDER BY id DESC LIMIT 20;
+
+-- Detect duplicates (the contract residual — see below)
+SELECT job_table, job_uuid, action_type, COUNT(*) AS dup_count
+  FROM outgoing_msg
+ WHERE telegram_message_id IS NOT NULL
+   AND cleanup_role IS NULL
+ GROUP BY 1, 2, 3
+HAVING COUNT(*) > 1;
+```
+
+
+## Duplicate-cleanup workflow (v7)
+
+When the duplicate-detection query returns rows, run `bin/commodore-dup-cleanup`.
+
+### Detection
+
+```bash
+./bin/commodore-dup-cleanup --list
+```
+
+### Resolution
+
+For each `(job_table, job_uuid, action_type)` group:
+- **Canonical** = lowest `id` (= earliest `intent_recorded_at`).
+- **Suppressed** = all others. Telegram-side action depends on age + chat type:
+
+| Pipeline / chat | Action | Why |
+|---|---|---|
+| QA/review threaded chat, ≤48h | `editMessageText` to "_duplicate of N° X — superseded_" | Preserves reply chain. |
+| QA/review non-threaded chat, ≤48h | `deleteMessage` | No chain to preserve. |
+| Build ack/apology, ≤48h | `editMessageText` to pointer | PR itself is unique; ack is innocuous. |
+| Any, >48h | Leave-in-place + `dup_followup` reply | Telegram refuses edit/delete past 48h. |
+
+```bash
+# Interactive single-group resolve
+./bin/commodore-dup-cleanup --resolve qa_job <job_uuid> qa_answer
+
+# Bulk dry-run
+./bin/commodore-dup-cleanup --resolve-all --dry-run
+
+# Bulk execute (only auto-resolves groups where all rows are <48h)
+./bin/commodore-dup-cleanup --resolve-all
+```
+
+After successful Telegram-side action, `outgoing_msg.cleanup_role` and
+`cleanup_action` are set. The detection query filters on `cleanup_role IS NULL`,
+so already-resolved duplicates stop appearing in `--list`.
+
+### Auditability
+
+```sql
+SELECT id, action_type, telegram_message_id, sent_at,
+       cleanup_role, cleanup_action, cleanup_at, cleanup_operator_id
+  FROM outgoing_msg
+ WHERE job_uuid = '<uuid>'
+ ORDER BY id ASC;
+```
+
+### What this does NOT promise
+
+- It does not PREVENT duplicates. The contract residual stands.
+- It does not retroactively fix user confusion if both messages were read
+  before cleanup. The pointer text is the best we can do.
+- It only catches duplicates logged via the WAL helper. All QA/review reply
+  paths MUST go through `send_message_with_wal()` — there is a unit test
+  enforcing this.
+
+
+## DB role hardening (one-shot SQL)
+
+Append the following REVOKEs to the `commodore_reader` role provisioning
+block above. Run as DigitalOcean DB admin once per database:
+
+```sql
+REVOKE SELECT (email, unique_token) ON bot_user FROM commodore_reader;
+REVOKE SELECT ON bot_social_account FROM commodore_reader;
+REVOKE SELECT ON bot_webauthn_credential FROM commodore_reader;
+REVOKE SELECT ON bot_pending_account_claim FROM commodore_reader;
+REVOKE SELECT ON lnn_user_login_event FROM commodore_reader;
+REVOKE SELECT (ip_address, user_agent) ON lnn_click FROM commodore_reader;
+```
+
+Verify (each query must error with `permission denied`):
+
+```sql
+-- As commodore_reader:
+SELECT email FROM bot_user LIMIT 1;
+SELECT * FROM bot_social_account LIMIT 1;
+SELECT * FROM bot_webauthn_credential LIMIT 1;
+SELECT * FROM bot_pending_account_claim LIMIT 1;
+SELECT * FROM lnn_user_login_event LIMIT 1;
+SELECT ip_address FROM lnn_click LIMIT 1;
+```
+
+
+## New file inventory (v6)
+
+- **`commodore.py`** — schema additions, `OutgoingAction` enum, `_can_*()`
+  predicates, `send_message_with_wal()`, `_claim_build_job()`/`_claim_qa_job()`,
+  `handle_plan_message`/`handle_ship`/`handle_abandon`/`handle_qa`,
+  `_process_build`/`_process_qa`/`_process_review`, `_recover_jobs_on_boot()`,
+  `_start_workers()`. RESULTS_DIR + atomic-read helpers.
+- **`bin/launch-build-container`** — fork-and-PR launcher; mounts results dir.
+- **`bin/launch-qa-container`** — Q&A launcher; NO GH_TOKEN; knowledge corpus
+  mount; runs on `commodore-qa-egress`.
+- **`bin/launch-review-container`** — modified to mount results dir.
+- **`bin/setup-commodore-qa-egress-network.sh`** — provisioning for the Q&A
+  network + sidecars.
+- **`bin/commodore-dup-cleanup`** — operator helper for the v7 cleanup recipe.
+- **`egress/qa-filter`** — tinyproxy allowlist for the Q&A network (no GitHub).
+- **`review_worker.py`** — fleshed out from v1 stub: real `gh pr diff` +
+  Claude review + atomic scratch write.

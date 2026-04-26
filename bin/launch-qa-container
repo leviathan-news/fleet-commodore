@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""launch-qa-container — Fleet Commodore Q&A launcher.
+
+Direct adaptation of launch-review-container with three intentional
+differences:
+
+  1. NO GH_TOKEN injected. The Q&A worker has no GitHub access. The egress
+     proxy (commodore-qa-egress-proxy) denies *.github.com at the network
+     layer. The tool allowlist inside Claude is also tightened.
+  2. Distinct network: commodore-qa-egress.
+  3. Knowledge corpus mounted read-only at /app/knowledge from the host's
+     local checkouts of squid-bot, auction-ui, etc.
+
+Stdout: ONE JSON object. Stderr: per-job log file.
+
+Exit codes: 0 ok, 1 child_exit, 2 invalid_uuid, 3 missing_credentials,
+4 timeout, 5 launcher_internal.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+# --- Configuration ---------------------------------------------------------
+
+DOCKER = os.environ.get("COMMODORE_DOCKER", "/usr/local/bin/docker")
+REVIEWER_IMAGE = os.environ.get("COMMODORE_REVIEWER_IMAGE", "commodore-reviewer:latest")
+EGRESS_NETWORK = os.environ.get("COMMODORE_QA_EGRESS_NETWORK", "commodore-qa-egress")
+PROXY_HOST = os.environ.get("COMMODORE_QA_EGRESS_PROXY_HOST", "commodore-qa-egress-proxy")
+PROXY_PORT = int(os.environ.get("COMMODORE_QA_EGRESS_PROXY_PORT", "8888"))
+DB_TUNNEL_HOST = os.environ.get("COMMODORE_QA_DB_TUNNEL_HOST", "commodore-qa-db-tunnel")
+
+# Q&A is interactive — keep tight. Long answers are usually wrong answers.
+QA_TIMEOUT_S = int(os.environ.get("COMMODORE_QA_TIMEOUT_S", "300"))
+
+# Note: GH_PAT_FILE deliberately NOT read here.
+DB_URL_FILE = Path(os.environ.get("COMMODORE_DB_URL_FILE", "~/.config/commodore/db_url")).expanduser()
+
+CLAUDE_AUTH_DIR = Path(os.environ.get("COMMODORE_CLAUDE_AUTH_DIR", "~/.config/commodore/claude-auth")).expanduser()
+CLAUDE_CONFIG_FILE = Path(os.environ.get("COMMODORE_CLAUDE_CONFIG_FILE", "~/.config/commodore/dot-claude.json")).expanduser()
+
+LOG_DIR = Path(os.environ.get("COMMODORE_QA_LOG_DIR", str(Path.home() / "dev/leviathan/fleet-commodore/logs/qa")))
+RESULTS_DIR = Path(os.environ.get("COMMODORE_RESULTS_DIR", str(Path.home() / ".local/state/commodore/results"))).expanduser()
+
+# Knowledge corpus root. The launcher mounts subdirs read-only into the
+# container. Override via COMMODORE_KNOWLEDGE_ROOT to point at a different
+# directory tree (useful for tests).
+KNOWLEDGE_ROOT = Path(os.environ.get(
+    "COMMODORE_KNOWLEDGE_ROOT", str(Path.home() / "dev/leviathan"),
+)).expanduser()
+
+# Subpaths under KNOWLEDGE_ROOT to expose. Tuples of (host_subpath, container_path).
+# Missing host paths are skipped silently — operator may not have all repos
+# checked out locally.
+KNOWLEDGE_MOUNTS = [
+    ("squid-bot/dev-journal", "/app/knowledge/squid-bot/dev-journal"),
+    ("squid-bot/docs", "/app/knowledge/squid-bot/docs"),
+    ("squid-bot/CLAUDE.md", "/app/knowledge/squid-bot/CLAUDE.md"),
+    ("squid-bot/README.md", "/app/knowledge/squid-bot/README.md"),
+    ("auction-ui/CLAUDE.md", "/app/knowledge/auction-ui/CLAUDE.md"),
+    ("auction-ui/README.md", "/app/knowledge/auction-ui/README.md"),
+    ("be-benthic/CLAUDE.md", "/app/knowledge/be-benthic/CLAUDE.md"),
+    ("be-benthic/README.md", "/app/knowledge/be-benthic/README.md"),
+    ("agent-chat/CLAUDE.md", "/app/knowledge/agent-chat/CLAUDE.md"),
+    ("agent-chat/README.md", "/app/knowledge/agent-chat/README.md"),
+    ("fleet-commodore/CLAUDE.md", "/app/knowledge/fleet-commodore/CLAUDE.md"),
+    ("fleet-commodore/README.md", "/app/knowledge/fleet-commodore/README.md"),
+]
+
+
+def emit(obj: dict, exit_code: int = 0) -> "None":
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+    sys.exit(exit_code)
+
+
+def extract_last_json(text: str) -> "dict | None":
+    depth = 0
+    start = -1
+    last_valid = None
+    for i, ch in enumerate(text or ""):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    last_valid = json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    pass
+                start = -1
+    return last_valid
+
+
+def main() -> "None":
+    if len(sys.argv) < 2:
+        emit({"error": "missing_uuid"}, exit_code=2)
+    job_uuid = sys.argv[1]
+    if not re.fullmatch(r"[a-f0-9-]{8,40}", job_uuid):
+        emit({"error": "invalid_uuid"}, exit_code=2)
+    container_name = f"commodore-qa-{job_uuid}"
+
+    try:
+        db_url = DB_URL_FILE.read_text().strip()
+    except FileNotFoundError as exc:
+        emit({"error": "missing_credentials", "detail": f"{exc.__class__.__name__}: {exc}"}, exit_code=3)
+    except PermissionError as exc:
+        emit({"error": "missing_credentials", "detail": f"permission denied: {exc}"}, exit_code=3)
+
+    if not CLAUDE_AUTH_DIR.is_dir() or not CLAUDE_CONFIG_FILE.is_file():
+        emit({
+            "error": "missing_claude_auth",
+            "detail": (
+                f"Claude auth state not staged. Expected dir at "
+                f"{CLAUDE_AUTH_DIR} and file at {CLAUDE_CONFIG_FILE}."
+            ),
+        }, exit_code=3)
+
+    try:
+        job_raw = sys.stdin.read()
+        job = json.loads(job_raw) if job_raw.strip() else {}
+    except json.JSONDecodeError as exc:
+        emit({"error": "bad_job_json", "detail": str(exc)}, exit_code=5)
+
+    for req in ("question",):
+        if req not in job:
+            emit({"error": "missing_job_field", "field": req}, exit_code=5)
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    stderr_log = LOG_DIR / f"{job_uuid}.stderr"
+
+    with tempfile.TemporaryDirectory(prefix=f"commodore-qa-{job_uuid}-") as scratch:
+        scratch_path = Path(scratch)
+        claude_copy = scratch_path / "claude-auth"
+        shutil.copytree(CLAUDE_AUTH_DIR, claude_copy)
+        claude_json_copy = scratch_path / "dot-claude.json"
+        shutil.copy2(CLAUDE_CONFIG_FILE, claude_json_copy)
+
+        env_file = None
+        proc = None
+        try:
+            umask_prev = os.umask(0o077)
+            try:
+                env_tmp = tempfile.NamedTemporaryFile(
+                    mode="w", delete=False, prefix=f"commodore-qa-env-{job_uuid}-", dir="/tmp",
+                )
+                env_file = env_tmp.name
+                os.chmod(env_file, 0o600)
+                # NB: NO GH_TOKEN here. That's the whole point.
+                env_tmp.write(f"COMMODORE_DB_URL={db_url}\n")
+                env_tmp.write(f"HTTPS_PROXY=http://{PROXY_HOST}:{PROXY_PORT}\n")
+                env_tmp.write(f"HTTP_PROXY=http://{PROXY_HOST}:{PROXY_PORT}\n")
+                env_tmp.write(f"NO_PROXY=localhost,127.0.0.1,{DB_TUNNEL_HOST}\n")
+                env_tmp.write(f"QA_UUID={job_uuid}\n")
+                env_tmp.write("WORKER_MODE=qa\n")
+                env_tmp.close()
+            finally:
+                os.umask(umask_prev)
+
+            cmd = [
+                DOCKER, "run", "--rm",
+                "--name", container_name,
+                "--network", EGRESS_NETWORK,
+                # Override the image's default ENTRYPOINT (review_worker.py).
+                # Same image, different worker entrypoint — keeps the build
+                # graph small while letting QA have a distinct script.
+                "--entrypoint", "python3",
+                "--read-only",
+                "--tmpfs", "/tmp:rw,exec,nosuid,size=50m",
+                "--tmpfs", "/home/reviewer:rw,exec,nosuid,size=50m,uid=1000,gid=1000",
+                "-v", f"{claude_copy}:/home/reviewer/.claude:rw",
+                "-v", f"{claude_json_copy}:/home/reviewer/.claude.json:rw",
+                "-v", f"{RESULTS_DIR}:/var/run/commodore-results:rw",
+            ]
+            # Knowledge corpus: each subpath mounted read-only. Skip missing.
+            for host_sub, container_path in KNOWLEDGE_MOUNTS:
+                host_path = KNOWLEDGE_ROOT / host_sub
+                if host_path.exists():
+                    cmd.extend(["-v", f"{host_path}:{container_path}:ro"])
+            cmd.extend([
+                "--memory", "512m",
+                "--cpus", "1.0",
+                "--security-opt", "no-new-privileges",
+                "--env-file", env_file,
+                REVIEWER_IMAGE,
+                # The argv override: -u for unbuffered, qa_worker.py as the
+                # actual entrypoint. The image already COPYs qa_worker.py to
+                # /app/qa_worker.py via reviewer.Dockerfile.
+                "-u", "/app/qa_worker.py",
+            ])
+
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    input=json.dumps(job),
+                    capture_output=True, text=True,
+                    timeout=QA_TIMEOUT_S,
+                )
+            except subprocess.TimeoutExpired:
+                subprocess.run([DOCKER, "kill", container_name],
+                               capture_output=True, timeout=30)
+                subprocess.run([DOCKER, "rm", "-f", container_name],
+                               capture_output=True, timeout=30)
+                emit({
+                    "error": "timeout",
+                    "detail": f"qa exceeded {QA_TIMEOUT_S}s; container killed",
+                    "job_uuid": job_uuid,
+                }, exit_code=4)
+
+            if proc and proc.stderr:
+                try:
+                    stderr_log.write_text(proc.stderr[:200_000])
+                except OSError:
+                    pass
+
+            payload = extract_last_json(proc.stdout if proc else "")
+            if proc and proc.returncode == 0 and payload is not None:
+                emit(payload, exit_code=0)
+            else:
+                emit({
+                    "error": "child_exit",
+                    "job_uuid": job_uuid,
+                    "returncode": proc.returncode if proc else None,
+                    "stdout_was_parseable": payload is not None,
+                    "stderr_log": str(stderr_log),
+                }, exit_code=1)
+
+        finally:
+            if env_file:
+                try:
+                    os.unlink(env_file)
+                except OSError:
+                    pass
+            if proc is None or (proc is not None and proc.returncode != 0):
+                subprocess.run([DOCKER, "rm", "-f", container_name],
+                               capture_output=True, timeout=10)
+
+
+if __name__ == "__main__":
+    main()

@@ -205,17 +205,28 @@ def test_review_worker_version_returns_json():
     assert "python_deps" in payload
 
 
-def test_review_worker_stub_acknowledges_job_shape():
-    """v1 stub returns status=not_implemented rather than faking findings."""
+def test_review_worker_handles_unavailable_gh_cleanly(tmp_path):
+    """v6: real review_worker.py shells to `gh pr diff`. In a test env without
+    a configured `gh` it should exit 0 with status=failed + a structured
+    error envelope — never crash, never fake findings, never block the
+    coordinator."""
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
     proc = subprocess.run(
         [sys.executable, str(WORKER)],
-        input=json.dumps({"review_uuid": "abc12345", "repo": "leviathan-news/squid-bot", "pr_number": 1}),
-        capture_output=True, text=True, timeout=15,
+        input=json.dumps({"review_uuid": "abc12345",
+                          "repo": "leviathan-news/squid-bot", "pr_number": 1}),
+        capture_output=True, text=True, timeout=30,
+        env={**os.environ,
+             "GH_BIN": "/nonexistent/gh",
+             "CLAUDE_BIN": "/nonexistent/claude",
+             "RESULTS_DIR": str(results_dir)},
     )
     assert proc.returncode == 0
     payload = json.loads(proc.stdout.strip())
-    assert payload["status"] == "not_implemented"
     assert payload["review_uuid"] == "abc12345"
+    assert payload["status"] == "failed"
+    assert payload["error"] in ("diff_unavailable", "claude_unparseable")
 
 
 def test_review_worker_empty_stdin_rejects():

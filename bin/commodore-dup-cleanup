@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""commodore-dup-cleanup — operator helper for resolving Telegram duplicates.
+
+The QA/review pipelines have a documented residual: a daemon crash between
+the outgoing_msg intent insert and the Telegram response being recorded can
+result in a single duplicate post. Detection is automatic via SQL; this
+script is the cleanup recipe.
+
+For each (job_table, job_uuid, action_type) group with multiple confirmed
+posts:
+  - Canonical = lowest id (= earliest intent_recorded_at).
+  - Suppressed = all others.
+  - Telegram-side action by message age:
+      <=48h: editMessageText to a "_duplicate of N° X — superseded_" pointer
+             (preserves reply chain) for threaded chats; deleteMessage for
+             non-threaded.
+      >48h:  leave-in-place + post a `dup_followup` reply via
+             send_message_with_wal (since edit/delete windows have closed).
+
+Modes:
+  --list                                  detect + print groups
+  --resolve <job_table> <job_uuid> <action_type>  interactive single resolve
+  --resolve-all --dry-run                 print intended actions
+  --resolve-all                           bulk; only auto-resolves groups
+                                           where ALL rows are <48h old
+
+After successful Telegram-side action:
+  outgoing_msg.cleanup_role = 'canonical' | 'suppressed'
+  outgoing_msg.cleanup_action = 'edited_to_marker' | 'deleted'
+                              | 'left_in_place_with_followup'
+  outgoing_msg.cleanup_at, cleanup_operator_id
+
+Usage example:
+  $ ./bin/commodore-dup-cleanup --list
+  $ ./bin/commodore-dup-cleanup --resolve qa_job <uuid> qa_answer
+  $ ./bin/commodore-dup-cleanup --resolve-all --dry-run
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+# --- Configuration ---------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_FILE = Path(os.environ.get("COMMODORE_DB_FILE", str(BASE_DIR / "commodore.db")))
+BOT_TOKEN_FILE = Path(os.environ.get("BOT_TOKEN_FILE",
+                                     str(Path.home() / ".config/commodore/bot_token"))).expanduser()
+BOT_TOKEN_ENV = os.environ.get("BOT_TOKEN", "").strip()
+TELEGRAM_API = "https://api.telegram.org"
+EDIT_DELETE_WINDOW_HOURS = 48
+
+
+# --- Telegram thin client --------------------------------------------------
+
+def _bot_token() -> str:
+    if BOT_TOKEN_ENV:
+        return BOT_TOKEN_ENV
+    try:
+        return BOT_TOKEN_FILE.read_text().strip()
+    except FileNotFoundError:
+        sys.exit(f"ERROR: bot token unavailable (env BOT_TOKEN unset, "
+                 f"file {BOT_TOKEN_FILE} not found)")
+
+
+def _tg_call(method: str, payload: dict) -> dict:
+    """Minimal stdlib-only Telegram call."""
+    url = f"{TELEGRAM_API}/bot{_bot_token()}/{method}"
+    data = urllib.parse.urlencode(payload).encode()
+    req = urllib.request.Request(url, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def edit_message(chat_id: int, message_id: int, text: str) -> dict:
+    return _tg_call("editMessageText", {
+        "chat_id": chat_id, "message_id": message_id, "text": text,
+        "parse_mode": "Markdown",
+    })
+
+
+def delete_message(chat_id: int, message_id: int) -> dict:
+    return _tg_call("deleteMessage", {
+        "chat_id": chat_id, "message_id": message_id,
+    })
+
+
+def send_followup(chat_id: int, text: str, reply_to: "int | None",
+                  thread_id: "int | None") -> dict:
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    if thread_id:
+        payload["message_thread_id"] = thread_id
+    return _tg_call("sendMessage", payload)
+
+
+# --- DB queries ------------------------------------------------------------
+
+def detect_duplicate_groups(conn) -> list:
+    """Returns list of (job_table, job_uuid, action_type, count) tuples for
+    groups with >1 confirmed post AND no canonical role yet assigned."""
+    rows = conn.execute(
+        "SELECT job_table, job_uuid, action_type, COUNT(*) AS dup_count "
+        "  FROM outgoing_msg "
+        " WHERE telegram_message_id IS NOT NULL "
+        "   AND cleanup_role IS NULL "
+        " GROUP BY 1, 2, 3 "
+        "HAVING COUNT(*) > 1"
+    ).fetchall()
+    return rows
+
+
+def fetch_group_rows(conn, job_table: str, job_uuid: str, action_type: str) -> list:
+    """Rows in the group, ordered by id ASC. First row is canonical."""
+    return conn.execute(
+        "SELECT id, chat_id, thread_id, telegram_message_id, sent_at, dedup_token "
+        "  FROM outgoing_msg "
+        " WHERE job_table=? AND job_uuid=? AND action_type=? "
+        "   AND telegram_message_id IS NOT NULL "
+        " ORDER BY id ASC",
+        (job_table, job_uuid, action_type),
+    ).fetchall()
+
+
+def message_is_within_window(sent_at_iso: str) -> bool:
+    """True if the message was sent within EDIT_DELETE_WINDOW_HOURS."""
+    try:
+        sent = datetime.fromisoformat(sent_at_iso)
+    except (ValueError, TypeError):
+        return False
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - sent < timedelta(hours=EDIT_DELETE_WINDOW_HOURS)
+
+
+def thread_is_topic(thread_id) -> bool:
+    """True iff this is a forum-topic-threaded chat (preserve reply chain)."""
+    return bool(thread_id)
+
+
+# --- Cleanup actions -------------------------------------------------------
+
+def resolve_group(conn, job_table: str, job_uuid: str, action_type: str,
+                  operator_id: int, dry_run: bool = False,
+                  auto_only_recent: bool = False) -> dict:
+    """Resolve one duplicate group. Returns a summary dict.
+
+    auto_only_recent: when True (used by --resolve-all bulk mode), groups
+    containing any row >48h old are SKIPPED rather than partially resolved,
+    so the operator can review them by hand."""
+    rows = fetch_group_rows(conn, job_table, job_uuid, action_type)
+    if len(rows) < 2:
+        return {"status": "no_duplicates", "rows": len(rows)}
+
+    canonical = rows[0]
+    suppressed = list(rows[1:])
+    canonical_msg_id = canonical["telegram_message_id"]
+
+    # Decide per-row action.
+    plan = []  # list of (row, action_str)
+    has_old = False
+    for sr in suppressed:
+        if message_is_within_window(sr["sent_at"]):
+            if thread_is_topic(sr["thread_id"]):
+                plan.append((sr, "edited_to_marker"))
+            else:
+                plan.append((sr, "deleted"))
+        else:
+            plan.append((sr, "left_in_place_with_followup"))
+            has_old = True
+
+    if auto_only_recent and has_old:
+        return {
+            "status": "skipped_has_old",
+            "canonical": canonical_msg_id,
+            "suppressed_count": len(suppressed),
+            "note": ("Group has at least one row >48h old; resolve manually "
+                     "via --resolve."),
+        }
+
+    if dry_run:
+        return {
+            "status": "dry_run",
+            "canonical": canonical_msg_id,
+            "plan": [{"id": r["id"], "msg": r["telegram_message_id"],
+                      "chat": r["chat_id"], "action": a}
+                     for r, a in plan],
+        }
+
+    # Execute.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    results = []
+    for sr, action in plan:
+        chat_id = sr["chat_id"]
+        msg_id = sr["telegram_message_id"]
+        if action == "edited_to_marker":
+            marker = (f"_duplicate of message N°{canonical_msg_id} "
+                      f"— superseded by the canonical dispatch._")
+            tg_resp = edit_message(chat_id, msg_id, marker)
+        elif action == "deleted":
+            tg_resp = delete_message(chat_id, msg_id)
+        elif action == "left_in_place_with_followup":
+            followup = (f"Note: this dispatch is a duplicate of "
+                        f"message N°{canonical_msg_id}. The canonical answer "
+                        f"is the earlier post.")
+            tg_resp = send_followup(chat_id, followup,
+                                    reply_to=msg_id,
+                                    thread_id=sr["thread_id"])
+        else:
+            tg_resp = {"ok": False, "error": f"unknown action {action}"}
+
+        if not tg_resp.get("ok"):
+            # Skip the SQL update; operator must rerun after fixing the cause.
+            results.append({"id": sr["id"], "action": action,
+                            "status": "telegram_failed",
+                            "error": tg_resp.get("error") or tg_resp})
+            continue
+
+        conn.execute(
+            "UPDATE outgoing_msg SET cleanup_role='suppressed', "
+            "cleanup_action=?, cleanup_at=?, cleanup_operator_id=? "
+            "WHERE id=?",
+            (action, now_iso, operator_id, sr["id"]),
+        )
+        results.append({"id": sr["id"], "action": action, "status": "ok"})
+
+    # Mark canonical (only if at least one suppressed succeeded — otherwise
+    # leave the group flagged as still-needing-resolution).
+    if any(r["status"] == "ok" for r in results):
+        conn.execute(
+            "UPDATE outgoing_msg SET cleanup_role='canonical', "
+            "cleanup_at=?, cleanup_operator_id=? WHERE id=?",
+            (now_iso, operator_id, canonical["id"]),
+        )
+    conn.commit()
+    return {
+        "status": "resolved",
+        "canonical": canonical_msg_id,
+        "results": results,
+    }
+
+
+# --- CLI -------------------------------------------------------------------
+
+def cmd_list(conn) -> int:
+    groups = detect_duplicate_groups(conn)
+    if not groups:
+        print("No unresolved duplicate groups.")
+        return 0
+    print(f"{len(groups)} duplicate group(s):")
+    for g in groups:
+        print(f"  - job_table={g['job_table']:10} job_uuid={g['job_uuid']:36} "
+              f"action_type={g['action_type']:25} dup_count={g['dup_count']}")
+    print()
+    print("Resolve a single group: ./bin/commodore-dup-cleanup --resolve "
+          "<job_table> <job_uuid> <action_type>")
+    print("Bulk: ./bin/commodore-dup-cleanup --resolve-all --dry-run")
+    return 0
+
+
+def cmd_resolve(conn, args) -> int:
+    operator_id = int(args.operator_id or os.environ.get("COMMODORE_OPERATOR_ID", "0"))
+    summary = resolve_group(conn, args.job_table, args.job_uuid,
+                            args.action_type, operator_id,
+                            dry_run=args.dry_run, auto_only_recent=False)
+    print(json.dumps(summary, indent=2, default=str))
+    return 0 if summary.get("status") in ("resolved", "dry_run") else 1
+
+
+def cmd_resolve_all(conn, args) -> int:
+    operator_id = int(args.operator_id or os.environ.get("COMMODORE_OPERATOR_ID", "0"))
+    groups = detect_duplicate_groups(conn)
+    if not groups:
+        print("No unresolved duplicate groups.")
+        return 0
+    print(f"{'DRY RUN: ' if args.dry_run else ''}Resolving {len(groups)} group(s):")
+    for g in groups:
+        summary = resolve_group(conn, g["job_table"], g["job_uuid"],
+                                g["action_type"], operator_id,
+                                dry_run=args.dry_run,
+                                auto_only_recent=True)
+        print(f"  - {g['job_table']}/{g['job_uuid']}/{g['action_type']}: "
+              f"{summary['status']}")
+        if args.dry_run and summary.get("plan"):
+            for step in summary["plan"]:
+                print(f"      msg={step['msg']} chat={step['chat']} "
+                      f"action={step['action']}")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--db", default=str(DB_FILE),
+                   help=f"SQLite DB path (default: {DB_FILE})")
+    p.add_argument("--operator-id", default="",
+                   help="Telegram user_id of the operator running this script")
+    sub = p.add_mutually_exclusive_group(required=True)
+    sub.add_argument("--list", action="store_true")
+    sub.add_argument("--resolve", nargs=3, metavar=("JOB_TABLE", "JOB_UUID", "ACTION_TYPE"))
+    sub.add_argument("--resolve-all", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    args = p.parse_args()
+
+    conn = sqlite3.connect(args.db, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        if args.list:
+            return cmd_list(conn)
+        if args.resolve:
+            jt, ju, at = args.resolve
+            args.job_table = jt
+            args.job_uuid = ju
+            args.action_type = at
+            return cmd_resolve(conn, args)
+        if args.resolve_all:
+            return cmd_resolve_all(conn, args)
+    finally:
+        conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
