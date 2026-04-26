@@ -14,7 +14,12 @@
 #
 # Build: bin/build-reviewer-image.sh
 
-FROM python:3.11-slim
+# Pinned to bookworm (Debian 12) rather than the generic `:slim` tag (which
+# now resolves to trixie/Debian 13). Trixie's lzma-compressed .debs OOM on
+# the Mini's 2 GiB Docker Desktop VM during dpkg --unpack — bookworm's
+# older xz tooling has a smaller working set and unpacks cleanly within
+# our memory budget. Bump to the next stable when Mini's VM gets >= 4 GiB.
+FROM python:3.11-slim-bookworm
 
 # --- System packages --------------------------------------------------------
 # bash: Claude CLI's Bash(...) tool invokes /bin/sh; python-slim's default
