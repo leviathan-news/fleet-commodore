@@ -44,11 +44,20 @@ def _msg(chat_id=BOT_HQ, sender_id=ADMIN_ID, message_id=1, thread_id=None):
 
 
 def test_first_plan_creates_drafting_row(isolated_db):
+    """v6: handle_plan_message returns None (handoff to LLM persona pipeline)
+    and stashes a per-turn plan-refinement context. The DB row is created
+    with status=drafting and the user's text in message_history_json."""
+    m = _msg(message_id=10)
     reply = commodore.handle_plan_message(
-        _msg(message_id=10),
+        m,
         "let's plan adding a verbose flag to /process_x_queue",
     )
-    assert "Admiralty" in reply
+    assert reply is None  # falls through to generate_response
+
+    # Plan context staged for the LLM
+    ctx = commodore.get_plan_context(m)
+    assert ctx is not None
+    assert "PLAN-REFINEMENT" in ctx
 
     conn = sqlite3.connect(str(isolated_db))
     conn.row_factory = sqlite3.Row
@@ -60,6 +69,32 @@ def test_first_plan_creates_drafting_row(isolated_db):
     assert row["requester_id"] == ADMIN_ID
     history = json.loads(row["message_history_json"])
     assert len(history) == 1
+
+
+def test_repo_extraction_from_first_turn(isolated_db):
+    """User saying `repo: leviathan-news/foo` in the opening message
+    must populate target_repo without an explicit second turn."""
+    m = _msg(message_id=14)
+    commodore.handle_plan_message(
+        m, "let's plan a typo fix. repo: leviathan-news/fleet-commodore",
+    )
+    conn = sqlite3.connect(str(isolated_db))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT target_repo FROM plan_drafts").fetchone()
+    assert row["target_repo"] == "leviathan-news/fleet-commodore"
+
+
+def test_repo_extraction_rejects_non_leviathan(isolated_db):
+    """Off-org repos must NOT populate target_repo (the build worker only
+    forks under leviathan-agent; foo/bar can't ship)."""
+    m = _msg(message_id=15)
+    commodore.handle_plan_message(
+        m, "fix something in microsoft/vscode",
+    )
+    conn = sqlite3.connect(str(isolated_db))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT target_repo FROM plan_drafts").fetchone()
+    assert row["target_repo"] is None
 
 
 def test_appended_turns_extend_history(isolated_db):

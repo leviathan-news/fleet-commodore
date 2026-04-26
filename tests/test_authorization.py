@@ -78,7 +78,18 @@ def test_handle_qa_in_squid_cave_declines():
 
 
 def test_handle_plan_in_lev_dev_admin_works():
-    """Plan refinement in Lev Dev (admin) must NOT chat-decline."""
+    """Plan refinement in Lev Dev (admin) must NOT chat-decline.
+
+    Per v6 architecture handle_plan_message returns None (handing the
+    reply composition to generate_response via plan-refinement context).
+    The chat-level decline string would be a non-None return; None means
+    we got past the auth gate cleanly."""
     m = msg(LEV_DEV, ADMIN_ID)
     reply = commodore.handle_plan_message(m, "let's plan a thing")
-    assert "Bot HQ" not in reply, f"chat-level decline still firing: {reply}"
+    assert reply is None, (
+        f"expected None (handoff to LLM); got chat-level decline: {reply!r}"
+    )
+    # And the plan-refinement context should be staged for generate_response
+    ctx = commodore.get_plan_context(m)
+    assert ctx is not None
+    assert "PLAN-REFINEMENT" in ctx
