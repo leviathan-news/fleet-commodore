@@ -2120,8 +2120,19 @@ _PLAN_REFINE_RE = re.compile(
     r"^(?:let'?s\s+)?(?:plan|design|propose|draft|build|implement|sketch|outline)\b",
     re.IGNORECASE,
 )
-_SHIP_RE = re.compile(r"^/ship(?:@\S+)?\b|^ship\s+it\b", re.IGNORECASE)
-_ABANDON_RE = re.compile(r"^/abandon(?:@\S+)?\b|^abandon\s+plan\b", re.IGNORECASE)
+_SHIP_RE = re.compile(
+    # Slash command: must be at start.
+    r"^/ship(?:@\S+)?\b|"
+    # Or `ship it` anywhere as a standalone phrase. Operators write
+    # "Your choice! Ship it!" or "OK ship it" naturally; requiring
+    # start-anchor was too brittle.
+    r"\bship\s+it\b",
+    re.IGNORECASE,
+)
+_ABANDON_RE = re.compile(
+    r"^/abandon(?:@\S+)?\b|\babandon\s+plan\b",
+    re.IGNORECASE,
+)
 _QA_RE = re.compile(
     # Slash command always wins.
     r"^/ask(?:@\S+)?\s+(.+)|"
@@ -2488,8 +2499,16 @@ def handle_plan_message(msg, text):
         "just told you. If the target repository is missing, ask for it "
         "(`repo: owner/name`). If the substance is too vague to ship, ask "
         "the most useful clarifying question. If everything seems firm, "
-        "say so and remind them they can signal `ship it`. Do NOT echo "
-        "the whole plan back; do NOT ask for things they already gave."
+        "say so and remind them they can signal `ship it` (the literal "
+        "phrase) when ready. Do NOT echo the whole plan back; do NOT ask "
+        "for things they already gave.\n\n"
+        "*** CRITICAL: NEVER claim you have shipped, queued, dispatched, "
+        "filed, opened, or otherwise initiated a PR or build. The build "
+        "pipeline is triggered by the literal regex match on `ship it` — "
+        "if your reply text says you are doing it, that is a lie, the "
+        "operator will check. Only when they actually type `ship it` (or "
+        "/ship) does anything happen. Until then your job is conversation, "
+        "not action. ***"
     )
     _set_plan_context(msg, plan_ctx)
     return None  # fall through to generate_response
@@ -3482,9 +3501,9 @@ def poll():
                         r"^@\S+\s*[,:]?\s*", "", stripped, count=1,
                     )
 
-                    if _SHIP_RE.match(stripped_no_mention):
+                    if _SHIP_RE.search(stripped_no_mention):
                         response = handle_ship(msg)
-                    elif _ABANDON_RE.match(stripped_no_mention):
+                    elif _ABANDON_RE.search(stripped_no_mention):
                         response = handle_abandon(msg)
                     elif _PLAN_REFINE_RE.match(stripped_no_mention):
                         response = handle_plan_message(msg, stripped_no_mention)
