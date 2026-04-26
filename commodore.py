@@ -177,6 +177,19 @@ def _policy_for(chat_id, topic_id):
             "allow_pr": True,
         }
 
+    if chat_id == LEV_DEV_GROUP_ID:
+        return {
+            **_BASE_POLICY,
+            "speak": "mention_only",
+            "rate_limit_s": 30,
+            "persona_suffix": (
+                "You are in Lev Dev — the engineering room. Speak with the "
+                "directness of a ship's first officer to the dev crew. "
+                "PR-filing and plan-refinement are appropriate here."
+            ),
+            "allow_pr": True,
+        }
+
     if chat_id == SQUID_CAVE_GROUP_ID:
         return {
             **_BASE_POLICY,
