@@ -3387,7 +3387,24 @@ def poll():
                     reply_msg.get("from", {}).get("username", "").lower() == BOT_USERNAME
                 )
                 is_mention = _is_mention_of_commodore(msg, text_lower)
-                is_direct = reply_to_us or is_mention
+                # If this user has an active plan_draft in this (chat, thread)
+                # they are mid-conversation with us — treat any of their next
+                # messages as implicitly directed at the Commodore. Without
+                # this, a follow-up like "Ship it!" with no @mention slips
+                # past should_respond() and the operator wonders why we
+                # ignored them. Scoped to the same (chat_id, thread_id,
+                # requester_id) tuple that owns the draft.
+                has_active_plan = False
+                try:
+                    _conn = sqlite3.connect(str(DB_FILE), timeout=5)
+                    _conn.row_factory = sqlite3.Row
+                    has_active_plan = _active_draft_for(
+                        _conn, chat_id, topic_id, sender.get("id", 0),
+                    ) is not None
+                    _conn.close()
+                except sqlite3.Error:
+                    pass
+                is_direct = reply_to_us or is_mention or has_active_plan
 
                 if not should_respond(msg, policy, is_direct):
                     if text:
