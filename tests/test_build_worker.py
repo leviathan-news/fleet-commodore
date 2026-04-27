@@ -125,6 +125,86 @@ def test_scrub_secrets_passthrough_for_non_secrets():
         assert mod._scrub_secrets(s) == s
 
 
+# --- GitHub App auth path -------------------------------------------------
+
+def test_have_app_config_false_when_anything_missing(tmp_path, monkeypatch):
+    """All three pieces (APP_ID, INSTALLATION_ID, PRIVATE_KEY_PATH) must
+    be set for App auth to engage. Missing any one falls back to PAT."""
+    mod = _load_module()
+    pem_file = tmp_path / "key.pem"
+    pem_file.write_text("---BEGIN FAKE---\nfake\n---END---\n")
+
+    # All present → True
+    monkeypatch.setattr(mod, "GITHUB_APP_ID", "123")
+    monkeypatch.setattr(mod, "GITHUB_APP_INSTALLATION_ID", "456")
+    monkeypatch.setattr(mod, "GITHUB_APP_PRIVATE_KEY_PATH", pem_file)
+    assert mod._have_app_config() is True
+
+    # Each missing piece → False
+    monkeypatch.setattr(mod, "GITHUB_APP_ID", "")
+    assert mod._have_app_config() is False
+    monkeypatch.setattr(mod, "GITHUB_APP_ID", "123")
+
+    monkeypatch.setattr(mod, "GITHUB_APP_INSTALLATION_ID", "")
+    assert mod._have_app_config() is False
+    monkeypatch.setattr(mod, "GITHUB_APP_INSTALLATION_ID", "456")
+
+    monkeypatch.setattr(mod, "GITHUB_APP_PRIVATE_KEY_PATH", tmp_path / "missing.pem")
+    assert mod._have_app_config() is False
+
+
+def test_gh_token_falls_back_to_pat_without_app_config(monkeypatch):
+    """No App config → use GH_TOKEN env var."""
+    mod = _load_module()
+    monkeypatch.setattr(mod, "GITHUB_APP_ID", "")
+    monkeypatch.setenv("GH_TOKEN", "fake-pat-12345")
+    assert mod.gh_token() == "fake-pat-12345"
+
+
+def test_gh_token_raises_when_no_auth(monkeypatch):
+    """No App config AND no GH_TOKEN → clear error."""
+    mod = _load_module()
+    monkeypatch.setattr(mod, "GITHUB_APP_ID", "")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    with pytest.raises(RuntimeError, match="no GitHub auth"):
+        mod.gh_token()
+
+
+def test_mint_app_jwt_signs_with_rs256(tmp_path, monkeypatch):
+    """JWT minting should produce a 3-segment dotted token signed RS256."""
+    mod = _load_module()
+    # Need a real RSA key for signing — generate one inline (cryptography
+    # comes in as a PyJWT[crypto] dependency).
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives import serialization
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pem_file = tmp_path / "test-key.pem"
+    pem_file.write_bytes(pem)
+
+    monkeypatch.setattr(mod, "GITHUB_APP_ID", "12345")
+    monkeypatch.setattr(mod, "GITHUB_APP_INSTALLATION_ID", "67890")
+    monkeypatch.setattr(mod, "GITHUB_APP_PRIVATE_KEY_PATH", pem_file)
+
+    jwt_token = mod._mint_app_jwt()
+    # Three segments separated by dots
+    parts = jwt_token.split(".")
+    assert len(parts) == 3
+    # Decode header to confirm RS256
+    import base64, json as _json
+    header_b64 = parts[0] + "=" * (4 - len(parts[0]) % 4)
+    header = _json.loads(base64.urlsafe_b64decode(header_b64))
+    assert header["alg"] == "RS256"
+    # Decode payload to confirm iss
+    payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+    payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
+    assert payload["iss"] == "12345"
+
+
 def test_atomic_write_protocol(tmp_path):
     mod = _load_module()
     mod.RESULTS_DIR = tmp_path
@@ -325,6 +405,9 @@ def test_version_banner():
     assert payload["mode"] == "version"
     assert payload["worker"] == "build"
     assert "components" in payload
-    assert "fork_owner" in payload
+    # New v7 banner fields (App auth migration)
+    assert "auth_path" in payload  # 'app' | 'legacy_pat' | 'none'
+    assert "pyjwt_present" in payload
+    assert "legacy_fork_owner" in payload  # renamed from fork_owner
     assert "commit_identity" in payload
     assert proc.returncode in (0, 1)

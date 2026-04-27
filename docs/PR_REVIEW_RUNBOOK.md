@@ -722,6 +722,107 @@ SELECT id, action_type, telegram_message_id, sent_at,
   enforcing this.
 
 
+## GitHub App auth (v7 build pipeline)
+
+The build pipeline (operator says `ship it` → real PR filed) authenticates
+to GitHub via a **GitHub App installation token**, not a user PAT.
+
+### Why a GitHub App, not a PAT
+
+Empirical: the `leviathan-news` org clamps fine-grained PATs at
+`administration=read` regardless of what's requested in the token, what's
+approved at the org-pending-tokens page, or what the token settings panel
+claims. This blocks `POST /repos/.../forks` (administration=write) and
+also blocks direct branch push to org-owned repos for non-member users.
+
+GitHub Apps don't have these problems. An App installed on the org with
+**Contents: write** + **Pull requests: write** can:
+
+- Push branches directly to source repos (no fork needed)
+- File same-repo PRs (`head=branch`, no `owner:branch` cross-repo prefix)
+- Work against any repo in the installation's selected set automatically
+
+### One-time setup
+
+Operator (logged in as the GitHub identity that should "own" the App):
+
+1. **Register the App**: https://github.com/settings/apps/new
+   - Name: `Leviathan Fleet Commodore` (becomes the bot's display name)
+   - Homepage: any URL (required field, value irrelevant)
+   - Webhook: **uncheck Active** (we don't use webhooks)
+   - Repository permissions:
+     - **Contents: Read and write** (clone, branch push)
+     - **Pull requests: Read and write** (file PRs, comment)
+     - **Metadata: Read-only** (auto-required)
+     - **Issues: Read and write** (optional — useful if PRs reference issues)
+   - Where can this App be installed: **Only on this account**
+   - **Generate**
+
+2. **Generate a private key**: at the bottom of the App's settings page,
+   "Private keys" section → **Generate a private key**. A `.pem` downloads.
+   Stage it on the Mini:
+   ```bash
+   ssh mini "cat > ~/.config/commodore/github-app-key.pem"
+   # paste PEM contents, Enter, Ctrl-D
+   ssh mini "chmod 600 ~/.config/commodore/github-app-key.pem"
+   ```
+
+3. **Note the App ID**: top of the App's settings page, "App ID: 12345".
+
+4. **Install the App on `leviathan-news`**:
+   On the App's settings page, sidebar **Install App** → click **Install**
+   next to `leviathan-news` → choose **All repositories** → **Install**.
+
+5. **Note the Installation ID**: after installing, GitHub redirects to a
+   URL like `https://github.com/organizations/leviathan-news/settings/installations/67890`
+   — the trailing number is the installation ID.
+
+6. **Stage the App config on the Mini**:
+   ```bash
+   ssh mini 'cat > ~/.config/commodore/github-app.env <<EOF
+   GITHUB_APP_ID=12345
+   GITHUB_APP_INSTALLATION_ID=67890
+   EOF
+   chmod 600 ~/.config/commodore/github-app.env'
+   ```
+
+### Verify
+
+```bash
+ssh mini 'cd ~/dev/leviathan/fleet-commodore && \
+  python3 -c "
+import os
+os.environ[\"GITHUB_APP_ID\"] = open(os.path.expanduser(\"~/.config/commodore/github-app.env\")).read().split(\"GITHUB_APP_ID=\")[1].split(chr(10))[0]
+os.environ[\"GITHUB_APP_INSTALLATION_ID\"] = open(os.path.expanduser(\"~/.config/commodore/github-app.env\")).read().split(\"GITHUB_APP_INSTALLATION_ID=\")[1].split(chr(10))[0]
+os.environ[\"GITHUB_APP_PRIVATE_KEY_PATH\"] = os.path.expanduser(\"~/.config/commodore/github-app-key.pem\")
+import sys; sys.path.insert(0, \".\")
+import build_worker
+token = build_worker._mint_installation_token()
+print(\"installation token minted, length:\", len(token))
+"'
+```
+
+If that prints a length, the App is set up correctly. The next `ship it`
+will use this path and fork-via-API errors disappear.
+
+### Rotations
+
+- **Private key**: GitHub Apps can hold up to two private keys. Generate a
+  new one, stage it, then revoke the old one from the App settings page.
+  No downtime.
+- **Installation token**: minted on demand by the worker, valid 1h. No
+  operator action.
+
+### Adding more repos
+
+If the App is installed with **All repositories**, new repos in
+`leviathan-news` are automatically accessible — no further config.
+If installed with **Selected repositories**, edit the installation
+on https://github.com/organizations/leviathan-news/settings/installations
+and add the new repo.
+
+---
+
 ## DB role hardening (one-shot SQL)
 
 > **GOTCHA discovered 2026-04-26**: column-level `REVOKE SELECT (col)` is a

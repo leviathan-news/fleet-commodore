@@ -52,6 +52,16 @@ BUILD_TIMEOUT_S = int(os.environ.get("COMMODORE_BUILD_TIMEOUT_S", "600"))
 GH_PAT_FILE = Path(os.environ.get("COMMODORE_GH_PAT_FILE", "~/.config/commodore/gh_pat")).expanduser()
 DB_URL_FILE = Path(os.environ.get("COMMODORE_DB_URL_FILE", "~/.config/commodore/db_url")).expanduser()
 
+# GitHub App auth (preferred). Set GITHUB_APP_ID/INSTALLATION_ID in
+# ~/.config/commodore/github-app.env and stage the private key PEM at
+# ~/.config/commodore/github-app-key.pem (mode 0o600).
+GITHUB_APP_ENV_FILE = Path(os.environ.get(
+    "COMMODORE_GITHUB_APP_ENV_FILE", "~/.config/commodore/github-app.env"
+)).expanduser()
+GITHUB_APP_PRIVATE_KEY = Path(os.environ.get(
+    "COMMODORE_GITHUB_APP_PRIVATE_KEY", "~/.config/commodore/github-app-key.pem"
+)).expanduser()
+
 CLAUDE_AUTH_DIR = Path(os.environ.get("COMMODORE_CLAUDE_AUTH_DIR", "~/.config/commodore/claude-auth")).expanduser()
 CLAUDE_CONFIG_FILE = Path(os.environ.get("COMMODORE_CLAUDE_CONFIG_FILE", "~/.config/commodore/dot-claude.json")).expanduser()
 HOST_CLAUDE_DIR = Path(os.environ.get("COMMODORE_HOST_CLAUDE_DIR", "~/.claude")).expanduser()
@@ -166,6 +176,27 @@ def main() -> "None":
     RESULTS_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
     stderr_log = LOG_DIR / f"{job_uuid}.stderr"
 
+    # Optional GitHub App auth — read APP_ID + INSTALLATION_ID from
+    # ~/.config/commodore/github-app.env if it exists. Format is shell-style
+    # KEY=VALUE lines; we only care about GITHUB_APP_ID and
+    # GITHUB_APP_INSTALLATION_ID. Falls back to legacy PAT if absent.
+    app_id = ""
+    app_installation_id = ""
+    if GITHUB_APP_ENV_FILE.is_file():
+        for line in GITHUB_APP_ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k == "GITHUB_APP_ID":
+                app_id = v
+            elif k == "GITHUB_APP_INSTALLATION_ID":
+                app_installation_id = v
+
     with tempfile.TemporaryDirectory(prefix=f"commodore-build-{job_uuid}-") as scratch:
         scratch_path = Path(scratch)
         claude_copy = scratch_path / "claude-auth"
@@ -183,6 +214,20 @@ def main() -> "None":
                 )
                 env_file = env_tmp.name
                 os.chmod(env_file, 0o600)
+                # GitHub App auth — preferred. The private key PEM is
+                # bind-mounted (it's multi-line, env-file would mangle).
+                # Inject the App config IDs and the in-container path
+                # to the mounted PEM.
+                if app_id and app_installation_id and GITHUB_APP_PRIVATE_KEY.is_file():
+                    env_tmp.write(f"GITHUB_APP_ID={app_id}\n")
+                    env_tmp.write(f"GITHUB_APP_INSTALLATION_ID={app_installation_id}\n")
+                    env_tmp.write(
+                        "GITHUB_APP_PRIVATE_KEY_PATH="
+                        "/var/run/commodore-secrets/github-app-key.pem\n"
+                    )
+                # Legacy GH_TOKEN — kept as a fallback even when App auth
+                # is configured (the worker prefers App, falls back to PAT
+                # only if App config is incomplete).
                 env_tmp.write(f"GH_TOKEN={gh_pat}\n")
                 env_tmp.write(f"COMMODORE_DB_URL={db_url}\n")
                 env_tmp.write(f"HTTPS_PROXY=http://{PROXY_HOST}:{PROXY_PORT}\n")
@@ -195,6 +240,23 @@ def main() -> "None":
                 env_tmp.close()
             finally:
                 os.umask(umask_prev)
+
+            mount_args = [
+                "-v", f"{claude_copy}:/home/reviewer/.claude:rw",
+                "-v", f"{claude_json_copy}:/home/reviewer/.claude.json:rw",
+                # Shared results dir for atomic scratch-file handoff.
+                "-v", f"{RESULTS_DIR}:/var/run/commodore-results:rw",
+            ]
+            # Bind-mount the GitHub App private key into the container
+            # read-only at a fixed path. Worker reads via
+            # GITHUB_APP_PRIVATE_KEY_PATH env var (set above).
+            if (app_id and app_installation_id
+                    and GITHUB_APP_PRIVATE_KEY.is_file()):
+                mount_args.extend([
+                    "-v",
+                    f"{GITHUB_APP_PRIVATE_KEY}:"
+                    "/var/run/commodore-secrets/github-app-key.pem:ro",
+                ])
 
             cmd = [
                 DOCKER, "run", "--rm",
@@ -210,10 +272,7 @@ def main() -> "None":
                 "--read-only",
                 "--tmpfs", "/tmp:rw,exec,nosuid,size=200m",
                 "--tmpfs", "/home/reviewer:rw,exec,nosuid,size=200m,uid=1000,gid=1000",
-                "-v", f"{claude_copy}:/home/reviewer/.claude:rw",
-                "-v", f"{claude_json_copy}:/home/reviewer/.claude.json:rw",
-                # Shared results dir for atomic scratch-file handoff.
-                "-v", f"{RESULTS_DIR}:/var/run/commodore-results:rw",
+                *mount_args,
                 "--memory", "768m",
                 "--cpus", "1.0",
                 "--security-opt", "no-new-privileges",
@@ -221,7 +280,7 @@ def main() -> "None":
                 REVIEWER_IMAGE,
                 # The argv override: -u for unbuffered, build_worker.py as
                 # the actual entrypoint. The image COPYs build_worker.py to
-                # /app/build_worker.py (added in this commit).
+                # /app/build_worker.py.
                 "-u", "/app/build_worker.py",
             ]
 

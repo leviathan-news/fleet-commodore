@@ -7,5 +7,9 @@
 sqlparse>=0.4.4,<0.6
 psycopg2-binary>=2.9,<3
 
-# HTTP client for review_worker.py (gh, LN API).
+# HTTP client for review_worker.py + build_worker.py.
 requests>=2.32,<3
+
+# JWT signing for GitHub App installation tokens in build_worker.py.
+# `[crypto]` extra pulls in cryptography for RS256 signing.
+PyJWT[crypto]>=2.8,<3

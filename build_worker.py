@@ -1,34 +1,56 @@
 #!/usr/bin/env python3
-"""Fleet Commodore build (fork-and-PR) worker container entrypoint.
+"""Fleet Commodore build (branch-and-PR) worker container entrypoint.
+
+This is the SAME-REPO branch-and-PR pattern that Dependabot, Renovate, and
+every other GitHub bot installed on its target org uses. NO FORKING.
+
+Why no forking: GitHub's `POST /repos/{owner}/{repo}/forks` requires
+`Administration: write` which most org policies clamp to read for
+fine-grained PATs and even for GitHub Apps. We hit that empirically on
+the leviathan-news org — the PAT was approved with Contents: write but
+the fork API still 403'd. Fork-via-web-UI works but doesn't scale to
+"any of the dozen leviathan repos."
+
+The right pattern: install a GitHub App on the org with `Contents: write`
+and `Pull requests: write`, mint short-lived installation tokens on demand,
+push branches DIRECTLY to the source repo, file PRs same-repo.
+
+Auth: the worker mints an installation access token at the start of every
+build by signing a JWT with the App's private key (mounted at
+/var/run/commodore-secrets/github-app-key.pem) and POSTing to
+/app/installations/{id}/access_tokens. Token is valid 1h — plenty for one
+build. No user identity, no fork, no membership, no operator clicks.
 
 Pipeline:
   1. Read job JSON from stdin: {draft_uuid, target_repo, target_branch,
      title, pr_body, commit_message, edits?, plan_body_md?}
-  2. Ensure leviathan-agent fork of <target_repo> exists (idempotent).
-  3. Clone fork via token-in-URL into /tmp/build/<uuid>/repo.
-  4. git fetch upstream && git rebase upstream/main (so our branch is current).
-  5. git checkout -b <target_branch>.
-  6. Apply edits. Two paths:
+  2. Mint installation access token from App private key + installation_id.
+  3. Clone source repo via token-in-URL into /tmp/build/<uuid>/repo.
+  4. git checkout -b <target_branch>.
+  5. Apply edits. Two paths:
      a. If `edits` is a non-empty list of {action, path, content|diff},
         apply those literally (write/patch).
-     b. Otherwise (the typical v6 path — operator just refined a plan in
-        chat), invoke Claude inside the worker with the plan body +
-        repo checkout, ask it to produce the structured edit list, then
-        apply.
-  7. git add -A && git commit -m <commit_message>.
-  8. git push -u origin <target_branch>.
-  9. gh pr create --repo <target_repo> --head leviathan-agent:<branch>
-     --title <title> --body <pr_body>.
- 10. Atomic scratch write {pr_url, commit_sha, branch} BEFORE stdout JSON.
- 11. Emit ONE JSON object on stdout.
+     b. Otherwise (the typical v6 path — operator refined a plan in chat),
+        invoke Claude inside the worker with the plan body + repo
+        checkout, ask it to produce the structured edit list, then apply.
+  6. git add -A && git commit -m <commit_message>.
+  7. git push -u origin <target_branch>  (to the SAME source repo).
+  8. gh pr create --repo <target_repo> --head <target_branch>  (same-repo).
+  9. Atomic scratch write {pr_url, commit_sha, branch} BEFORE stdout JSON.
+ 10. Emit ONE JSON object on stdout.
 
 The atomic scratch write is the durability boundary. If we crash after
 the file appears at its final name, the host coordinator's recovery
 treats the side effect (the PR) as committed and the GitHub pre-flight
 oracle (`gh pr list`) confirms it.
 
+Backward-compat: if GITHUB_APP_ID is not set, falls back to GH_TOKEN
+(the legacy PAT path) but logs a deprecation warning. The PAT path
+requires a pre-existing fork at FORK_OWNER/<repo> and will fail clean
+if absent.
+
 Exit codes: 0 ok, 2 bad job, 5 internal error. Errors during pipeline
-stages are reported in-band (status=failed, stage=clone|edit|push|pr|...)
+stages are reported in-band (status=failed, stage=auth|clone|edit|push|pr)
 with rc=0 so the launcher's last-JSON parser stays happy.
 """
 from __future__ import annotations
@@ -51,12 +73,29 @@ GIT_BIN = os.environ.get("GIT_BIN") or shutil.which("git") or "/usr/bin/git"
 # Container path for the result-scratch handoff. Bound by the launcher.
 RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/var/run/commodore-results"))
 
-# Fork owner — the GitHub account whose token is in GH_TOKEN.
-FORK_OWNER = os.environ.get("BUILD_FORK_OWNER", "leviathan-agent")
+# GitHub App auth (preferred). Set all three to enable App auth.
+# - APP_ID is numeric, from the App's settings page.
+# - INSTALLATION_ID is numeric, identifying the org/account where the
+#   App is installed. Read off the App's installation page URL or via
+#   `GET /app/installations` once authenticated.
+# - PRIVATE_KEY_PATH is the PEM file mounted into the container (mode 0o600).
+GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID", "").strip()
+GITHUB_APP_INSTALLATION_ID = os.environ.get("GITHUB_APP_INSTALLATION_ID", "").strip()
+GITHUB_APP_PRIVATE_KEY_PATH = Path(
+    os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH",
+                   "/var/run/commodore-secrets/github-app-key.pem")
+)
 
-# Commit identity — DeepSeaSquid until leviathan-commodore is unflagged.
-COMMIT_NAME = os.environ.get("BUILD_COMMIT_NAME", "DeepSeaSquid")
-COMMIT_EMAIL = os.environ.get("BUILD_COMMIT_EMAIL", "deepseasquid@nicepick.dev")
+# Legacy PAT fallback — only used if GitHub App config is incomplete.
+# Same pattern as the user PAT: requires a pre-existing fork and only
+# works for repos where leviathan-agent has push access.
+LEGACY_FORK_OWNER = os.environ.get("BUILD_FORK_OWNER", "leviathan-agent")
+
+# Commit identity. App auth: GitHub recommends `<bot-name>[bot]@users.noreply.github.com`
+# with the bot's user ID prefix; we set sensible defaults but allow override.
+COMMIT_NAME = os.environ.get("BUILD_COMMIT_NAME", "Fleet Commodore")
+COMMIT_EMAIL = os.environ.get("BUILD_COMMIT_EMAIL",
+                              "leviathan-fleet-commodore[bot]@users.noreply.github.com")
 
 # Working directory inside the container's tmpfs.
 WORK_ROOT = Path(os.environ.get("BUILD_WORK_ROOT", "/tmp/build"))
@@ -64,6 +103,10 @@ WORK_ROOT = Path(os.environ.get("BUILD_WORK_ROOT", "/tmp/build"))
 # Soft budgets. The launcher's wall timeout (10 min default) is the hard cap.
 CLAUDE_EDIT_TIMEOUT_S = int(os.environ.get("BUILD_CLAUDE_TIMEOUT_S", "300"))
 GIT_TIMEOUT_S = int(os.environ.get("BUILD_GIT_TIMEOUT_S", "120"))
+
+# Cached installation token + expiry — avoid minting per-step.
+_cached_installation_token = None
+_cached_installation_token_exp = 0.0
 
 
 # --- Single-exit emitter ---------------------------------------------------
@@ -151,12 +194,101 @@ def run(cmd, *, cwd=None, env=None, timeout=GIT_TIMEOUT_S, check=True,
     return proc
 
 
+def _have_app_config() -> bool:
+    """True if all three GitHub App config bits are present."""
+    return bool(
+        GITHUB_APP_ID and
+        GITHUB_APP_INSTALLATION_ID and
+        GITHUB_APP_PRIVATE_KEY_PATH.is_file()
+    )
+
+
+def _mint_app_jwt() -> str:
+    """Mint a 10-minute JWT signed with the App's RS256 private key.
+    Used ONLY to exchange for an installation access token — never sent
+    to git/gh directly."""
+    import jwt as _jwt
+    import time as _time
+    private_key = GITHUB_APP_PRIVATE_KEY_PATH.read_text()
+    now = int(_time.time())
+    payload = {
+        # iat backdated 60s to tolerate clock skew between Mini and api.github.com
+        "iat": now - 60,
+        # exp 9 minutes (max GitHub allows is 10)
+        "exp": now + 9 * 60,
+        "iss": GITHUB_APP_ID,
+    }
+    return _jwt.encode(payload, private_key, algorithm="RS256")
+
+
+def _mint_installation_token() -> str:
+    """Exchange a freshly-minted App JWT for an installation access token
+    (1-hour TTL, scoped to the installation's permissions). Cached for
+    the lifetime of the worker process so we don't re-mint per stage."""
+    import time as _time
+    global _cached_installation_token, _cached_installation_token_exp
+    # Reuse if more than 5 minutes left on the cached token
+    if _cached_installation_token and _cached_installation_token_exp - _time.time() > 300:
+        return _cached_installation_token
+
+    import requests
+    app_jwt = _mint_app_jwt()
+    resp = requests.post(
+        f"https://api.github.com/app/installations/"
+        f"{GITHUB_APP_INSTALLATION_ID}/access_tokens",
+        headers={
+            "Authorization": f"Bearer {app_jwt}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=15,
+    )
+    if resp.status_code != 201:
+        raise RuntimeError(
+            f"failed to mint installation token: HTTP {resp.status_code} — "
+            f"{(resp.text or '')[:300]}"
+        )
+    body = resp.json()
+    _cached_installation_token = body["token"]
+    # 'expires_at' is ISO8601, e.g. "2026-04-27T10:30:00Z"
+    from datetime import datetime as _dt
+    expires_at = body.get("expires_at", "")
+    try:
+        # Strip the Z and parse — datetime.fromisoformat accepts naive ISO
+        exp_dt = _dt.fromisoformat(expires_at.replace("Z", "+00:00"))
+        _cached_installation_token_exp = exp_dt.timestamp()
+    except (ValueError, TypeError):
+        # If parse fails, assume 1h from now (the GitHub default)
+        _cached_installation_token_exp = _time.time() + 3500
+    return _cached_installation_token
+
+
 def gh_token() -> str:
-    """The launcher injects GH_TOKEN via the env-file. Required."""
-    token = os.environ.get("GH_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("GH_TOKEN missing — launcher must inject it")
-    return token
+    """Returns a token suitable for `gh` CLI calls + git push.
+
+    Preferred path: GitHub App installation token (minted via JWT).
+    Fallback path: legacy GH_TOKEN env var (PAT).
+
+    The App path is what makes the bot work on org repos without
+    forking — installation tokens carry `Contents: write` and
+    `Pull requests: write` directly on the source repo, no fork needed.
+    """
+    if _have_app_config():
+        return _mint_installation_token()
+    legacy = os.environ.get("GH_TOKEN", "").strip()
+    if legacy:
+        sys.stderr.write(
+            "[auth] WARNING: using legacy GH_TOKEN PAT path. App config "
+            "(GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, GITHUB_APP_"
+            "PRIVATE_KEY_PATH) not set; PR-filing requires a pre-existing "
+            "fork at " + LEGACY_FORK_OWNER + "/<repo>.\n"
+        )
+        return legacy
+    raise RuntimeError(
+        "no GitHub auth available — set GITHUB_APP_ID + "
+        "GITHUB_APP_INSTALLATION_ID + GITHUB_APP_PRIVATE_KEY_PATH "
+        "(preferred) OR GH_TOKEN (legacy)"
+    )
 
 
 def make_git_env() -> dict:
@@ -167,73 +299,74 @@ def make_git_env() -> dict:
     e["GIT_AUTHOR_EMAIL"] = COMMIT_EMAIL
     e["GIT_COMMITTER_NAME"] = COMMIT_NAME
     e["GIT_COMMITTER_EMAIL"] = COMMIT_EMAIL
+    # When using App auth, gh CLI also needs GH_TOKEN — set it to the
+    # installation token. (GH_TOKEN is short-lived, won't outlive the build.)
+    if _have_app_config():
+        try:
+            e["GH_TOKEN"] = _mint_installation_token()
+        except Exception:
+            pass  # gh_token() raises clearly downstream if needed
     return e
 
 
-# --- Stage 1: ensure fork --------------------------------------------------
+# --- Stage 1+2: clone (App path = source; legacy path = fork) -------------
 
-def ensure_fork(target_repo: str) -> None:
-    """Verify the fork exists at FORK_OWNER/<repo>. If missing, attempt to
-    create it via API; on 403 (the PAT lacks administration=write) print
-    a clear in-character error and let the clone stage fail naturally —
-    the operator must pre-create the fork via the web UI ONCE per repo.
+def clone_repo(target_repo: str, work_dir: Path) -> Path:
+    """Clone the SOURCE repo via the installation token (or legacy PAT
+    against a pre-existing fork). Returns the repo working-tree path.
 
-    Why not REQUIRE the API fork: GitHub's fine-grained PAT model requires
-    administration=write to create forks, which most org policies clamp.
-    Web-UI fork has no such restriction. Pre-creating once is a 10-second
-    button click; failing builds with a clear message is better than
-    blocking ye on the GitHub permissions maze.
+    App path: clones leviathan-news/<repo> directly. Branch + push will
+    target this same remote. No fork involved.
+
+    Legacy PAT path: requires a pre-existing fork at LEGACY_FORK_OWNER/
+    <repo> (operator-pre-created). Clones the fork, adds upstream, hard-
+    resets to upstream/main so the branch is current.
     """
     repo_name = target_repo.split("/")[-1]
-    # Cheap GET — does the fork already exist?
+    repo_path = work_dir / "repo"
+
+    if _have_app_config():
+        # App path — clone source directly.
+        clone_url = (
+            f"https://x-access-token:{gh_token()}@github.com/{target_repo}.git"
+        )
+        run([GIT_BIN, "clone", "--depth=50", clone_url, str(repo_path)],
+            env=make_git_env(), log_label="clone-source")
+        return repo_path
+
+    # Legacy PAT path — fork-and-PR.
+    sys.stderr.write(
+        "[clone] WARNING: legacy PAT path. Operator must have pre-created "
+        f"a fork at {LEGACY_FORK_OWNER}/{repo_name}.\n"
+    )
+    # Verify fork existence via API (cheap, no perms beyond read).
     check = subprocess.run(
-        [GH_BIN, "api", f"repos/{FORK_OWNER}/{repo_name}", "--silent"],
+        [GH_BIN, "api", f"repos/{LEGACY_FORK_OWNER}/{repo_name}", "--silent"],
         capture_output=True, text=True, timeout=30,
     )
-    if check.returncode == 0:
-        sys.stderr.write(f"[fork] {FORK_OWNER}/{repo_name} already exists; skipping API fork.\n")
-        return
+    if check.returncode != 0:
+        # Try API fork as a courtesy (will likely 403 on org-clamped PATs).
+        fork_proc = subprocess.run(
+            [GH_BIN, "repo", "fork", target_repo, "--clone=false"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if fork_proc.returncode != 0:
+            raise RuntimeError(
+                f"fork missing and API create failed (rc={fork_proc.returncode}). "
+                f"Operator action: visit https://github.com/{target_repo} as "
+                f"{LEGACY_FORK_OWNER} and click `Fork`. OR migrate to App auth "
+                f"(set GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, "
+                f"GITHUB_APP_PRIVATE_KEY_PATH) and remove the legacy PAT — "
+                f"the App path requires no fork at all."
+            )
 
-    # Fork missing — try to create it via API. May 403 on PAT-clamped orgs.
-    sys.stderr.write(f"[fork] {FORK_OWNER}/{repo_name} not found; attempting API fork.\n")
-    fork_proc = subprocess.run(
-        [GH_BIN, "repo", "fork", target_repo, "--clone=false"],
-        capture_output=True, text=True, timeout=60,
+    fork_url = (
+        f"https://x-access-token:{gh_token()}@github.com/{LEGACY_FORK_OWNER}/{repo_name}.git"
     )
-    if fork_proc.returncode == 0:
-        sys.stderr.write(f"[fork] API fork succeeded for {FORK_OWNER}/{repo_name}.\n")
-        return
+    run([GIT_BIN, "clone", "--depth=50", fork_url, str(repo_path)],
+        env=make_git_env(), log_label="clone-fork")
 
-    # Pre-conditioned 403 — surface a clear actionable error.
-    err_msg = (
-        f"fork missing and API create failed (rc={fork_proc.returncode}). "
-        f"Operator action: visit https://github.com/{target_repo} logged in "
-        f"as {FORK_OWNER} and click `Fork`. ONE-TIME setup per repo."
-    )
-    sys.stderr.write(f"[fork] {_scrub_secrets(err_msg)}\n")
-    raise RuntimeError(err_msg)
-
-
-# --- Stage 2: clone fork ---------------------------------------------------
-
-def clone_fork(target_repo: str, work_dir: Path) -> Path:
-    """Clone leviathan-agent's fork via token-in-URL. Returns repo path."""
-    repo_name = target_repo.split("/")[-1]
-    fork_url = f"https://x-access-token:{gh_token()}@github.com/{FORK_OWNER}/{repo_name}.git"
-    repo_path = work_dir / "repo"
-    run(
-        [GIT_BIN, "clone", "--depth=50", fork_url, str(repo_path)],
-        env=make_git_env(),
-        log_label="clone",
-    )
-    return repo_path
-
-
-# --- Stage 3: rebase against upstream --------------------------------------
-
-def rebase_against_upstream(repo_path: Path, target_repo: str) -> None:
-    """Add upstream remote, fetch, rebase fork's main on top of upstream/main.
-    Keeps our branch from diverging from the source repo."""
+    # Rebase fork's main on top of upstream/main so we branch off current code.
     upstream_url = (
         f"https://x-access-token:{gh_token()}@github.com/{target_repo}.git"
     )
@@ -242,11 +375,11 @@ def rebase_against_upstream(repo_path: Path, target_repo: str) -> None:
         cwd=repo_path, env=env, log_label="remote-add", check=False)
     run([GIT_BIN, "fetch", "upstream", "main"],
         cwd=repo_path, env=env, log_label="fetch-upstream")
-    # Switch to main (clone's default may be a different ref) then rebase
     run([GIT_BIN, "checkout", "main"],
         cwd=repo_path, env=env, log_label="checkout-main")
     run([GIT_BIN, "reset", "--hard", "upstream/main"],
         cwd=repo_path, env=env, log_label="reset-to-upstream")
+    return repo_path
 
 
 # --- Stage 4: branch + apply edits -----------------------------------------
@@ -428,12 +561,16 @@ def commit_and_push(repo_path: Path, branch: str, message: str) -> str:
 # --- Stage 6: open PR ------------------------------------------------------
 
 def create_pr(target_repo: str, branch: str, title: str, body: str) -> str:
-    """gh pr create against upstream from leviathan-agent:branch.
-    Returns the PR URL."""
+    """gh pr create — same-repo when using App auth, cross-repo when
+    using legacy PAT (head is `leviathan-agent:branch`)."""
+    if _have_app_config():
+        head = branch  # same-repo: no `owner:` prefix
+    else:
+        head = f"{LEGACY_FORK_OWNER}:{branch}"
     proc = run(
         [GH_BIN, "pr", "create",
          "--repo", target_repo,
-         "--head", f"{FORK_OWNER}:{branch}",
+         "--head", head,
          "--title", title[:200],
          "--body", body[:60000]],
         log_label="pr-create",
@@ -470,12 +607,25 @@ def version_banner() -> dict:
             v = f"probe-failed: {type(exc).__name__}"
         components[name] = {"present": True, "path": path, "version": v}
     all_present = all(c["present"] for c in components.values())
+    # Try to import jwt — required for App auth.
+    try:
+        import jwt as _jwt  # noqa: F401
+        jwt_present = True
+    except ImportError:
+        jwt_present = False
+
+    auth_path = "app" if _have_app_config() else (
+        "legacy_pat" if os.environ.get("GH_TOKEN") else "none"
+    )
+
     return {
         "mode": "version",
         "worker": "build",
-        "all_components_present": all_present,
+        "all_components_present": all_present and jwt_present,
         "components": components,
-        "fork_owner": FORK_OWNER,
+        "pyjwt_present": jwt_present,
+        "auth_path": auth_path,
+        "legacy_fork_owner": LEGACY_FORK_OWNER,
         "commit_identity": f"{COMMIT_NAME} <{COMMIT_EMAIL}>",
     }
 
@@ -515,14 +665,15 @@ def main() -> "None":
 
     stage = "init"
     try:
-        stage = "fork"
-        ensure_fork(target_repo)
+        stage = "auth"
+        # Force-mint a token at the start so we fail fast on auth misconfig
+        # rather than mid-clone with a misleading "Permission denied" error.
+        gh_token()
 
         stage = "clone"
-        repo_path = clone_fork(target_repo, work_dir)
-
-        stage = "rebase"
-        rebase_against_upstream(repo_path, target_repo)
+        # clone_repo handles both App path (clone source) and legacy PAT
+        # path (clone fork + rebase against upstream).
+        repo_path = clone_repo(target_repo, work_dir)
 
         stage = "branch"
         checkout_new_branch(repo_path, target_branch)
