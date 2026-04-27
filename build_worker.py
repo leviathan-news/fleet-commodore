@@ -173,11 +173,45 @@ def make_git_env() -> dict:
 # --- Stage 1: ensure fork --------------------------------------------------
 
 def ensure_fork(target_repo: str) -> None:
-    """gh repo fork is idempotent — if the fork exists, it's a no-op."""
-    run(
-        [GH_BIN, "repo", "fork", target_repo, "--clone=false"],
-        log_label="fork", check=False,  # gh prints "already exists" then exit 0
+    """Verify the fork exists at FORK_OWNER/<repo>. If missing, attempt to
+    create it via API; on 403 (the PAT lacks administration=write) print
+    a clear in-character error and let the clone stage fail naturally —
+    the operator must pre-create the fork via the web UI ONCE per repo.
+
+    Why not REQUIRE the API fork: GitHub's fine-grained PAT model requires
+    administration=write to create forks, which most org policies clamp.
+    Web-UI fork has no such restriction. Pre-creating once is a 10-second
+    button click; failing builds with a clear message is better than
+    blocking ye on the GitHub permissions maze.
+    """
+    repo_name = target_repo.split("/")[-1]
+    # Cheap GET — does the fork already exist?
+    check = subprocess.run(
+        [GH_BIN, "api", f"repos/{FORK_OWNER}/{repo_name}", "--silent"],
+        capture_output=True, text=True, timeout=30,
     )
+    if check.returncode == 0:
+        sys.stderr.write(f"[fork] {FORK_OWNER}/{repo_name} already exists; skipping API fork.\n")
+        return
+
+    # Fork missing — try to create it via API. May 403 on PAT-clamped orgs.
+    sys.stderr.write(f"[fork] {FORK_OWNER}/{repo_name} not found; attempting API fork.\n")
+    fork_proc = subprocess.run(
+        [GH_BIN, "repo", "fork", target_repo, "--clone=false"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if fork_proc.returncode == 0:
+        sys.stderr.write(f"[fork] API fork succeeded for {FORK_OWNER}/{repo_name}.\n")
+        return
+
+    # Pre-conditioned 403 — surface a clear actionable error.
+    err_msg = (
+        f"fork missing and API create failed (rc={fork_proc.returncode}). "
+        f"Operator action: visit https://github.com/{target_repo} logged in "
+        f"as {FORK_OWNER} and click `Fork`. ONE-TIME setup per repo."
+    )
+    sys.stderr.write(f"[fork] {_scrub_secrets(err_msg)}\n")
+    raise RuntimeError(err_msg)
 
 
 # --- Stage 2: clone fork ---------------------------------------------------
