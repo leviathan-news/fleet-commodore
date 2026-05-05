@@ -33,10 +33,18 @@ def test_policy_cave_ambient_with_cooldown():
     assert p["ambient_cooldown_s"] >= 300
 
 
-def test_policy_monetization_mention_only():
+def test_policy_monetization_ambient_for_market_design():
+    """Monetization topic: Admiral engages on market-design discussion
+    (resolution criteria, oracle pinning, conflicts) but the persona
+    refuses wager picks with disdain. Updated 2026-05-05 — Admiral was
+    previously mention_only here and missed legitimate design questions."""
     p = _policy_for(AGENT_CHAT_GROUP_ID, AGENT_CHAT_TOPICS["monetization"])
-    assert p["speak"] == "mention_only"
-    assert p["ambient_cooldown_s"] > 0
+    assert p["speak"] == "ambient"
+    assert p["ambient_cooldown_s"] > 0  # bounded to prevent spam
+    # Persona must still flag wagering itself as off-limits
+    assert "wager" in p["persona_suffix"].lower() or "bet" in p["persona_suffix"].lower()
+    # And explicitly invite design engagement
+    assert "design" in p["persona_suffix"].lower()
 
 
 def test_policy_opsec_no_ambient():
