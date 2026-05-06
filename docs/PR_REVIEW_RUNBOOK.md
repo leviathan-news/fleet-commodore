@@ -300,6 +300,80 @@ No reviewer-image rebuild is needed for this — the tunnel is independent.
 
 ## Troubleshooting
 
+### "Admiral has gone quiet"
+
+Most common cause: Claude OAuth on the Mini has expired. The hourly
+heartbeat (`cron/claude-oauth-heartbeat.sh`, runs at `17 * * * *`)
+should alert Bot HQ on auth failure within 1 hour. If you see:
+
+```
+⚠️ Fleet Commodore: Claude OAuth has expired on the Mini.
+The daemon will fall back to Codex (also broken) until you run
+`claude /login` on the Mini. Last probe at <iso> returned 401.
+```
+
+Just run `ssh mini` (or open a Mini terminal) and:
+
+```bash
+claude /login
+```
+
+That opens a browser-OAuth flow. After successful login:
+
+- The next user message in chat triggers `_try_clear_breaker_via_probe()`,
+  which probes Claude (≤10 min later) and clears the breaker on success.
+- **No daemon restart needed** — the in-memory breaker state self-heals.
+- Verify with: `tail -5 ~/dev/leviathan/fleet-commodore/logs/claude-heartbeat.log`
+  — next hour's run should report `state=ok`.
+
+### Diagnostic chain when Admiral is silent
+
+```bash
+# 1. Daemon process alive?
+ssh mini 'ps aux | grep commodore.py | grep -v grep'
+
+# 2. Claude CLI auth direct test
+ssh mini 'echo "ping" | /opt/homebrew/bin/claude --print --output-format text 2>&1 | head -3'
+# 401 = run claude /login. "ping" or similar = auth fine, dig deeper.
+
+# 3. Heartbeat log (hourly status)
+ssh mini 'tail -10 ~/dev/leviathan/fleet-commodore/logs/claude-heartbeat.log'
+
+# 4. Daemon log for breaker activity
+ssh mini 'grep -E "Claude|breaker|probe|Falling back" ~/dev/leviathan/fleet-commodore/logs/commodore.log | tail -10'
+
+# 5. If a message was sent but no reply:
+ssh mini 'grep "$(date +%Y-%m-%d)" ~/dev/leviathan/fleet-commodore/logs/commodore.log | tail -20'
+```
+
+If breaker shows "still failing" repeatedly even though Claude is healthy:
+the persona-suffix prompt may be causing SKIP. Check the chat policy
+for that surface in `_policy_for()` and the `generate_response` action.
+
+### Self-healing breaker contract
+
+The breaker is in `commodore.py` around line 1576. Key state:
+
+- `_claude_failures` (int): increments per failed Claude call, max=3.
+- `_claude_unavailable_until` (float): cooldown timer.
+- `_claude_last_probe_at` (float): rate-limits probes when tripped.
+- `_CLAUDE_PROBE_INTERVAL_S` (env override `CLAUDE_PROBE_INTERVAL_S`,
+  default 600s): minimum gap between probes.
+
+When **both** counters are clear → `_claude_is_available()` returns True
+without probing (zero overhead in healthy state).
+
+When **either** is tripped → call `_try_clear_breaker_via_probe()`. That
+function runs a probe ONLY if the rate-limit interval has elapsed; on
+clean response (no 401, no quota text) it resets both counters.
+
+This gives us:
+- **Detection**: ≤1h via cron heartbeat
+- **Recovery**: ≤10min after operator runs `claude /login`
+- **No daemon restart needed** for routine OAuth rotation
+
+
+
 ### Reviewer image build fails
 
 If `./bin/build-reviewer-image.sh` fails during `apt-get` on the Mini, two
