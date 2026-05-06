@@ -1578,6 +1578,13 @@ def should_respond(msg, policy, is_direct):
 _claude_failures = 0
 _claude_max_failures = 3
 _claude_unavailable_until = 0.0
+# Self-healing breaker: when tripped (failures >= max OR cooldown active),
+# re-test Claude with a tiny probe at this interval. If the probe succeeds,
+# the breaker clears immediately. Without this, the daemon stayed
+# "unavailable" until restart even after the operator ran `claude /login`
+# to fix expired OAuth — silent dead bot for ~20h on 2026-05-06.
+_CLAUDE_PROBE_INTERVAL_S = int(os.environ.get("CLAUDE_PROBE_INTERVAL_S", "600"))
+_claude_last_probe_at = 0.0
 
 
 def _build_provider_env(bin_path):
@@ -1607,16 +1614,80 @@ def _mark_claude_unavailable(reason, cooldown=CLAUDE_LIMIT_COOLDOWN):
     log.warning("Claude marked unavailable for %ds: %s", max(60, cooldown), reason[:200])
 
 
-def _claude_is_available():
-    if _claude_unavailable_until > time.time():
+def _probe_claude() -> bool:
+    """Run a 5-second no-op against Claude CLI. Returns True on a clean
+    success. Used by the self-healing breaker to detect when the underlying
+    auth/quota issue has cleared.
+
+    Probe is short and rate-limited via _CLAUDE_PROBE_INTERVAL_S so we don't
+    burn quota when Claude is genuinely down."""
+    try:
+        result = subprocess.run(
+            [CLAUDE_BIN, "-p", "-"],
+            input="ok",
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=_build_provider_env(CLAUDE_BIN),
+            cwd=str(BASE_DIR),
+        )
+    except Exception as exc:
+        log.warning("Claude probe errored: %s", exc)
         return False
-    return _claude_failures < _claude_max_failures
+    return (
+        result.returncode == 0
+        and bool((result.stdout or "").strip())
+        and not (result.stdout or "").startswith("Error:")
+        # 401, quota, rate-limit phrasings still flag as unavailable
+        and not _looks_like_claude_limit_error(result.stdout, result.stderr)
+        and "Failed to authenticate" not in (result.stdout or "")
+        and "Failed to authenticate" not in (result.stderr or "")
+    )
+
+
+def _try_clear_breaker_via_probe() -> bool:
+    """If the breaker is tripped AND the probe interval has elapsed since
+    the last attempt, run a probe. Clear the breaker on success.
+
+    Returns True iff the breaker is now clear (either was never tripped
+    or just got released)."""
+    global _claude_failures, _claude_unavailable_until, _claude_last_probe_at
+
+    tripped = (
+        _claude_unavailable_until > time.time()
+        or _claude_failures >= _claude_max_failures
+    )
+    if not tripped:
+        return True
+
+    # Rate-limit probes so we don't pound the CLI when Claude is genuinely down.
+    if time.time() - _claude_last_probe_at < _CLAUDE_PROBE_INTERVAL_S:
+        return False
+
+    _claude_last_probe_at = time.time()
+    log.info("Claude breaker tripped; running probe to test recovery")
+    if _probe_claude():
+        log.info("Claude probe succeeded; clearing breaker")
+        _claude_failures = 0
+        _claude_unavailable_until = 0.0
+        return True
+    log.info("Claude probe still failing; breaker remains tripped")
+    return False
+
+
+def _claude_is_available():
+    return _try_clear_breaker_via_probe()
 
 
 def _claude_ask(prompt, timeout=120, retries=2):
     global _claude_failures
     for attempt in range(retries + 1):
-        if _claude_unavailable_until > time.time() or _claude_failures >= _claude_max_failures:
+        # _try_clear_breaker_via_probe gives the breaker a chance to release
+        # (probes Claude every _CLAUDE_PROBE_INTERVAL_S; clears on success).
+        # Without this, an OAuth 401 burst followed by an operator
+        # `claude /login` would leave the daemon stuck in fallback-mode
+        # until manual restart — that's the 2026-05-06 bug.
+        if not _try_clear_breaker_via_probe():
             return ""
         try:
             result = subprocess.run(
