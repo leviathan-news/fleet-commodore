@@ -7,8 +7,8 @@ for DeepSeaSquid the corsair. Never wagers - declines /buy and /sell outright,
 though /markets, /leaderboard, and /position are permitted.
 
 Architecture lifted in spirit (and in several battle-tested primitives) from
-be-benthic's benthic-bot.py - prompt-injection defense, Claude CLI primary with
-Codex fallback + circuit breaker, long-poll getUpdates, SQLite chat history.
+be-benthic's benthic-bot.py - prompt-injection defense, Claude CLI with
+self-healing circuit breaker, long-poll getUpdates, SQLite chat history.
 
 What this file does NOT do: news curation, article posting, voting, or yap
 writing. That is Benthic's lane. The Commodore is a chat/PR/code-Q&A agent.
@@ -26,7 +26,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 import urllib.request
@@ -153,19 +152,16 @@ CLAUDE_BIN = os.environ.get(
 )
 
 
-def _resolve_codex_bin():
-    found = shutil.which("codex")
-    if found:
-        return found
-    candidates = sorted(Path("~/.nvm/versions/node").expanduser().glob("*/bin/codex"))
-    if candidates:
-        return str(candidates[-1])
-    return "codex"
-
-
-CODEX_BIN = os.environ.get("CODEX_BIN", _resolve_codex_bin())
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.4")
 CLAUDE_LIMIT_COOLDOWN = int(os.environ.get("CLAUDE_LIMIT_COOLDOWN", str(6 * 60 * 60)))
+
+# In-character "radio jammed" line returned by llm_ask when Claude is
+# unreachable. Better than silent-skip — silence makes the bot look broken
+# and embarrasses the operator in front of the crew. Heartbeat cron posts
+# the actual outage alert to Bot HQ; this line keeps the bot speaking.
+CLAUDE_OUTAGE_REPLY = (
+    "Aye — me wireless be fouled by squall and seafoam at the moment. "
+    "Hail again in a few minutes and I'll have the radio dry."
+)
 
 ALLOWED_TOOLS = "WebSearch,WebFetch,Read,Grep,Glob"
 POLL_TIMEOUT = 30
@@ -1573,7 +1569,7 @@ def should_respond(msg, policy, is_direct):
     return True
 
 
-# --- LLM provider - Claude CLI primary, Codex CLI fallback ------------------
+# --- LLM provider - Claude CLI primary, in-character outage line otherwise --
 
 _claude_failures = 0
 _claude_max_failures = 3
@@ -1739,66 +1735,19 @@ def _claude_ask(prompt, timeout=120, retries=2):
     return ""
 
 
-def _codex_ask(prompt, timeout=120):
-    wrapped = (
-        "You are the Fleet Commodore's fallback model.\n\n"
-        "NON-INTERACTIVE one-shot task. Return ONLY the reply text (or SKIP).\n\n"
-        f"TASK:\n{prompt}\n"
-    )
-    output_path = None
-    try:
-        with tempfile.NamedTemporaryFile(prefix="commodore-codex-", suffix=".txt", delete=False) as tmp:
-            output_path = tmp.name
-        result = subprocess.run(
-            [
-                CODEX_BIN, "exec",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "-C", str(BASE_DIR),
-                "-m", CODEX_MODEL,
-                "-o", output_path,
-                "-",
-            ],
-            input=wrapped,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_build_provider_env(CODEX_BIN),
-            cwd=str(BASE_DIR),
-        )
-        response = ""
-        if output_path and Path(output_path).exists():
-            response = Path(output_path).read_text().strip()
-        if not response and result.stdout:
-            response = result.stdout.strip()
-        if result.returncode != 0 or not response:
-            log.error("Codex fallback failed: %s",
-                      (result.stderr or result.stdout or "")[:500])
-            return ""
-        return response
-    except subprocess.TimeoutExpired:
-        log.error("Codex fallback timed out")
-        return ""
-    except Exception as exc:
-        log.error("Codex fallback error: %s", exc)
-        return ""
-    finally:
-        if output_path:
-            try:
-                Path(output_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
 def llm_ask(prompt, timeout=120):
     primary = ""
     if _claude_is_available():
         primary = _claude_ask(prompt, timeout=timeout)
     if primary:
         return primary
-    log.warning("Falling back to Codex")
-    return _codex_ask(prompt, timeout=timeout)
+    # Codex fallback removed 2026-05-09: it was always 401 (no auth.json on
+    # Mini) AND used an invalid model name ("gpt-5.4"), so the "fallback"
+    # silently returned empty and the bot went mute. When Claude is down,
+    # speak in character — "radio jammed" is recoverable; silence is
+    # embarrassing. Operator gets paged via the OAuth heartbeat cron.
+    log.warning("Claude unavailable; returning in-character outage line")
+    return CLAUDE_OUTAGE_REPLY
 
 
 # --- Persona ----------------------------------------------------------------
@@ -2546,7 +2495,15 @@ _QA_RE = re.compile(
     # gate upstream prevents non-mention questions from triggering Q&A.
     # NB: include `who` and `whose` — operator questions about people/roles
     # are common ("who are the editors online?", "whose call is this?").
-    r"\b(?:how\s+(?:many|much)|how|what(?:'s)?|why|when|where|which|who(?:'s|se)?)\b.*\?",
+    r"\b(?:how\s+(?:many|much)|how|what(?:'s)?|why|when|where|which|who(?:'s|se)?)\b.*\?|"
+    # Or ANY question ending in `?` when the bot is directly addressed.
+    # Yes/no questions ("Is this true?", "Can you check?", "Are you sure?")
+    # are still Q&A — the operator wants verification. The is_direct gate
+    # upstream means non-mention questions never reach this branch.
+    # 2026-05-09: Gerrit asked "Is this true? Isn't this your job to check it?"
+    # and the wh-word-only regex missed it; bot fell to persona LLM, Claude
+    # timed out, fallback failed silent.
+    r".+\?",
     re.IGNORECASE | re.DOTALL,
 )
 
