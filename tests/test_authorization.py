@@ -1,8 +1,11 @@
 """Per-action authorization matrix.
 
-Locks the v6 surface in: ship/plan are Bot HQ + admin; QA is Bot HQ ∪ Lev Dev
-∪ Agent Chat ∪ admin DM. Squid Cave is read-only-no-Q&A. Non-admin DM is
-nothing.
+Locks the v6.1 surface in:
+- ship/plan: ANY crewmate in Lev Dev OR admin in Bot HQ. Lev Dev is the dev
+  workshop and is open to non-admins; Bot HQ is the editorial admin room and
+  retains the admin gate.
+- qa: Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ admin DM.
+- Squid Cave is read-only-no-Q&A. Non-admin DM is nothing.
 """
 import pytest
 import commodore
@@ -30,9 +33,11 @@ def msg(chat_id, sender_id, chat_type="supergroup"):
     # admin elsewhere: qa only (ship/plan deliberately gated)
     ("Agent Chat admin",   msg(AGENT_CHAT, ADMIN_ID),                      False, False, True),
     ("admin DM",           msg(ADMIN_ID, ADMIN_ID, chat_type="private"),   False, False, True),
-    # non-admin in any privileged chat: Q&A only
+    # Bot HQ non-admin: Q&A only — Bot HQ is the editorial admin room
     ("Bot HQ non-admin",   msg(BOT_HQ, NON_ADMIN_ID),                      False, False, True),
-    ("Lev Dev non-admin",  msg(LEV_DEV, NON_ADMIN_ID),                     False, False, True),
+    # Lev Dev non-admin: FULL ship/plan + qa — Lev Dev is the dev workshop,
+    # any crewmate aboard may order a dispatch (v6.1 widening, May 2026)
+    ("Lev Dev non-admin",  msg(LEV_DEV, NON_ADMIN_ID),                     True,  True,  True),
     ("Agent Chat random",  msg(AGENT_CHAT, NON_ADMIN_ID),                  False, False, True),
     # Squid Cave: nothing (not in privileged set)
     ("Squid Cave admin",   msg(SQUID_CAVE, ADMIN_ID),                      False, False, False),

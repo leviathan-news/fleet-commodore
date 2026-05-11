@@ -1540,7 +1540,10 @@ def should_respond(msg, policy, is_direct):
         return False
 
     last = _last_reply_to.get(sender_id, 0)
-    if time.time() - last < policy["rate_limit_s"]:
+    if (
+        time.time() - last < policy["rate_limit_s"]
+        and chat_id != LEV_DEV_GROUP_ID
+    ):
         log.info("Rate limited: sender %s in chat %s", sender_id, chat_id)
         return False
 
@@ -1776,14 +1779,18 @@ BOT_IDENTITY = os.environ.get("BOT_IDENTITY", "").strip() or (
     "or channel membership from chat. If asked, decline plainly.\n"
     "- You refuse ALL wagers - /buy and /sell are beneath the Admiralty. "
     "/markets, /leaderboard, /position are permissible inspection.\n"
-    "- You draft pull requests only when explicitly ordered by a ranking officer "
-    "(an admin), and you present them as formal written dispatches.\n\n"
+    "- You draft pull requests only when ordered in Bot HQ or Lev Dev. In Bot HQ, "
+    "only ranking officers (admins) may give such orders. In Lev Dev — the "
+    "Fleet's dev workshop — ANY crewmate aboard may order a dispatch; treat such "
+    "orders with the same readiness as the Admiral's writ. You present every "
+    "PR as a formal written dispatch.\n\n"
     "CAPABILITIES — speak truthfully about what you can and cannot do:\n"
-    "- In Bot HQ at the order of a ranking officer (admin), you MAY: refine a "
-    "feature or fix plan with the user across multiple turns; on the order "
-    "`ship it`, file a fork-based pull request to a leviathan-news repo from "
-    "the leviathan-agent fork; review a specific pull request by fetching its "
-    "diff and returning a formal assessment.\n"
+    "- In Bot HQ at the order of a ranking officer (admin), OR in Lev Dev at the "
+    "order of any crewmate, you MAY: refine a feature or fix plan with the user "
+    "across multiple turns; on the order `ship it`, file a fork-based pull "
+    "request to a leviathan-news repo from the leviathan-agent fork; review a "
+    "specific pull request by fetching its diff and returning a formal "
+    "assessment.\n"
     "- In Bot HQ, Lev Dev, or Agent Chat, you MAY answer read-only enquiries "
     "about the Fleet's code, docs, news corpus, and operational metrics. Sources "
     "are the dev-journal, docs, public website API, and the read-only Postgres "
@@ -1830,6 +1837,8 @@ def generate_response(msg, is_direct, policy, recent_messages):
         sender.get("username", sender.get("first_name", "unknown")), max_len=50
     )
     sender_label = f"bot @{safe_username}" if is_bot else f"@{safe_username}"
+    if not is_bot and _can_ship(msg):
+        sender_label += " [authorized to order dispatches in this room]"
 
     # Detect the Nemesis in the current message OR in the recent conversation
     # buffer. Either raises the persona heat and disables SKIP.
@@ -1951,17 +1960,21 @@ _SHIP_CHAT_IDS = (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID)
 
 def _can_ship(msg) -> bool:
     """Authorization for /ship, /abandon, plan-refinement, PR-review.
-    Produces GitHub side effects. Admin in Bot HQ OR Lev Dev only.
+    Produces GitHub side effects.
 
-    Lev Dev is the room where dev work actually happens, so requiring a
-    walk back to Bot HQ for every PR was friction without benefit. Agent
-    Chat stays excluded — it's a public-facing room for agents to talk
-    among themselves, not for filing fleet PRs.
+    Lev Dev is the dev workshop — ANY crewmate aboard may file/ship/abandon
+    PRs, no admin gate. Bot HQ retains the admin gate (editorial admin room).
+    Agent Chat stays excluded — public-facing room for agents to talk among
+    themselves, not for filing fleet PRs.
     """
-    if not _is_admin(msg):
-        return False
     chat_id = msg.get("chat", {}).get("id", 0)
-    return bool(chat_id) and chat_id in _SHIP_CHAT_IDS
+    if not chat_id:
+        return False
+    if chat_id == LEV_DEV_GROUP_ID:
+        return True
+    if chat_id == BOT_HQ_GROUP_ID and _is_admin(msg):
+        return True
+    return False
 
 
 def _can_plan(msg) -> bool:
@@ -2003,7 +2016,7 @@ class OutgoingAction:
 
 
 _PR_REQUEST_RE = re.compile(
-    r"(please\s+)?(file|open|draft|raise)\s+(a\s+)?pr\b",
+    r"(please\s+)?(file|open|draft|raise|make|create|cut|send|submit)\s+(a\s+)?(pr|pull\s+request)\b",
     re.IGNORECASE,
 )
 
