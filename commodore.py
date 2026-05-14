@@ -217,13 +217,17 @@ def _policy_for(chat_id, topic_id):
     if chat_id == SQUID_CAVE_GROUP_ID:
         return {
             **_BASE_POLICY,
-            "speak": "ambient",
+            # mention_only across all rooms (2026-05-14): with Benthic back
+            # and the bot meant to stay in its lane — PR-filing, formal Q&A
+            # on hail, dispatches — ambient "social director" duty is off.
+            "speak": "mention_only",
             "rate_limit_s": 60,
-            "ambient_cooldown_s": 300,  # 1 ambient per 5 min per chat
+            "ambient_cooldown_s": 0,
             "persona_suffix": (
-                "You are in Squid Cave, the crew's common room. Be a social director: "
-                "measured levity, welcome newcomers, hype good submissions. Never post so "
-                "often that you bury the sticky voting panel - restraint is a virtue."
+                "You are in Squid Cave, the crew's common room. When hailed, "
+                "be a gracious presence: brief, gentlemanly, welcoming. Do NOT "
+                "volunteer commentary on unaddressed messages; the sticky "
+                "voting panel must not be buried under bot chatter."
             ),
         }
 
@@ -231,12 +235,13 @@ def _policy_for(chat_id, topic_id):
         if topic_id == AGENT_CHAT_TOPICS["monetization"]:
             return {
                 **_BASE_POLICY,
-                # ambient: engage on market-design discussion. The persona
-                # below distinguishes picks (refused with disdain) from
-                # structure (Admiralty's province).
-                "speak": "ambient",
+                # mention_only across all rooms (2026-05-14). Market-design
+                # discussion is still squarely the Admiralty's province
+                # WHEN HAILED — but he no longer parachutes into wagering
+                # threads unbidden.
+                "speak": "mention_only",
                 "rate_limit_s": 60,
-                "ambient_cooldown_s": 300,  # 5 min between unprompted speaks
+                "ambient_cooldown_s": 0,
                 "persona_suffix": (
                     "Topic: Monetization. There are TWO conversations on this surface "
                     "and you treat them differently:\n"
@@ -267,22 +272,30 @@ def _policy_for(chat_id, topic_id):
         if topic_id == AGENT_CHAT_TOPICS["api_help"]:
             return {
                 **_BASE_POLICY,
-                "speak": "ambient",
+                # mention_only across all rooms (2026-05-14). API Help is
+                # still his lane; he just waits to be asked.
+                "speak": "mention_only",
                 "rate_limit_s": 30,
-                "ambient_cooldown_s": 120,
+                "ambient_cooldown_s": 0,
                 "persona_suffix": (
-                    "Topic: API Help. This is your lane. Answer questions about the Leviathan "
-                    "API with precision. Quote endpoints by exact path."
+                    "Topic: API Help. This is your lane. When hailed, answer "
+                    "questions about the Leviathan API with precision. Quote "
+                    "endpoints by exact path. Wait to be asked."
                 ),
             }
         if topic_id == AGENT_CHAT_TOPICS["sandbox"]:
             return {
                 **_BASE_POLICY,
-                "speak": "ambient",
+                # mention_only across all rooms (2026-05-14). The "banter
+                # with other bots" rationale was the source of echo-loop
+                # behavior — exactly what we're closing off.
+                "speak": "mention_only",
                 "rate_limit_s": 30,
-                "ambient_cooldown_s": 90,
+                "ambient_cooldown_s": 0,
                 "persona_suffix": (
-                    "Topic: Sandbox. You may banter with other bots here. Still a gentleman."
+                    "Topic: Sandbox. The most relaxed agent-chat topic, but "
+                    "you still wait to be addressed. No bot-to-bot ambient "
+                    "banter."
                 ),
             }
         if topic_id == AGENT_CHAT_TOPICS["human_lounge"]:
