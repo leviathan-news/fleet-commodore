@@ -78,7 +78,19 @@ python -m pytest tests/ -v
 Server-side denylist tests live in the squid-bot repo at
 `tests/api/test_wager_denylist.py` (12 tests, all green).
 
+## Pitfalls
+
+Lessons paid for in hallucinated dispatches:
+
+- **Regex intent detection is structurally wrong for editor audiences.** Editors don't say "file a PR" — they say "robot fix this" / "kill it from the header". Each regex miss = one Commodore restart. See `docs/plans/2026-05-11-commodore-structured-intent.md` for the replacement.
+- **Decoupled action + reply layers will hallucinate completions.** If the LLM writes the reply and a separate regex routes the action, the LLM will cheerfully promise dispatches that the action pipeline never received. The structural fix is to make ONE LLM call emit BOTH the reply and the intent (JSON envelope), so the reply can't promise what the dispatch decision didn't claim.
+- **LLM persona must know who's an admin / operator.** Without a `[authorized to order dispatches in this room]` marker on `sender_label`, the persona prompt's "defer to ranking officers" instruction has no signal to act on, and the LLM defaults to refusing in character.
+- **Mini env flags drift.** `QA_ENABLED`, `BENTHIC_BACKUP_MODE`, etc. get flipped during incidents and forgotten. First triage step for "bot not responding": `cat .env | grep -E "ENABLED|MODE"` BEFORE suspecting code paths.
+- **Verify reality, not chat.** SQLite is the source of truth. `sqlite3 commodore.db "SELECT status, error FROM build_job ORDER BY id DESC LIMIT 1"` is the only honest answer for "did the bot file the PR?". The chat history will lie politely.
+
 ## Plan
 
 Full implementation plan and server-side denylist contract:
 `leviathan-news/squid-bot:docs/plans/2026-04-16-commodore-agent.md`.
+
+Outstanding plan (preparatory, this branch): `docs/plans/2026-05-11-commodore-structured-intent.md`.
