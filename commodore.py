@@ -194,21 +194,22 @@ def _policy_for(chat_id, topic_id):
     if chat_id == LEV_DEV_GROUP_ID:
         return {
             **_BASE_POLICY,
-            # ambient: engage on direct questions even without @mention.
-            # Lev Dev is a small-team dev channel; silence on real questions
-            # is worse than occasional unsolicited input. Cooldown bounds
-            # the noise.
-            "speak": "ambient",
+            # mention_only: with @Benthic_Bot back, Lev Dev's "real questions"
+            # demand was met. Commodore + Benthic running ambient in the same
+            # room produced echo-loop chatter (2026-05-14, see dev-journal).
+            # Commodore now stands silent unless explicitly @mentioned.
+            # PR-filing and plan-refinement still work — those routes are
+            # mention-driven by design.
+            "speak": "mention_only",
             "rate_limit_s": 30,
-            "ambient_cooldown_s": 180,  # 3 min between unprompted speaks
+            "ambient_cooldown_s": 0,
             "persona_suffix": (
-                "You are in Lev Dev — the engineering room. Speak with the "
-                "directness of a ship's first officer to the dev crew. "
-                "PR-filing and plan-refinement are appropriate here. When a "
-                "real engineering question is in flight (architecture, "
-                "trade-offs, debugging), volunteer your view — silence on a "
-                "direct query reads as absence, not restraint. SKIP only on "
-                "social chatter or off-topic links."
+                "You are in Lev Dev — the engineering room. When the dev crew "
+                "addresses you directly, answer with the directness of a "
+                "ship's first officer. PR-filing and plan-refinement are "
+                "appropriate here. Do NOT volunteer opinions on threads where "
+                "you were not addressed; @Benthic_Bot is the resident voice "
+                "for ambient engineering chatter."
             ),
             "allow_pr": True,
         }
