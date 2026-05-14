@@ -3392,7 +3392,15 @@ def _process_qa(job_uuid: str) -> None:
                 # file intact; recovery will retry.
                 log.warning("qa %s: telegram POST failed, keeping scratch", job_uuid)
         elif status == "declined":
-            reason = (result.get("reason") or "")[:500]
+            # qa_worker.py returns the field as "declined_reason" (see
+            # qa_worker.parse_qa). Older code read "reason" which silently
+            # produced empty decline messages ("The Admiralty declines that
+            # inquiry: ") with no hint to the operator. Read both for safety.
+            reason = (
+                result.get("declined_reason")
+                or result.get("reason")
+                or "no reason given"
+            )[:500]
             wal = send_message_with_wal(
                 "qa_job", job_uuid, OutgoingAction.QA_DECLINE,
                 chat_id,
