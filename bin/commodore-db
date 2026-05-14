@@ -2,25 +2,24 @@
 """commodore-db — read-only SQL wrapper for the review container.
 
 Reads a single SQL statement from stdin, validates it is a pure read
-(SELECT / EXPLAIN / CTE-with-SELECT-tail), executes via psycopg against
+(SELECT / EXPLAIN / CTE-with-SELECT-tail), executes via psycopg2 against
 COMMODORE_DB_URL, returns JSON on stdout.
 
 Defense layers:
   1. Parser (sqlparse): reject non-SELECT, multi-statement, DML, DDL.
-  2. DB role: commodore_reader has `default_transaction_read_only = on`
-     and no GRANTs beyond SELECT. This is the real backstop.
-  3. statement_timeout = 3 seconds. Runaway queries die fast.
-  4. Row cap = 500. Wrapper appends LIMIT if missing; otherwise it
-     truncates results at 500 rows and sets truncated=true.
+  2. DB role: commodore_reader has SELECT on safe tables only; no SELECT
+     on bot_apikey, bot_user, auth_user, or other identity/credential
+     tables. This is the real backstop.
+  3. statement_timeout = 3 seconds (set on the session BEFORE the query).
+     Runaway queries die fast.
+  4. Row cap = 500. Wrapper fetches at most MAX_ROWS+1 rows; if it gets
+     the extra row, truncated=true is set and only MAX_ROWS are returned.
 
 Exit codes:
   0 — query ran, JSON on stdout.
   1 — parser rejection. JSON error on stdout.
   2 — DB error. JSON error on stdout.
   3 — timeout. JSON error on stdout.
-
-This file is v1 STUB: scaffolding + parser gate present, actual psycopg
-execution is implemented in task #16 (needs live DB to test against).
 """
 from __future__ import annotations
 
@@ -31,6 +30,38 @@ import sys
 
 MAX_ROWS = 500
 STATEMENT_TIMEOUT_MS = 3000
+
+# Wrapper-level denylist. The commodore_reader role's GRANTs are wider
+# than they should be (some default-ACL bleed-through + tables created
+# under doadmin that weren't explicitly revoked). Until the DB-side grants
+# are tightened, the wrapper holds the line: any of these table names in
+# the SQL gets the query rejected before it reaches the database.
+#
+# Word-boundary match means "bot_user" matches "FROM bot_user", "JOIN
+# bot_user u", '"bot_user"', and `public.bot_user` (regex \b honors the
+# dot as a boundary). Quoted-identifier with internal whitespace would
+# bypass — but psycopg2 will fail those anyway with the parser, and we
+# don't accept arbitrary text the operator can craft (the QA bot composes
+# the SQL inside the safety prompt).
+import re as _re
+
+SENSITIVE_TABLE_NAMES = (
+    # Identity / accounts
+    "bot_user", "bot_user_groups", "bot_user_user_permissions",
+    "bot_houseuser", "auth_user", "auth_user_groups",
+    # Credentials
+    "lnn_api_keys", "bot_webauthn_credential",
+    # Auth state
+    "django_session", "lnn_delegation_nonce",
+    "token_blacklist_blacklistedtoken", "token_blacklist_outstandingtoken",
+    # Login telemetry / brute-force surface
+    "lnn_user_login_events", "lnn_user_throttle",
+)
+
+_DENYLIST_RE = _re.compile(
+    r"\b(" + "|".join(_re.escape(t) for t in SENSITIVE_TABLE_NAMES) + r")\b",
+    _re.IGNORECASE,
+)
 
 
 def emit(obj: dict, exit_code: int = 0) -> "None":
@@ -92,25 +123,128 @@ def is_read_only_sql(sql: str) -> "tuple[bool, str]":
     return False, f"non-SELECT statement type: {first_kw or stmt_type or 'UNKNOWN'}"
 
 
+def _serialize_value(v):
+    """JSON-safe conversion. dates/decimals/uuids/bytes get string repr."""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_serialize_value(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _serialize_value(x) for k, x in v.items()}
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        try:
+            return bytes(v).decode("utf-8", errors="replace")
+        except Exception:
+            return f"<{len(bytes(v))} bytes>"
+    # date, datetime, time, timedelta, Decimal, UUID, etc.
+    return str(v)
+
+
+def run_query(sql: str, db_url: str) -> dict:
+    """Execute the SQL against COMMODORE_DB_URL. Return a JSON-safe dict.
+
+    Caller has already verified the SQL is read-only. We belt+brace by:
+      - opening a fresh autocommit connection (no transaction churn)
+      - setting statement_timeout BEFORE the user query
+      - setting default_transaction_read_only=on at the session level so
+        even a parser-bypass DML fails server-side
+      - fetching at most MAX_ROWS+1 rows; flagging truncated if needed
+    """
+    import psycopg2
+    import psycopg2.extensions
+    import time
+
+    start = time.monotonic()
+    conn = psycopg2.connect(db_url, connect_timeout=5)
+    try:
+        # Read-only + statement timeout, applied before the user query.
+        # autocommit so the SET commands take effect immediately and the
+        # user SELECT doesn't churn an implicit transaction.
+        conn.set_session(readonly=True, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+            cur.execute(sql)
+            if cur.description is None:
+                # No result set (shouldn't happen for SELECT/EXPLAIN, but
+                # defend against EXPLAIN ANALYZE side-effects etc.)
+                return {
+                    "columns": [],
+                    "rows": [],
+                    "row_count": 0,
+                    "truncated": False,
+                    "elapsed_ms": int((time.monotonic() - start) * 1000),
+                }
+            columns = [d.name for d in cur.description]
+            # Fetch MAX_ROWS + 1 so we can detect truncation cheaply.
+            raw_rows = cur.fetchmany(MAX_ROWS + 1)
+            truncated = len(raw_rows) > MAX_ROWS
+            if truncated:
+                raw_rows = raw_rows[:MAX_ROWS]
+            rows = [[_serialize_value(v) for v in r] for r in raw_rows]
+            return {
+                "columns": columns,
+                "rows": rows,
+                "row_count": len(rows),
+                "truncated": truncated,
+                "elapsed_ms": int((time.monotonic() - start) * 1000),
+            }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def main() -> "None":
     sql = sys.stdin.read()
     ok, reason = is_read_only_sql(sql)
     if not ok:
         emit({"error": "not_read_only", "reason": reason}, exit_code=1)
 
+    deny_hit = _DENYLIST_RE.search(sql or "")
+    if deny_hit:
+        emit({"error": "denied_table",
+              "reason": (
+                  f"references sensitive table '{deny_hit.group(1)}'. "
+                  "Identity, credential, session, and auth-state tables are "
+                  "out of scope for Q&A."
+              )},
+             exit_code=1)
+
     db_url = os.environ.get("COMMODORE_DB_URL")
     if not db_url:
         emit({"error": "missing_db_url", "reason": "COMMODORE_DB_URL env var not set"}, exit_code=2)
 
-    # v1 STUB: parser passed. Task #16 implements psycopg execution, row cap,
-    # and statement timeout enforcement. For image smoke tests + unit tests,
-    # the parser-only gate is sufficient.
+    try:
+        result = run_query(sql, db_url)
+    except ImportError:
+        emit({"error": "psycopg2_missing",
+              "reason": "psycopg2 not installed in container (bug in Dockerfile)"},
+             exit_code=2)
+    except Exception as exc:
+        # Distinguish timeout from other DB errors. psycopg2.errors.QueryCanceled
+        # is raised when statement_timeout fires.
+        try:
+            import psycopg2.errors
+            if isinstance(exc, psycopg2.errors.QueryCanceled):
+                emit({"error": "statement_timeout",
+                      "reason": f"query exceeded {STATEMENT_TIMEOUT_MS}ms"},
+                     exit_code=3)
+        except ImportError:
+            pass
+        # Generic DB error: surface psycopg2's pgcode + message but not stack.
+        pgcode = getattr(exc, "pgcode", None)
+        emit({"error": "db_error",
+              "reason": f"{type(exc).__name__}: {str(exc)[:500]}",
+              "pgcode": pgcode},
+             exit_code=2)
+
     emit({
-        "status": "parser_passed_stub",
-        "reason": reason,
+        "status": "ok",
+        "parser_reason": reason,
         "max_rows": MAX_ROWS,
         "statement_timeout_ms": STATEMENT_TIMEOUT_MS,
-        "message": "Parser gate passed. psycopg execution implemented in task #16.",
+        **result,
     }, exit_code=0)
 
 

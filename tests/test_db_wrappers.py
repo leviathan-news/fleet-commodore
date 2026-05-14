@@ -50,15 +50,22 @@ def _run(wrapper, stdin_text, env=None):
     "EXPLAIN ANALYZE SELECT 1",
 ])
 def test_commodore_db_accepts_read_only_sql(sql, tmp_path):
+    # Use a fake DSN that resolves to a parser-passed payload *before* psycopg
+    # tries to connect. We assert that the parser gate accepted the SQL
+    # (i.e. the wrapper proceeded to the connection step and surfaced a
+    # connection error, NOT a parser rejection error).
     rc, payload = _run(DB_WRAPPER, sql, env={
         "COMMODORE_DB_URL": "postgres://fake"
     })
-    # Parser passes — then v1 stub reports parser_passed_stub.
-    # When the real psycopg layer lands (task #16), this will become
-    # "status: ok" with rows. For now any non-error exit + parser-passed
-    # status means the gate let it through.
-    assert rc == 0, f"expected accept; got rc={rc} payload={payload}"
-    assert payload.get("status") == "parser_passed_stub"
+    # Two valid outcomes prove parser pass:
+    #   (a) exit 2 + error "db_error" (psycopg couldn't connect to "fake")
+    #   (b) exit 0 + status "ok" (would require a live DB; not the case here)
+    # The PARSER REJECT path would be exit 1 + error "not_read_only".
+    assert payload.get("error") != "not_read_only", (
+        f"parser rejected an accepted-shape SQL: {sql!r} payload={payload}"
+    )
+    # And exit 1 (parser reject) is wrong. exit 0 or exit 2 are both fine.
+    assert rc in (0, 2), f"unexpected rc={rc} payload={payload}"
 
 
 @pytest.mark.parametrize("sql,expected_reason_substr", [
@@ -93,13 +100,56 @@ def test_commodore_db_rejects_empty():
 
 
 def test_commodore_db_reports_missing_db_url():
-    # Clear COMMODORE_DB_URL. Parser passes, then stub reports the missing
-    # URL as a separate error path.
+    # Clear COMMODORE_DB_URL. Parser passes, then the wrapper reports
+    # missing URL before attempting connection.
     import os
     env = {k: v for k, v in os.environ.items() if k != "COMMODORE_DB_URL"}
     rc, payload = _run(DB_WRAPPER, "SELECT 1", env=env)
     assert rc == 2
     assert payload["error"] == "missing_db_url"
+
+
+# --- commodore-db sensitive-table denylist tests --------------------------
+
+
+@pytest.mark.parametrize("sql,expected_table", [
+    ("SELECT count(*) FROM bot_user", "bot_user"),
+    ("SELECT count(*) FROM public.bot_user", "bot_user"),
+    ("SELECT count(*) FROM \"bot_user\"", "bot_user"),
+    ("SELECT * FROM lnn_api_keys LIMIT 1", "lnn_api_keys"),
+    ("SELECT * FROM bot_webauthn_credential", "bot_webauthn_credential"),
+    ("SELECT * FROM token_blacklist_blacklistedtoken", "token_blacklist_blacklistedtoken"),
+    ("SELECT * FROM django_session", "django_session"),
+    ("SELECT * FROM lnn_user_login_events", "lnn_user_login_events"),
+    ("SELECT * FROM lnn_delegation_nonce", "lnn_delegation_nonce"),
+    # Cross-table JOIN must trip the deny on any sensitive table reference
+    ("SELECT n.id FROM lnn_news n JOIN bot_user u ON n.owner_id = u.id", "bot_user"),
+    # Case-insensitive
+    ("select * from BOT_USER", "BOT_USER"),
+])
+def test_commodore_db_rejects_sensitive_tables(sql, expected_table):
+    rc, payload = _run(DB_WRAPPER, sql, env={"COMMODORE_DB_URL": "postgres://fake"})
+    assert rc == 1, f"expected denylist reject for {sql!r}; got rc={rc} payload={payload}"
+    assert payload["error"] == "denied_table"
+    assert expected_table.lower() in payload["reason"].lower()
+
+
+def test_commodore_db_denylist_does_not_match_column_names():
+    # A column named like a sensitive table should NOT trip the deny —
+    # only standalone identifiers matter. (The check is regex \b on the
+    # full token; a column called "bot_user_id" would match \b and trip,
+    # which is an acceptable false positive given there's no real such
+    # column in the schema. But "user_id" as a column does NOT match
+    # "bot_user".)
+    rc, payload = _run(DB_WRAPPER, "SELECT user_id FROM bot_dispatch LIMIT 1",
+                       env={"COMMODORE_DB_URL": "postgres://fake"})
+    # Parser passes, denylist does NOT trip. Connection then fails on
+    # the fake URL → db_error. We just need to confirm we got PAST the
+    # parser + denylist.
+    assert payload.get("error") != "not_read_only"
+    assert payload.get("error") != "denied_table", (
+        f"denylist incorrectly tripped on column reference: {payload}"
+    )
 
 
 # --- commodore-orm snippet gate tests -------------------------------------
