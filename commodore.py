@@ -1556,8 +1556,22 @@ def should_respond(msg, policy, is_direct):
         if time.time() - last_ambient < policy["ambient_cooldown_s"]:
             return False
 
-    reply_to = msg.get("reply_to_message", {}).get("message_id")
-    if reply_to:
+    # In Telegram forum supergroups (e.g. Agent Chat topics), EVERY message
+    # carries reply_to_message pointing at the topic's anchor message. Telegram
+    # exposes this via is_topic_message=True and message_thread_id == topic_anchor_id.
+    # If we treated those as conversation-thread replies we'd cap the entire topic
+    # at MAX_THREAD_DEPTH messages after a single bot restart, silencing the
+    # Commodore in that topic forever. Filter the topic-anchor "reply" out and
+    # only count true conversation replies (where reply_to ≠ topic anchor).
+    reply_to_msg = msg.get("reply_to_message") or {}
+    reply_to = reply_to_msg.get("message_id")
+    topic_anchor = msg.get("message_thread_id") if msg.get("is_topic_message") else None
+    is_topic_anchor_only = (
+        reply_to is not None
+        and topic_anchor is not None
+        and reply_to == topic_anchor
+    )
+    if reply_to and not is_topic_anchor_only:
         root = _msg_root.get(reply_to, reply_to)
         _msg_root[msg_id] = root
         depth = _thread_depth.get(root, 0) + 1
