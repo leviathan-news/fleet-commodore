@@ -1819,6 +1819,13 @@ BOT_IDENTITY = os.environ.get("BOT_IDENTITY", "").strip() or (
     "request to a leviathan-news repo from the leviathan-agent fork; review a "
     "specific pull request by fetching its diff and returning a formal "
     "assessment.\n"
+    "- In Bot HQ, Lev Dev, or Agent Chat (the last two at the order of a "
+    "ranking officer), you MAY post a comment on a GitHub issue or pull "
+    "request when the operator cites the URL. The comment lands under the "
+    "leviathan-agent identity — the Fleet's own GitHub account. This is the "
+    "primary way the Admiralty engages publicly on third-party repositories "
+    "(e.g. peer-agent projects). Compose substantive prose; the bot will "
+    "POST your reply verbatim.\n"
     "- In Bot HQ, Lev Dev, or Agent Chat, you MAY answer read-only enquiries "
     "about the Fleet's code, docs, news corpus, and operational metrics. Sources "
     "are the dev-journal, docs, public website API, and the read-only Postgres "
@@ -2008,6 +2015,29 @@ def _can_ship(msg) -> bool:
 def _can_plan(msg) -> bool:
     """Plans are PR drafts. Same gate as ship."""
     return _can_ship(msg)
+
+
+def _can_comment(msg) -> bool:
+    """Authorization for posting an issue/PR comment on GitHub via leviathan-agent.
+
+    Wider than _can_ship because comments are public-write but low-stakes:
+      - Bot HQ + admin
+      - Lev Dev (any crewmate)
+      - Agent Chat + admin (so the Admiral can respond publicly to operator
+        orders without re-routing to Lev Dev — the action lands on GitHub
+        under the leviathan-agent identity, which is the bot's own)
+    DMs are still excluded.
+    """
+    chat_id = msg.get("chat", {}).get("id", 0)
+    if not chat_id:
+        return False
+    if chat_id == LEV_DEV_GROUP_ID:
+        return True
+    if chat_id == BOT_HQ_GROUP_ID and _is_admin(msg):
+        return True
+    if chat_id == AGENT_CHAT_GROUP_ID and _is_admin(msg):
+        return True
+    return False
 
 
 def _can_qa(msg) -> bool:
@@ -2549,6 +2579,28 @@ _QA_RE = re.compile(
 )
 
 
+# --- GitHub issue/PR comment trigger (v7) ----------------------------------
+#
+# Matches "comment on https://github.com/<owner>/<repo>/issues/<n>" or
+# /pull/<n>. The URL itself is the unambiguous signal — the verb is just
+# noise. We extract owner/repo/number from the URL.
+_GITHUB_ISSUE_URL_RE = re.compile(
+    r"https?://github\.com/(?P<owner>[A-Za-z0-9][\w.-]*)/"
+    r"(?P<repo>[A-Za-z0-9][\w.-]*)/"
+    r"(?P<kind>issues|pull)/"
+    r"(?P<number>\d+)",
+    re.IGNORECASE,
+)
+# Trigger verbs near the URL. Permissive on gerunds/inflections —
+# "comment / post / reply / respond / drop a note". The URL match is the
+# real anchor; the verb just disambiguates from "I read the comment on
+# github.com/.../issues/1, what do you think?"
+_COMMENT_REQUEST_RE = re.compile(
+    r"\b(comment|post|reply|respond|drop)\w*\s+(on|to|at)\b",
+    re.IGNORECASE,
+)
+
+
 def _active_draft_for(conn, chat_id, thread_id, requester_id):
     """Return the active (drafting|shipping) draft row for this user+thread,
     or None. The unique index idx_plan_drafts_active enforces at most one."""
@@ -3007,6 +3059,281 @@ def handle_qa(msg, question: str):
         return None  # let the normal chat handler deal with empty
     _job_uuid, ack = _claim_qa_job(msg, question.strip())
     return ack
+
+
+# --- GitHub issue-comment handler (v7) -------------------------------------
+#
+# Operator orders the Commodore to post a comment on a GitHub issue or PR.
+# The bot composes the comment body via Claude (in-character), POSTs it to
+# the GitHub API as the `leviathan-agent` user (via gh_pat), and replies
+# in chat with the resulting comment URL. The URL is verifiable — no
+# hallucinated "I have done so" without a real receipt.
+#
+# Auth gate: _can_comment (Bot HQ admin / Lev Dev anyone / Agent Chat admin).
+# Persona: a few short paragraphs, formal naval voice. The operator's
+# request is the "brief" that scopes the comment.
+
+_GH_API_BASE = "https://api.github.com"
+
+
+def _gh_pat_value() -> "str | None":
+    """Read the gh_pat file. Returns None if missing or empty.
+
+    Cached on a module global with mtime invalidation? Not yet — the file
+    rarely changes and the read is microseconds. Premature optimization.
+    """
+    gh_pat_path = Path(os.environ.get(
+        "GH_PAT_FILE", "~/.config/commodore/gh_pat")).expanduser()
+    if not gh_pat_path.exists():
+        return None
+    try:
+        tok = gh_pat_path.read_text().strip()
+        return tok or None
+    except OSError:
+        return None
+
+
+def _gh_post_issue_comment(owner: str, repo: str, number: int, body: str) -> dict:
+    """POST a comment to GitHub via the gh_pat. Returns the parsed JSON
+    response (which on success includes 'html_url' and 'id'). On HTTP
+    error returns {'error': '...', 'status': <int>}.
+
+    NB: the URL path /repos/{owner}/{repo}/issues/{n}/comments works for
+    BOTH plain issues and pull requests — GitHub treats PR conversations
+    as issues with extra metadata. /pulls/{n}/comments is for review
+    inline comments on diff hunks; we don't want that here.
+    """
+    import urllib.request
+    import urllib.error
+
+    tok = _gh_pat_value()
+    if not tok:
+        return {"error": "no_gh_pat", "status": 0}
+    url = f"{_GH_API_BASE}/repos/{owner}/{repo}/issues/{number}/comments"
+    data = json.dumps({"body": body[:65_000]}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "leviathan-commodore-bot",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8")
+            try:
+                body_json = json.loads(body)
+                body_msg = body_json.get("message") or body[:200]
+            except json.JSONDecodeError:
+                body_msg = body[:200]
+        except Exception:
+            body_msg = ""
+        return {"error": f"http_{exc.code}", "status": exc.code,
+                "message": body_msg}
+    except Exception as exc:
+        return {"error": type(exc).__name__, "status": 0,
+                "message": str(exc)[:200]}
+
+
+_COMMENT_PROMPT_TEMPLATE = """You are the Fleet Commodore, posting a comment
+on GitHub issue/PR https://github.com/{owner}/{repo}/{kind}/{number}.
+
+Your operator's brief:
+---
+{brief}
+---
+
+The comment will appear under the GitHub identity `leviathan-agent`, which is
+the Fleet's account. Other agents and humans will read it.
+
+VOICE
+- Formal old-world English, the Commodore's voice. 1-3 short paragraphs.
+- Substantive: bring a useful observation, technical opinion, or question.
+  Generic praise is beneath the Admiralty.
+- No greetings ("Hi all"), no closings ("Hope this helps"), no emoji.
+- No "Aye"-laden caricature; this is a written dispatch, not a tavern.
+- Quote concrete code/files only if they appear in the operator's brief —
+  do NOT fabricate file paths or line numbers.
+
+OUTPUT
+Respond with ONLY the comment body text. No preamble, no formatting
+explanations, no STATUS/REASON headers. The bot will POST whatever you
+return verbatim.
+"""
+
+
+def handle_comment_request(msg, text: str):
+    """Compose + post a GitHub issue/PR comment as leviathan-agent.
+
+    Returns the in-chat reply text (the URL of the created comment on
+    success, or an in-character decline on failure). Synchronous — the
+    GitHub POST is a single ~1s call; no need for a worker thread.
+    """
+    if not _can_comment(msg):
+        return (
+            "Comments to GitHub sail only from Bot HQ, Lev Dev, or Agent "
+            "Chat at the order of a ranking officer. Pray return there to "
+            "issue this commission."
+        )
+
+    url_match = _GITHUB_ISSUE_URL_RE.search(text or "")
+    if not url_match:
+        return (
+            "Pray cite the issue or pull-request URL. The Admiralty does "
+            "not comment without a clear target on the chart."
+        )
+    owner = url_match.group("owner")
+    repo = url_match.group("repo")
+    kind = url_match.group("kind")  # 'issues' or 'pull'
+    number = int(url_match.group("number"))
+
+    if not _gh_pat_value():
+        return (
+            "The Admiralty's letters of marque are absent — no credentials "
+            "to sign the dispatch under leviathan-agent's hand."
+        )
+
+    # Operator's brief = the message minus the URL and the verb noise.
+    # We pass the full text to Claude and let it use what's useful; no
+    # need to be clever about extraction.
+    brief = (text or "").strip()
+    prompt = _COMMENT_PROMPT_TEMPLATE.format(
+        owner=owner, repo=repo, kind=kind, number=number, brief=brief[:1500],
+    )
+    body = _claude_ask(prompt, timeout=60, retries=1).strip()
+    if not body:
+        return (
+            "The Admiralty's quill ran dry — the wordsmith returned nothing. "
+            "Pray retry the order."
+        )
+
+    # Strip Claude meta-prefixes if any leaked through (defensive).
+    for prefix in ("comment body:", "comment:", "body:"):
+        if body.lower().startswith(prefix):
+            body = body[len(prefix):].strip()
+
+    if check_output_for_injection(body, context=f"gh-comment {owner}/{repo}#{number}"):
+        return (
+            "The drafted comment failed the Admiralty's prose review. "
+            "Pray retry the order."
+        )
+    if check_leak_patterns(body):
+        return (
+            "The drafted comment carried sensitive markers; suppressed. "
+            "Pray retry the order."
+        )
+
+    # Audit row BEFORE the POST — if we crash mid-call, we have a record
+    # of the attempt. Update with the resulting URL on success.
+    conn = sqlite3.connect(str(DB_FILE), timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS github_action (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                target_owner TEXT NOT NULL,
+                target_repo TEXT NOT NULL,
+                target_number INTEGER NOT NULL,
+                requester_id INTEGER NOT NULL,
+                requester_username TEXT,
+                chat_id INTEGER NOT NULL,
+                topic_id INTEGER,
+                request_msg_id INTEGER,
+                body_preview TEXT,
+                result_url TEXT,
+                result_status INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            )"""
+        )
+        sender = msg.get("from", {}) or {}
+        cur = conn.execute(
+            """INSERT INTO github_action
+               (kind, target_owner, target_repo, target_number,
+                requester_id, requester_username, chat_id, topic_id,
+                request_msg_id, body_preview, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "issue_comment", owner, repo, number,
+                int(sender.get("id", 0)),
+                sender.get("username") or sender.get("first_name") or "unknown",
+                int(msg.get("chat", {}).get("id", 0)),
+                msg.get("message_thread_id"),
+                msg.get("message_id"),
+                body[:500],
+                _now_iso(),
+            ),
+        )
+        conn.commit()
+        action_id = cur.lastrowid
+    finally:
+        conn.close()
+
+    result = _gh_post_issue_comment(owner, repo, number, body)
+    comment_url = result.get("html_url")
+
+    conn = sqlite3.connect(str(DB_FILE), timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        if comment_url:
+            conn.execute(
+                """UPDATE github_action
+                   SET result_url=?, result_status=?, finished_at=?
+                   WHERE id=?""",
+                (comment_url, 201, _now_iso(), action_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE github_action
+                   SET error=?, result_status=?, finished_at=?
+                   WHERE id=?""",
+                (
+                    f"{result.get('error', 'unknown')}: "
+                    f"{result.get('message', '')[:200]}",
+                    result.get("status", 0),
+                    _now_iso(),
+                    action_id,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if comment_url:
+        log.info("gh comment posted: %s by requester=%s",
+                 comment_url, sender.get("username"))
+        return (
+            f"Dispatch lodged. The Admiralty's mark is now in the record:\n"
+            f"{comment_url}"
+        )
+    err = result.get("error", "unknown")
+    status = result.get("status", 0)
+    log.warning("gh comment failed: %s/%s#%s err=%s status=%s",
+                owner, repo, number, err, status)
+    if status == 404:
+        return (
+            f"The target {owner}/{repo}#{number} cannot be found, or "
+            f"leviathan-agent lacks access. The dispatch was not lodged."
+        )
+    if status in (401, 403):
+        return (
+            "The Admiralty's letters of marque are not honoured by that "
+            "harbour. The dispatch was not lodged."
+        )
+    return (
+        f"The dispatch was refused by GitHub (status {status}). "
+        f"The Admiralty stands ready to retry."
+    )
 
 
 # --- Worker coordinator threads (v6) ----------------------------------------
@@ -3905,6 +4232,17 @@ def poll():
                                 response = preflight_decline
                             else:
                                 response = _claim_review(msg, pr_number, repo)
+
+                # GitHub issue/PR comment — checked BEFORE _detect_pr_request
+                # so "comment on .../pull/N" doesn't get mis-routed to the
+                # PR-filing pipeline. The URL match is the anchor; the verb
+                # disambiguates from passive references.
+                if (
+                    response is None and is_direct
+                    and _GITHUB_ISSUE_URL_RE.search(text or "")
+                    and _COMMENT_REQUEST_RE.search(text or "")
+                ):
+                    response = handle_comment_request(msg, text)
 
                 # "file a PR / open a PR / draft a PR" routes into the v6
                 # plan-refinement flow. The old v1 stub (handle_pr_request)
