@@ -2601,16 +2601,34 @@ _COMMENT_REQUEST_RE = re.compile(
 )
 
 
-def _active_draft_for(conn, chat_id, thread_id, requester_id):
+def _active_draft_for(conn, chat_id, thread_id, requester_id,
+                      max_age_minutes: "int | None" = None):
     """Return the active (drafting|shipping) draft row for this user+thread,
-    or None. The unique index idx_plan_drafts_active enforces at most one."""
-    return conn.execute(
+    or None. The unique index idx_plan_drafts_active enforces at most one.
+
+    When `max_age_minutes` is set, ignore drafts whose `updated_at` is older
+    than that — used by the is_direct fast-path to treat conversation as
+    closed after the operator stops engaging. handle_plan_message itself
+    leaves it unbounded so it can find and continue an existing draft of
+    any age when the operator explicitly addresses the bot again.
+    """
+    sql = (
         "SELECT * FROM plan_drafts "
         "WHERE chat_id=? AND COALESCE(thread_id,0)=? AND requester_id=? "
-        "  AND status IN ('drafting','shipping') "
-        "ORDER BY id DESC LIMIT 1",
-        (chat_id, thread_id or 0, requester_id),
-    ).fetchone()
+        "  AND status IN ('drafting','shipping')"
+    )
+    params = [chat_id, thread_id or 0, requester_id]
+    if max_age_minutes is not None:
+        # SQLite ISO-8601 strings sort lexicographically by recency. Use a
+        # datetime comparison so timezone-naive vs aware doesn't matter.
+        from datetime import datetime, timedelta, timezone
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+        ).isoformat()
+        sql += " AND updated_at >= ?"
+        params.append(cutoff)
+    sql += " ORDER BY id DESC LIMIT 1"
+    return conn.execute(sql, params).fetchone()
 
 
 def _claim_build_job(draft_row) -> "tuple[str, str]":
@@ -4162,12 +4180,19 @@ def poll():
                 # past should_respond() and the operator wonders why we
                 # ignored them. Scoped to the same (chat_id, thread_id,
                 # requester_id) tuple that owns the draft.
+                #
+                # 2026-05-15: bounded to 15 min of inactivity. Stale drafts
+                # (operator wandered off mid-plan) were causing the bot to
+                # treat every subsequent Lev Dev message from that user as
+                # "direct," bypassing mention_only. Two May 12 / April 26
+                # rows had been silently bypassing the policy for days.
                 has_active_plan = False
                 try:
                     _conn = sqlite3.connect(str(DB_FILE), timeout=5)
                     _conn.row_factory = sqlite3.Row
                     has_active_plan = _active_draft_for(
                         _conn, chat_id, topic_id, sender.get("id", 0),
+                        max_age_minutes=15,
                     ) is not None
                     _conn.close()
                 except sqlite3.Error:
