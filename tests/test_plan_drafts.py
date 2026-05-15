@@ -218,3 +218,89 @@ def test_drafts_are_per_thread(isolated_db):
     assert len(rows) == 2
     threads = {r["thread_id"] for r in rows}
     assert threads == {100, 200}
+
+
+# --- _active_draft_for: max_age_minutes (2026-05-15) -------------------------
+#
+# Used by the is_direct fast-path so stale drafts don't keep treating every
+# user message as "implicitly directed at the bot." Without the bound, a
+# 3-day-old "drafting" row was bypassing mention_only in Lev Dev.
+
+
+def test_active_draft_for_unbounded_finds_old_row(isolated_db):
+    """No max_age — the helper finds drafts of any age (handle_plan_message
+    uses this to continue an existing plan when the operator re-engages)."""
+    from datetime import datetime, timedelta, timezone
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    conn = sqlite3.connect(str(isolated_db))
+    try:
+        conn.execute(
+            """INSERT INTO plan_drafts
+               (draft_uuid, chat_id, thread_id, requester_id, requester_username,
+                title, target_repo, plan_body_md, message_history_json, status,
+                created_at, updated_at)
+               VALUES ('uuid-old', ?, NULL, ?, 'curvecap',
+                       'old', NULL, 'body', '[]', 'drafting', ?, ?)""",
+            (BOT_HQ, ADMIN_ID, long_ago, long_ago),
+        )
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        row = commodore._active_draft_for(conn, BOT_HQ, None, ADMIN_ID)
+        assert row is not None
+        assert row["draft_uuid"] == "uuid-old"
+    finally:
+        conn.close()
+
+
+def test_active_draft_for_bounded_ignores_stale_row(isolated_db):
+    """With max_age_minutes=15, a 3-day-old draft is invisible to the
+    is_direct check — the bot won't treat the user as mid-conversation."""
+    from datetime import datetime, timedelta, timezone
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    conn = sqlite3.connect(str(isolated_db))
+    try:
+        conn.execute(
+            """INSERT INTO plan_drafts
+               (draft_uuid, chat_id, thread_id, requester_id, requester_username,
+                title, target_repo, plan_body_md, message_history_json, status,
+                created_at, updated_at)
+               VALUES ('uuid-stale', ?, NULL, ?, 'curvecap',
+                       'old', NULL, 'body', '[]', 'drafting', ?, ?)""",
+            (BOT_HQ, ADMIN_ID, long_ago, long_ago),
+        )
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        row = commodore._active_draft_for(
+            conn, BOT_HQ, None, ADMIN_ID, max_age_minutes=15,
+        )
+        assert row is None
+
+
+    finally:
+        conn.close()
+
+
+def test_active_draft_for_bounded_finds_fresh_row(isolated_db):
+    """Within the window, the helper still returns the row."""
+    from datetime import datetime, timedelta, timezone
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    conn = sqlite3.connect(str(isolated_db))
+    try:
+        conn.execute(
+            """INSERT INTO plan_drafts
+               (draft_uuid, chat_id, thread_id, requester_id, requester_username,
+                title, target_repo, plan_body_md, message_history_json, status,
+                created_at, updated_at)
+               VALUES ('uuid-fresh', ?, NULL, ?, 'curvecap',
+                       'recent', NULL, 'body', '[]', 'drafting', ?, ?)""",
+            (BOT_HQ, ADMIN_ID, recent, recent),
+        )
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        row = commodore._active_draft_for(
+            conn, BOT_HQ, None, ADMIN_ID, max_age_minutes=15,
+        )
+        assert row is not None
+        assert row["draft_uuid"] == "uuid-fresh"
+    finally:
+        conn.close()
