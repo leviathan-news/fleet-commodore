@@ -98,3 +98,32 @@ def test_handle_plan_in_lev_dev_admin_works():
     ctx = commodore.get_plan_context(m)
     assert ctx is not None
     assert "PLAN-REFINEMENT" in ctx
+
+
+# --- DM auto-direct (2026-06-13) ------------------------------------------
+#
+# DMs from admins are always direct — there's nobody else in the room
+# to address. Non-admin DMs do NOT auto-direct so random strangers
+# discovering the bot can't spend LLM credits by saying "hi".
+
+
+def test_admin_dm_is_admin_true():
+    """The predicate the poll-loop uses: chat.type=='private' + _is_admin."""
+    m = msg(ADMIN_ID, ADMIN_ID, chat_type="private")
+    assert commodore._is_admin(m), \
+        "admin DM should pass _is_admin (used by is_admin_dm logic)"
+    assert m["chat"]["type"] == "private"
+
+
+def test_non_admin_dm_is_admin_false():
+    m = msg(NON_ADMIN_ID, NON_ADMIN_ID, chat_type="private")
+    assert not commodore._is_admin(m), \
+        "non-admin DM should fail _is_admin (auto-direct gate)"
+    assert m["chat"]["type"] == "private"
+
+
+def test_group_admin_message_is_not_dm():
+    """Admin in a group chat is NOT a DM even though _is_admin is True."""
+    m = msg(BOT_HQ, ADMIN_ID, chat_type="supergroup")
+    assert commodore._is_admin(m)
+    assert m["chat"]["type"] != "private"  # is_admin_dm would short-circuit False

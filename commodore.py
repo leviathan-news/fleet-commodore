@@ -4302,7 +4302,18 @@ def poll():
                     _conn.close()
                 except sqlite3.Error:
                     pass
-                is_direct = reply_to_us or is_mention or has_active_plan
+                # DMs from admins are always direct — there's nobody else
+                # in the room to address. Without this, a DM like "Status"
+                # with no @mention falls through mention_only and the bot
+                # silently ignores its own operator (2026-06-13 incident).
+                # Non-admin DMs are NOT auto-direct — random strangers
+                # discovering @leviathan_commodore_bot don't get to spend
+                # the Admiralty's LLM credits by saying "hi".
+                is_admin_dm = (
+                    msg.get("chat", {}).get("type") == "private"
+                    and _is_admin(msg)
+                )
+                is_direct = is_admin_dm or reply_to_us or is_mention or has_active_plan
 
                 # Benthic backup enqueue: someone hailed @Benthic_Bot and the
                 # Commodore is covering. Record the mention; the sweeper will
