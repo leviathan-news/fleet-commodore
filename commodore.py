@@ -154,14 +154,23 @@ CLAUDE_BIN = os.environ.get(
 
 CLAUDE_LIMIT_COOLDOWN = int(os.environ.get("CLAUDE_LIMIT_COOLDOWN", str(6 * 60 * 60)))
 
-# In-character "radio jammed" line returned by llm_ask when Claude is
-# unreachable. Better than silent-skip — silence makes the bot look broken
-# and embarrasses the operator in front of the crew. Heartbeat cron posts
-# the actual outage alert to Bot HQ; this line keeps the bot speaking.
+# Outage reply for messages that DIRECTLY hailed the bot. Silence on a
+# direct ping reads as broken; this line acknowledges the gap honestly
+# without performing weather-flavor. For non-direct (ambient / Nemesis-
+# override) the bot stays silent instead — the audience didn't ask for
+# anything, and a stand-in line in public reads as theatrics.
+#
+# In both cases _alert_operator_claude_down() DMs the operator (deduped)
+# so the outage doesn't go silent for days like June 2026's 17-day run.
 CLAUDE_OUTAGE_REPLY = (
-    "Aye — me wireless be fouled by squall and seafoam at the moment. "
-    "Hail again in a few minutes and I'll have the radio dry."
+    "Forgive me — the Admiralty's wordsmith is silent at present, "
+    "and I'd not dispatch a half-formed reply. The Operator has been "
+    "notified; pray hail again shortly."
 )
+
+# Operator's user_id for direct outage DMs. Falls back to first
+# ADMIN_TELEGRAM_IDS entry if env not set.
+OPERATOR_DM_USER_ID = int(os.environ.get("OPERATOR_DM_USER_ID", "0") or 0)
 
 ALLOWED_TOOLS = "WebSearch,WebFetch,Read,Grep,Glob"
 POLL_TIMEOUT = 30
@@ -1070,7 +1079,10 @@ def _benthic_substitute_reply(original_msg):
         "Compose the stand-in reply now. Output only the reply text."
     )
 
-    response = llm_ask(prompt, timeout=120)
+    # is_direct=False: this is a stand-in for Benthic, not the Commodore
+    # himself being addressed. Falling silent on LLM-down is more honest
+    # than emitting a Commodore-voice outage line under Benthic's hat.
+    response = llm_ask(prompt, timeout=120, is_direct=False)
     if not response or len(response) < 10:
         return None
     if check_output_for_injection(response, context=f"benthic_sub(@{sender_name})"):
@@ -1766,19 +1778,107 @@ def _claude_ask(prompt, timeout=120, retries=2):
     return ""
 
 
-def llm_ask(prompt, timeout=120):
+def _operator_dm_user_id() -> int:
+    """Operator's user_id for outage DMs. Env override OPERATOR_DM_USER_ID
+    wins; otherwise first ADMIN_TELEGRAM_IDS entry."""
+    if OPERATOR_DM_USER_ID:
+        return OPERATOR_DM_USER_ID
+    if ADMIN_TELEGRAM_IDS:
+        return int(next(iter(ADMIN_TELEGRAM_IDS)))
+    return 0
+
+
+def _alert_operator_claude_down(reason: str = "") -> None:
+    """DM the operator that the LLM is unreachable. Deduped via a
+    commodore_alert SQLite row keyed on alert_kind so we don't spam the
+    DM every minute the breaker stays tripped.
+
+    Per memory feedback-cache-dedupe-not-suitable-for-rare-alerts: dedupe
+    via the DB (Mini has no shared Redis; LocMemCache dies per process).
+    """
+    op = _operator_dm_user_id()
+    if not op:
+        return  # no operator configured; nothing to do
+    cooldown_hours = 6
+    try:
+        conn = sqlite3.connect(str(DB_FILE), timeout=5)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS commodore_alert (
+                    alert_kind TEXT PRIMARY KEY,
+                    last_sent_at TEXT NOT NULL,
+                    last_reason TEXT
+                )"""
+            )
+            row = conn.execute(
+                "SELECT last_sent_at FROM commodore_alert WHERE alert_kind=?",
+                ("claude_down",),
+            ).fetchone()
+            if row:
+                from datetime import datetime, timezone, timedelta
+                try:
+                    last = datetime.fromisoformat(row[0])
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) - last < timedelta(hours=cooldown_hours):
+                        return  # within cooldown, suppress
+                except (TypeError, ValueError):
+                    pass  # malformed timestamp — proceed with the alert
+            # Send the DM, THEN record. If send fails, we'd rather re-try
+            # next call than record a phantom delivery.
+            text = (
+                "Commodore here, breaking persona for an ops note:\n\n"
+                "Claude CLI is returning 401 / unreachable. My LLM calls are "
+                "failing. Public replies will be suppressed (ambient) or "
+                "honest-fallback (direct). Need a re-auth on the Mini host:\n\n"
+                "  /opt/homebrew/bin/claude /login\n\n"
+                "Then restart me (tmux leviathan:commodore, Ctrl-C + ./run.sh).\n\n"
+                f"Reason captured: {reason[:200] if reason else '(none)'}"
+            )
+            resp = send_message(op, text)
+            if not (resp and resp.get("ok")):
+                log.warning("alert DM to operator failed: %s", str(resp)[:200])
+                return
+            conn.execute(
+                """INSERT INTO commodore_alert (alert_kind, last_sent_at, last_reason)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(alert_kind) DO UPDATE SET
+                     last_sent_at=excluded.last_sent_at,
+                     last_reason=excluded.last_reason""",
+                ("claude_down", _now_iso(), reason[:500] if reason else None),
+            )
+            conn.commit()
+            log.warning("alerted operator (DM): claude_down — reason=%s",
+                        (reason or "")[:120])
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("operator alert failed: %s", exc)
+
+
+def llm_ask(prompt, timeout=120, is_direct: bool = False):
+    """Ask the LLM. Returns the response text, or:
+      - the CLAUDE_OUTAGE_REPLY string if `is_direct=True` and Claude is down
+        (the asker is owed SOME reply, silence reads as broken)
+      - None if `is_direct=False` and Claude is down (ambient / Nemesis-
+        override / etc. — the audience didn't ask, silence is honest)
+    Either way, the operator gets a DM via _alert_operator_claude_down,
+    deduped on a 6h DB cooldown.
+    """
     primary = ""
     if _claude_is_available():
         primary = _claude_ask(prompt, timeout=timeout)
     if primary:
         return primary
-    # Codex fallback removed 2026-05-09: it was always 401 (no auth.json on
-    # Mini) AND used an invalid model name ("gpt-5.4"), so the "fallback"
-    # silently returned empty and the bot went mute. When Claude is down,
-    # speak in character — "radio jammed" is recoverable; silence is
-    # embarrassing. Operator gets paged via the OAuth heartbeat cron.
-    log.warning("Claude unavailable; returning in-character outage line")
-    return CLAUDE_OUTAGE_REPLY
+    # LLM unavailable. Notify the operator (deduped) and decide what to
+    # return based on whether the asker is owed a reply.
+    log.warning("Claude unavailable; is_direct=%s — outage path", is_direct)
+    _alert_operator_claude_down(reason="llm_ask: Claude returned empty/auth-failed")
+    if is_direct:
+        return CLAUDE_OUTAGE_REPLY
+    # Ambient / Nemesis-override / other non-direct paths: silence.
+    return None
 
 
 # --- Persona ----------------------------------------------------------------
@@ -1960,7 +2060,12 @@ def generate_response(msg, is_direct, policy, recent_messages):
         "Respond with ONLY the reply text (or SKIP). No preamble."
     )
 
-    response = llm_ask(prompt, timeout=120)
+    # is_direct=True paths get the honest-fallback line when Claude is
+    # down (operator pinged the bot directly — silence reads as broken).
+    # is_direct=False paths (ambient, Nemesis-override) get None and the
+    # bot stays silent — the audience didn't ask, and a performed
+    # outage-line in public reads as theatrics rather than failure.
+    response = llm_ask(prompt, timeout=120, is_direct=is_direct)
     if not response or len(response) < 3:
         return None
     if check_output_for_injection(response, context=f"chat(@{safe_username})"):
