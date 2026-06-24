@@ -156,7 +156,7 @@ def run_claude_review(prompt: str) -> str:
     (the verdict + findings), or empty string on failure."""
     try:
         proc = subprocess.run(
-            [CLAUDE_BIN, "--print", "--output-format", "text"],
+            [CLAUDE_BIN, "--print", "--model", "claude-sonnet-4-6", "--output-format", "text"],
             input=prompt,
             capture_output=True, text=True,
             timeout=CLAUDE_TIMEOUT_S,

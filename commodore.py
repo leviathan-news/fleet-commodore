@@ -28,6 +28,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import atexit
+import fcntl
 import unicodedata
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -1736,7 +1738,7 @@ def _probe_claude() -> bool:
     burn quota when Claude is genuinely down."""
     try:
         result = subprocess.run(
-            [CLAUDE_BIN, "-p", "-"],
+            [CLAUDE_BIN, "-p", "-", "--model", "claude-sonnet-4-6"],
             input="ok",
             capture_output=True,
             text=True,
@@ -1810,7 +1812,7 @@ def _claude_ask(prompt, timeout=120, retries=2):
             # has its own subprocess in qa_worker.py with its own effort
             # setting for substantive research questions.
             result = subprocess.run(
-                [CLAUDE_BIN, "-p", "-", "--allowedTools", ALLOWED_TOOLS],
+                [CLAUDE_BIN, "-p", "-", "--model", "claude-sonnet-4-6", "--allowedTools", ALLOWED_TOOLS],
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -4292,10 +4294,51 @@ def _start_workers():
 # --- Main poll loop ---------------------------------------------------------
 
 
+# --- Single-instance lock ---------------------------------------------------
+# Two pollers on the same bot token both answer every message (the duplicate
+# "Commodore replies twice" bug, 2026-06-24: an orphaned instance ran alongside
+# the watchdog-managed one). Telegram only surfaces this as intermittent 409s.
+# An exclusive flock on a pidfile makes a second instance refuse to start, so
+# orphans / manual launches / watchdog races can never produce a double poller.
+_INSTANCE_LOCK_PATH = "/tmp/fleet-commodore.lock"
+_instance_lock_fh = None
+
+
+def _acquire_single_instance_lock():
+    """Exit the process if another commodore.py already holds the lock."""
+    global _instance_lock_fh
+    fh = open(_INSTANCE_LOCK_PATH, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        # Another instance holds it — do NOT start a second poller.
+        sys.exit(
+            "ERROR: another Fleet Commodore instance is already running "
+            "(lock held on %s) — refusing to start a duplicate poller."
+            % _INSTANCE_LOCK_PATH
+        )
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _instance_lock_fh = fh  # keep the handle (and thus the lock) for process life
+    atexit.register(_release_single_instance_lock)
+
+
+def _release_single_instance_lock():
+    global _instance_lock_fh
+    if _instance_lock_fh is not None:
+        try:
+            fcntl.flock(_instance_lock_fh.fileno(), fcntl.LOCK_UN)
+            _instance_lock_fh.close()
+        except Exception:
+            pass
+        _instance_lock_fh = None
+
+
 def poll():
     offset = 0
     recent_by_chat = {}
 
+    _acquire_single_instance_lock()
     log.info("Fleet Commodore listener starting")
     global BOT_USER_ID
     try:
