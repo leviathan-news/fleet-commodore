@@ -18,6 +18,7 @@ Ops surface: `docker logs -f leviathan-commodore`.
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -1290,13 +1291,86 @@ def tg_request(method, data=None):
         return json.loads(resp.read())
 
 
+_MD_CODE_FENCE_RE = re.compile(r"```(?:[^\n`]*)\n?(.*?)```", re.DOTALL)
+_MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)")
+# NOTE: italic conversion (single * or _) is deliberately OMITTED. In this
+# dev-ops chat, bare "*" (multiplication, bullets) and single-underscore
+# snake_case identifiers (foo_bar) are common and would be mangled into
+# <i>...</i> false-positives. Bold/code/pre/links are the low-false-positive,
+# high-value formats; italic is dropped rather than risk garbling technical text.
+
+
+def _md_to_telegram_html(text):
+    """Convert the common Markdown the LLM emits into Telegram-safe HTML.
+
+    Telegram's HTML parse_mode only understands a small tag set (<b>, <i>,
+    <code>, <pre>, <a href="">, <s>, <u>). We escape the raw text first, then
+    re-insert real tags via regex substitution. Code/pre spans are pulled out
+    into placeholders before the bold/italic/link passes run, so markup
+    characters inside code are never misinterpreted as formatting.
+    """
+    if not text:
+        return text
+
+    # Escape HTML metacharacters BEFORE inserting any tags of our own.
+    escaped = html.escape(text, quote=False)
+
+    # Pull fenced code blocks and inline code out into placeholders so later
+    # bold/italic/link regexes never touch their contents.
+    protected = []
+
+    def _stash_pre(m):
+        protected.append(f"<pre>{m.group(1)}</pre>")
+        return f"\x00{len(protected) - 1}\x00"
+
+    def _stash_code(m):
+        protected.append(f"<code>{m.group(1)}</code>")
+        return f"\x00{len(protected) - 1}\x00"
+
+    working = _MD_CODE_FENCE_RE.sub(_stash_pre, escaped)
+    working = _MD_INLINE_CODE_RE.sub(_stash_code, working)
+
+    # Links then bold. Italic intentionally skipped (see regex note above).
+    working = _MD_LINK_RE.sub(r'<a href="\2">\1</a>', working)
+    working = _MD_BOLD_RE.sub(r"<b>\1</b>", working)
+
+    # Restore protected code/pre spans.
+    for idx, block in enumerate(protected):
+        working = working.replace(f"\x00{idx}\x00", block)
+
+    return working
+
+
 def send_message(chat_id, text, thread_id=None, reply_to=None):
-    data = {"chat_id": chat_id, "text": text[:4096]}
+    raw_text = text[:3800]
+    data = {
+        "chat_id": chat_id,
+        "text": _md_to_telegram_html(raw_text),
+        "parse_mode": "HTML",
+    }
     if thread_id:
         data["message_thread_id"] = thread_id
     if reply_to:
         data["reply_to_message_id"] = reply_to
-    return tg_request("sendMessage", data)
+
+    try:
+        resp = tg_request("sendMessage", data)
+        if isinstance(resp, dict) and resp.get("ok") is False:
+            raise ValueError(f"sendMessage returned ok=False: {resp}")
+        return resp
+    except Exception as exc:
+        log.warning(
+            "send_message: HTML parse_mode failed (%s), retrying as plain text",
+            exc,
+        )
+        plain_data = {"chat_id": chat_id, "text": raw_text}
+        if thread_id:
+            plain_data["message_thread_id"] = thread_id
+        if reply_to:
+            plain_data["reply_to_message_id"] = reply_to
+        return tg_request("sendMessage", plain_data)
 
 
 # --- Agent Chat Mode B relay receipt ----------------------------------------
