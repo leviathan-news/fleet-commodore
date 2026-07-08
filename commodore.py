@@ -106,6 +106,7 @@ BOT_HQ_GROUP_ID = int(os.environ.get("BOT_HQ_GROUP_ID", "0"))
 SQUID_CAVE_GROUP_ID = int(os.environ.get("SQUID_CAVE_GROUP_ID", "0"))
 AGENT_CHAT_GROUP_ID = int(os.environ.get("AGENT_CHAT_GROUP_ID", "0"))
 LEV_DEV_GROUP_ID = int(os.environ.get("LEV_DEV_GROUP_ID", "0"))
+ATLAS_GROUP_ID = int(os.environ.get("ATLAS_GROUP_ID", "0"))
 
 # Telegram user_ids authorized to request draft PR filing from Bot HQ.
 ADMIN_TELEGRAM_IDS = _parse_int_set("ADMIN_TELEGRAM_IDS")
@@ -2191,7 +2192,7 @@ def _is_admin(msg):
 # - _can_qa: Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ admin in DM. Read-only; can be
 #   wider safely.
 
-_PRIVILEGED_CHAT_IDS = (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID, AGENT_CHAT_GROUP_ID)
+_PRIVILEGED_CHAT_IDS = (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID, AGENT_CHAT_GROUP_ID, ATLAS_GROUP_ID)
 _SHIP_CHAT_IDS = (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID)
 
 

@@ -4,7 +4,7 @@ Locks the v6.1 surface in:
 - ship/plan: ANY crewmate in Lev Dev OR admin in Bot HQ. Lev Dev is the dev
   workshop and is open to non-admins; Bot HQ is the editorial admin room and
   retains the admin gate.
-- qa: Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ admin DM.
+- qa: Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ Atlas ∪ admin DM.
 - Squid Cave is read-only-no-Q&A. Non-admin DM is nothing.
 """
 import pytest
@@ -14,6 +14,7 @@ import commodore
 BOT_HQ = int(commodore.BOT_HQ_GROUP_ID)
 LEV_DEV = int(commodore.LEV_DEV_GROUP_ID)
 AGENT_CHAT = int(commodore.AGENT_CHAT_GROUP_ID)
+ATLAS = int(commodore.ATLAS_GROUP_ID)
 SQUID_CAVE = int(commodore.SQUID_CAVE_GROUP_ID)
 ADMIN_ID = next(iter(commodore.ADMIN_TELEGRAM_IDS))
 NON_ADMIN_ID = 999_999_999
@@ -39,6 +40,10 @@ def msg(chat_id, sender_id, chat_type="supergroup"):
     # any crewmate aboard may order a dispatch (v6.1 widening, May 2026)
     ("Lev Dev non-admin",  msg(LEV_DEV, NON_ADMIN_ID),                     True,  True,  True),
     ("Agent Chat random",  msg(AGENT_CHAT, NON_ADMIN_ID),                  False, False, True),
+    # Atlas: Q&A only (partner-facing room, opened for Q&A July 2026);
+    # ship/plan deliberately gated like Agent Chat
+    ("Atlas admin",        msg(ATLAS, ADMIN_ID),                           False, False, True),
+    ("Atlas random",       msg(ATLAS, NON_ADMIN_ID),                       False, False, True),
     # Squid Cave: nothing (not in privileged set)
     ("Squid Cave admin",   msg(SQUID_CAVE, ADMIN_ID),                      False, False, False),
     ("Squid Cave random",  msg(SQUID_CAVE, NON_ADMIN_ID),                  False, False, False),
