@@ -28,6 +28,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import atexit
+import fcntl
 import unicodedata
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -1737,7 +1739,7 @@ def _probe_claude() -> bool:
     burn quota when Claude is genuinely down."""
     try:
         result = subprocess.run(
-            [CLAUDE_BIN, "-p", "-"],
+            [CLAUDE_BIN, "-p", "-", "--model", "claude-sonnet-4-6"],
             input="ok",
             capture_output=True,
             text=True,
@@ -1811,7 +1813,7 @@ def _claude_ask(prompt, timeout=120, retries=2):
             # has its own subprocess in qa_worker.py with its own effort
             # setting for substantive research questions.
             result = subprocess.run(
-                [CLAUDE_BIN, "-p", "-", "--allowedTools", ALLOWED_TOOLS],
+                [CLAUDE_BIN, "-p", "-", "--model", "claude-sonnet-4-6", "--allowedTools", ALLOWED_TOOLS],
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -3391,6 +3393,209 @@ return verbatim.
 """
 
 
+# Operator orders the Commodore to OPEN a GitHub issue (vs. comment on an
+# existing one). Same gate as comments (_can_comment: Lev Dev anyone, Bot HQ /
+# Agent Chat admin) — issues are public-write + low-stakes like comments — plus
+# an EXPLICIT repo-allowlist check because creating an issue mints a new object.
+# Trigger: "open/file/create/raise an issue on <repo> ...". The repo is named
+# in the text (bare name or owner/repo); no URL exists yet (the issue doesn't
+# exist), so we resolve the repo via the same _expand_repo helper as /review.
+_ISSUE_REQUEST_RE = re.compile(
+    r"\b(open|file|create|raise|log)\w*\s+(?:(?:a|an|new|the)\s+){0,3}(?:github\s+)?issue\b",
+    re.IGNORECASE,
+)
+# Repo token: "on squid-bot" / "in leviathan-news/auction-ui" / "against fleet-commodore".
+_ISSUE_REPO_RE = re.compile(
+    r"\b(on|in|against|for|to)\s+(?P<repo>[A-Za-z0-9][\w.-]*(?:/[A-Za-z0-9][\w.-]*)?)",
+    re.IGNORECASE,
+)
+
+
+def _gh_create_issue(owner: str, repo: str, title: str, body: str) -> dict:
+    """POST a new issue via the gh_pat. Returns parsed JSON (incl. 'html_url'
+    + 'number' on success) or {'error','status',...} on failure."""
+    import urllib.request
+    import urllib.error
+
+    tok = _gh_pat_value()
+    if not tok:
+        return {"error": "no_gh_pat", "status": 0}
+    url = f"{_GH_API_BASE}/repos/{owner}/{repo}/issues"
+    data = json.dumps({"title": title[:250], "body": body[:65_000]}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Authorization": f"Bearer {tok}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "leviathan-commodore-bot",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            ebody = exc.read().decode("utf-8")
+            try:
+                emsg = json.loads(ebody).get("message") or ebody[:200]
+            except json.JSONDecodeError:
+                emsg = ebody[:200]
+        except Exception:
+            emsg = ""
+        return {"error": f"http_{exc.code}", "status": exc.code, "message": emsg}
+    except Exception as exc:
+        return {"error": type(exc).__name__, "status": 0, "message": str(exc)[:200]}
+
+
+_ISSUE_PROMPT_TEMPLATE = """You are the Fleet Commodore, opening a GitHub issue
+on the repository {owner}/{repo}.
+
+Your operator's brief:
+---
+{brief}
+---
+
+Write the issue as JSON with exactly two keys: "title" (a concise one-line
+summary, <=80 chars, no markdown) and "body" (a clear markdown description:
+what's wrong / what's wanted, any context, and a short next-step if obvious).
+Be factual and specific. Do NOT invent details not in the brief. Output ONLY
+the JSON object, nothing else."""
+
+
+def handle_issue_request(msg, text: str):
+    """Compose + open a GitHub issue as leviathan-agent. Returns the in-chat
+    reply (issue URL on success, in-character decline otherwise). Synchronous."""
+    if not _can_comment(msg):
+        return (
+            "Issues to GitHub are raised only from Bot HQ, Lev Dev, or Agent "
+            "Chat at a ranking officer's order. Pray return there."
+        )
+
+    repo_m = _ISSUE_REPO_RE.search(text or "")
+    if not repo_m:
+        return (
+            "Pray name the repository for this issue, e.g. 'open an issue on "
+            "squid-bot — ...'. The Admiralty raises no flag without a target."
+        )
+    # _normalize_repo expands a bare name AND enforces the allowlist (returns
+    # None if the repo isn't one of the fleet's chartered repositories).
+    full_repo = _normalize_repo(repo_m.group("repo"))
+    if not full_repo:
+        return (
+            f"'{repo_m.group('repo')}' lies outside the Admiralty's chartered "
+            f"waters. Issues may be raised only on the fleet's own repositories."
+        )
+    owner, repo = full_repo.split("/", 1)
+
+    if not _gh_pat_value():
+        return (
+            "The Admiralty's letters of marque are absent — no credentials "
+            "to sign the dispatch under leviathan-agent's hand."
+        )
+
+    brief = (text or "").strip()
+    prompt = _ISSUE_PROMPT_TEMPLATE.format(owner=owner, repo=repo, brief=brief[:1500])
+    raw = _claude_ask(prompt, timeout=60, retries=1).strip()
+    if not raw:
+        return (
+            "The Admiralty's quill ran dry — the wordsmith returned nothing. "
+            "Pray retry the order."
+        )
+    # Parse the JSON the model returned (tolerate code-fence wrapping).
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+        title = str(parsed.get("title", "")).strip()
+        body = str(parsed.get("body", "")).strip()
+    except (json.JSONDecodeError, AttributeError):
+        title, body = "", ""
+    if not title or not body:
+        return (
+            "The drafted issue came back malformed. Pray retry the order."
+        )
+
+    combined = f"{title}\n\n{body}"
+    if check_output_for_injection(combined, context=f"gh-issue {owner}/{repo}"):
+        return ("The drafted issue failed the Admiralty's prose review. Pray retry.")
+    if check_leak_patterns(combined):
+        return ("The drafted issue carried sensitive markers; suppressed. Pray retry.")
+
+    # Audit row BEFORE the POST (target_number 0 = not-yet-created).
+    conn = sqlite3.connect(str(DB_FILE), timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        sender = msg.get("from", {}) or {}
+        cur = conn.execute(
+            """INSERT INTO github_action
+               (kind, target_owner, target_repo, target_number,
+                requester_id, requester_username, chat_id, topic_id,
+                request_msg_id, body_preview, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "issue_create", owner, repo, 0,
+                int(sender.get("id", 0)),
+                sender.get("username") or sender.get("first_name") or "unknown",
+                int(msg.get("chat", {}).get("id", 0)),
+                msg.get("message_thread_id"),
+                msg.get("message_id"),
+                f"{title} :: {body[:400]}",
+                _now_iso(),
+            ),
+        )
+        conn.commit()
+        action_id = cur.lastrowid
+    finally:
+        conn.close()
+
+    result = _gh_create_issue(owner, repo, title, body)
+    issue_url = result.get("html_url")
+    issue_num = result.get("number")
+
+    conn = sqlite3.connect(str(DB_FILE), timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        if issue_url:
+            conn.execute(
+                "UPDATE github_action SET result_url=?, result_status=?, "
+                "target_number=?, finished_at=? WHERE id=?",
+                (issue_url, 201, int(issue_num or 0), _now_iso(), action_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE github_action SET error=?, result_status=?, finished_at=? "
+                "WHERE id=?",
+                (
+                    f"{result.get('error', 'unknown')}: {result.get('message', '')[:200]}",
+                    result.get("status", 0), _now_iso(), action_id,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if issue_url:
+        log.info("gh issue opened: %s by requester=%s", issue_url,
+                 (msg.get("from", {}) or {}).get("username"))
+        return (f"Issue raised and logged in the ship's book:\n{issue_url}")
+    err = result.get("error", "unknown")
+    status = result.get("status", 0)
+    log.warning("gh issue failed: %s/%s err=%s status=%s", owner, repo, err, status)
+    if status == 404:
+        return (
+            f"The repository {owner}/{repo} cannot be found, or leviathan-agent "
+            f"lacks access. No issue was raised."
+        )
+    return (
+        f"The dispatch foundered (status {status}). No issue was raised. "
+        f"Pray retry, or summon the operator."
+    )
+
+
 def handle_comment_request(msg, text: str):
     """Compose + post a GitHub issue/PR comment as leviathan-agent.
 
@@ -4293,10 +4498,51 @@ def _start_workers():
 # --- Main poll loop ---------------------------------------------------------
 
 
+# --- Single-instance lock ---------------------------------------------------
+# Two pollers on the same bot token both answer every message (the duplicate
+# "Commodore replies twice" bug, 2026-06-24: an orphaned instance ran alongside
+# the watchdog-managed one). Telegram only surfaces this as intermittent 409s.
+# An exclusive flock on a pidfile makes a second instance refuse to start, so
+# orphans / manual launches / watchdog races can never produce a double poller.
+_INSTANCE_LOCK_PATH = "/tmp/fleet-commodore.lock"
+_instance_lock_fh = None
+
+
+def _acquire_single_instance_lock():
+    """Exit the process if another commodore.py already holds the lock."""
+    global _instance_lock_fh
+    fh = open(_INSTANCE_LOCK_PATH, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        # Another instance holds it — do NOT start a second poller.
+        sys.exit(
+            "ERROR: another Fleet Commodore instance is already running "
+            "(lock held on %s) — refusing to start a duplicate poller."
+            % _INSTANCE_LOCK_PATH
+        )
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _instance_lock_fh = fh  # keep the handle (and thus the lock) for process life
+    atexit.register(_release_single_instance_lock)
+
+
+def _release_single_instance_lock():
+    global _instance_lock_fh
+    if _instance_lock_fh is not None:
+        try:
+            fcntl.flock(_instance_lock_fh.fileno(), fcntl.LOCK_UN)
+            _instance_lock_fh.close()
+        except Exception:
+            pass
+        _instance_lock_fh = None
+
+
 def poll():
     offset = 0
     recent_by_chat = {}
 
+    _acquire_single_instance_lock()
     log.info("Fleet Commodore listener starting")
     global BOT_USER_ID
     try:
@@ -4471,6 +4717,15 @@ def poll():
                                 response = preflight_decline
                             else:
                                 response = _claim_review(msg, pr_number, repo)
+
+                # Open a NEW GitHub issue — checked BEFORE the comment +
+                # PR-filing routes. No URL yet (the issue doesn't exist), so
+                # the repo is named in the text; the 'issue' verb is the anchor.
+                if (
+                    response is None and is_direct
+                    and _ISSUE_REQUEST_RE.search(text or "")
+                ):
+                    response = handle_issue_request(msg, text)
 
                 # GitHub issue/PR comment — checked BEFORE _detect_pr_request
                 # so "comment on .../pull/N" doesn't get mis-routed to the
