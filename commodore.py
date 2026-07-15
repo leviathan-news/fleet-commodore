@@ -177,6 +177,27 @@ OPERATOR_DM_USER_ID = int(os.environ.get("OPERATOR_DM_USER_ID", "0") or 0)
 ALLOWED_TOOLS = "WebSearch,WebFetch,Read,Grep,Glob"
 POLL_TIMEOUT = 30
 
+# Telegram documents are user-controlled input.  Keep the accepted surface
+# deliberately narrow and bounded: enough for editorial Markdown packets such
+# as Maze's ~40 KiB review, nowhere near Telegram's general document limit.
+_TELEGRAM_TEXT_DOCUMENT_HARD_MAX_BYTES = 256 * 1024
+try:
+    TELEGRAM_TEXT_DOCUMENT_MAX_BYTES = min(
+        max(int(os.environ.get("TELEGRAM_TEXT_DOCUMENT_MAX_BYTES", 128 * 1024)), 1),
+        _TELEGRAM_TEXT_DOCUMENT_HARD_MAX_BYTES,
+    )
+except ValueError:
+    TELEGRAM_TEXT_DOCUMENT_MAX_BYTES = 128 * 1024
+
+_TELEGRAM_TEXT_DOCUMENT_EXTENSIONS = frozenset({
+    ".md", ".markdown", ".txt", ".rst", ".json", ".csv", ".yaml", ".yml",
+})
+_TELEGRAM_TEXT_DOCUMENT_MIME_TYPES = frozenset({
+    "text/markdown", "text/plain", "text/x-markdown", "text/csv",
+    "text/yaml", "application/json", "application/yaml",
+    "application/x-yaml", "application/octet-stream",
+})
+
 
 # --- Per-channel + per-topic policy ------------------------------------------
 
@@ -815,6 +836,8 @@ def _ensure_tables():
                 requester_username TEXT,
                 request_msg_id INTEGER,
                 question TEXT NOT NULL,
+                attachment_name TEXT,
+                attachment_text TEXT,
                 status TEXT NOT NULL,
                 answer_summary TEXT,
                 declined_reason TEXT,
@@ -905,6 +928,11 @@ def _ensure_tables():
         _safe_column_add(conn, "pr_review", "idempotency_key", "TEXT NOT NULL DEFAULT ''")
         _safe_column_add(conn, "pr_review", "side_effect_completed_at", "TEXT")
         _safe_column_add(conn, "pr_review", "last_dedup_token", "TEXT")
+        # Text attachments are stored separately from the asker's question so
+        # the worker can frame them as untrusted data and run hostile-question
+        # checks against the actual request rather than quoted document prose.
+        _safe_column_add(conn, "qa_job", "attachment_name", "TEXT")
+        _safe_column_add(conn, "qa_job", "attachment_text", "TEXT")
         # Idempotency unique index for pr_review (excludes legacy '' rows).
         conn.execute(
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_review_idempotency
@@ -939,7 +967,7 @@ def save_chat_message(msg, our_reply=None):
                 msg.get("message_thread_id"),
                 sender.get("username", sender.get("first_name", "?")),
                 int(sender.get("is_bot", False)),
-                (msg.get("text") or "")[:500],
+                _message_text(msg)[:500],
                 (our_reply or "")[:500],
                 datetime.now(timezone.utc).isoformat(),
             ),
@@ -1290,6 +1318,136 @@ def tg_request(method, data=None):
         req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=POLL_TIMEOUT + 10) as resp:
         return json.loads(resp.read())
+
+
+class TelegramDocumentIntakeError(ValueError):
+    """A safe, user-reportable failure while reading a Telegram document."""
+
+
+def _message_text(msg: dict) -> str:
+    """Return Telegram's text-bearing field for text or media messages."""
+    return msg.get("text") or msg.get("caption") or ""
+
+
+def _message_document(msg: dict) -> "dict | None":
+    """Return a document on this message or the message it directly replies to.
+
+    Telegram users commonly upload a document first, then @mention the bot in
+    a reply. The reply is the request; its parent carries the file metadata.
+    """
+    document = msg.get("document")
+    if document:
+        return document
+    return (msg.get("reply_to_message") or {}).get("document") or None
+
+
+def _safe_document_name(document: dict) -> str:
+    """Return a short basename suitable for replies and metadata logs."""
+    raw = str(document.get("file_name") or "unnamed document")
+    # Telegram filenames are untrusted; prevent path-looking names and log or
+    # reply injection through control characters.
+    name = Path(raw.replace("\\", "/")).name
+    name = "".join(ch for ch in name if ch.isprintable()).strip()
+    return (name or "unnamed document")[:120]
+
+
+def _document_intake_failure(document: dict, reason: str) -> str:
+    return (
+        f"I received `{_safe_document_name(document)}`, but could not read its "
+        f"contents: {reason}"
+    )
+
+
+def download_telegram_text_document(msg: dict) -> dict:
+    """Download one safe, bounded UTF-8 text-like Telegram document.
+
+    The returned mapping contains only the display filename and decoded body.
+    The file id, authenticated file URL, token, and body are never logged.
+    Raises TelegramDocumentIntakeError with a user-safe reason on rejection or
+    retrieval failure.
+    """
+    document = _message_document(msg) or {}
+    if not document:
+        raise TelegramDocumentIntakeError("the message has no document metadata.")
+
+    name = _safe_document_name(document)
+    extension = Path(name).suffix.lower()
+    mime_type = str(document.get("mime_type") or "").split(";", 1)[0].strip().lower()
+    mime_type = "".join(ch for ch in mime_type if ch.isprintable())[:100]
+    if extension not in _TELEGRAM_TEXT_DOCUMENT_EXTENSIONS:
+        allowed = ", ".join(sorted(_TELEGRAM_TEXT_DOCUMENT_EXTENSIONS))
+        raise TelegramDocumentIntakeError(
+            f"`{extension or '[no extension]'}` is not an accepted text type "
+            f"(accepted: {allowed})."
+        )
+    if mime_type and mime_type not in _TELEGRAM_TEXT_DOCUMENT_MIME_TYPES:
+        raise TelegramDocumentIntakeError(
+            f"Telegram labelled it `{mime_type}`, not a supported text MIME type."
+        )
+
+    declared_size = document.get("file_size")
+    try:
+        declared_size = int(declared_size) if declared_size is not None else None
+    except (TypeError, ValueError):
+        declared_size = None
+    if declared_size is not None and declared_size > TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:
+        raise TelegramDocumentIntakeError(
+            f"it is {declared_size:,} bytes; the review limit is "
+            f"{TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:,} bytes."
+        )
+
+    file_id = document.get("file_id")
+    if not file_id:
+        raise TelegramDocumentIntakeError("Telegram supplied no downloadable file id.")
+
+    try:
+        metadata = tg_request("getFile", {"file_id": file_id})
+        if not metadata.get("ok"):
+            raise TelegramDocumentIntakeError("Telegram refused the file lookup.")
+        file_result = metadata.get("result") or {}
+        file_path = file_result.get("file_path")
+        if not file_path:
+            raise TelegramDocumentIntakeError("Telegram returned no file path.")
+        resolved_size = file_result.get("file_size")
+        if resolved_size is not None and int(resolved_size) > TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:
+            raise TelegramDocumentIntakeError(
+                f"Telegram reports {int(resolved_size):,} bytes; the review limit is "
+                f"{TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:,} bytes."
+            )
+
+        # This authenticated URL must never enter logs, exceptions, or SQLite.
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "leviathan-commodore-bot"}
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read(TELEGRAM_TEXT_DOCUMENT_MAX_BYTES + 1)
+    except TelegramDocumentIntakeError:
+        raise
+    except Exception:
+        # Do not interpolate the exception: HTTP errors can include the
+        # authenticated URL and therefore the bot token.
+        raise TelegramDocumentIntakeError(
+            "Telegram's file service could not retrieve it; please retry."
+        ) from None
+
+    if len(raw) > TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:
+        raise TelegramDocumentIntakeError(
+            f"the downloaded body exceeds the "
+            f"{TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:,}-byte review limit."
+        )
+    try:
+        body = raw.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError:
+        raise TelegramDocumentIntakeError(
+            "it is not valid UTF-8 text; please export it as UTF-8 Markdown or plain text."
+        ) from None
+    if "\x00" in body:
+        raise TelegramDocumentIntakeError(
+            "it contains binary NUL bytes rather than plain text."
+        )
+
+    return {"name": name, "text": body, "size": len(raw)}
 
 
 _MD_CODE_FENCE_RE = re.compile(r"```(?:[^\n`]*)\n?(.*?)```", re.DOTALL)
@@ -2059,7 +2217,7 @@ _NEMESIS_PERSONA_SUFFIX = (
 
 
 def generate_response(msg, is_direct, policy, recent_messages):
-    text = msg.get("text", "") or ""
+    text = _message_text(msg)
     sender = msg.get("from", {})
     if len(text) < 2:
         return None
@@ -2087,7 +2245,7 @@ def generate_response(msg, is_direct, policy, recent_messages):
             m_name = sanitize_untrusted(
                 m_sender.get("username", m_sender.get("first_name", "?")), max_len=30
             )
-            m_text = sanitize_untrusted(m.get("text") or "", max_len=200)
+            m_text = sanitize_untrusted(_message_text(m), max_len=200)
             if m_text:
                 conv_lines.append(f"@{m_name}: {m_text}")
         if conv_lines:
@@ -2782,6 +2940,16 @@ _QA_RE = re.compile(
 )
 
 
+def _qa_question_for_text(text: str, has_attachment: bool = False) -> "str | None":
+    """Return the Q&A request, including document-review requests without `?`."""
+    qa_match = _QA_RE.search(text)
+    if qa_match:
+        return (qa_match.group(1) or text).strip()
+    if has_attachment:
+        return text.strip() or "Please review the attached document."
+    return None
+
+
 # --- GitHub issue/PR comment trigger (v7) ----------------------------------
 #
 # Matches "comment on https://github.com/<owner>/<repo>/issues/<n>" or
@@ -2930,7 +3098,8 @@ def _claim_build_job(draft_row) -> "tuple[str, str]":
     )
 
 
-def _claim_qa_job(msg, question: str) -> "tuple[str, str]":
+def _claim_qa_job(msg, question: str,
+                  attachment: "dict | None" = None) -> "tuple[str, str]":
     """Persist a qa_job row and enqueue. Returns (job_uuid, ack_string)."""
     job_uuid = str(_uuid_mod.uuid4())
     sender = msg.get("from", {}) or {}
@@ -2968,11 +3137,15 @@ def _claim_qa_job(msg, question: str) -> "tuple[str, str]":
             conn.execute(
                 """INSERT INTO qa_job
                    (job_uuid, chat_id, topic_id, requester_id, requester_username,
-                    request_msg_id, question, status, idempotency_key, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                    request_msg_id, question, attachment_name, attachment_text,
+                    status, idempotency_key, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
                 (
                     job_uuid, chat_id, topic_id, requester_id, requester_username,
-                    request_msg_id, question[:2000], idem, _now_iso(),
+                    request_msg_id, question[:4000],
+                    (attachment or {}).get("name"),
+                    (attachment or {}).get("text"),
+                    idem, _now_iso(),
                 ),
             )
             conn.commit()
@@ -3012,9 +3185,13 @@ def _claim_qa_job(msg, question: str) -> "tuple[str, str]":
         )
 
     _qa_cooldown_by_user[requester_id] = time.time()
-    return job_uuid, (
-        "The Admiralty consults its records. One moment."
-    )
+    if attachment:
+        return job_uuid, (
+            f"I have `{attachment['name']}` aboard "
+            f"({int(attachment.get('size') or 0):,} bytes) and can read its "
+            "contents. The Admiralty is reviewing it now."
+        )
+    return job_uuid, "The Admiralty consults its records. One moment."
 
 
 # --- Plan-refinement helpers (intent extraction) ---------------------------
@@ -3269,7 +3446,7 @@ def handle_abandon(msg):
     return "The dispatch is struck from the orders book."
 
 
-def handle_qa(msg, question: str):
+def handle_qa(msg, question: str, attachment: "dict | None" = None):
     """Read-only Q&A: enqueues a qa_job and returns the immediate ack."""
     if not _can_qa(msg):
         return (
@@ -3278,7 +3455,7 @@ def handle_qa(msg, question: str):
         )
     if not question or not question.strip():
         return None  # let the normal chat handler deal with empty
-    _job_uuid, ack = _claim_qa_job(msg, question.strip())
+    _job_uuid, ack = _claim_qa_job(msg, question.strip(), attachment=attachment)
     return ack
 
 
@@ -3875,6 +4052,8 @@ def _process_qa(job_uuid: str) -> None:
             job_payload = json.dumps({
                 "qa_uuid": job_uuid,
                 "question": row["question"],
+                "attachment_name": row["attachment_name"],
+                "attachment_text": row["attachment_text"],
                 "requester": row["requester_username"] or "unknown",
                 "channel": chat_id,
             })
@@ -4344,7 +4523,13 @@ def poll():
                 chat = msg.get("chat", {})
                 chat_id = chat.get("id", 0)
                 topic_id = msg.get("message_thread_id")
-                text = msg.get("text", "") or ""
+                text = _message_text(msg)
+                if text and not msg.get("text"):
+                    # The rest of the mature routing stack reads `text`.
+                    # Normalize Telegram media captions once, while retaining
+                    # caption_entities and document metadata on the message.
+                    msg = dict(msg)
+                    msg["text"] = text
                 sender = msg.get("from", {})
 
                 log.info(
@@ -4444,6 +4629,31 @@ def poll():
                     continue
 
                 response = None
+                attachment = None
+                document = _message_document(msg)
+                if is_direct and document:
+                    if not _can_qa(msg):
+                        response = _document_intake_failure(
+                            document,
+                            "document review is not authorized in this room; "
+                            "the attachment itself did arrive.",
+                        )
+                    elif not QA_ENABLED:
+                        response = _document_intake_failure(
+                            document,
+                            "document review is temporarily disabled with the "
+                            "Q&A worker; the attachment itself did arrive.",
+                        )
+                    else:
+                        try:
+                            attachment = download_telegram_text_document(msg)
+                        except TelegramDocumentIntakeError as exc:
+                            log.warning(
+                                "Telegram document rejected chat=%s msg=%s name=%r: %s",
+                                chat_id, msg.get("message_id"),
+                                _safe_document_name(document), str(exc),
+                            )
+                            response = _document_intake_failure(document, str(exc))
                 # PR review flow takes priority over PR filing flow (narrower
                 # intent first): /review 253, "review PR 253", etc. Must be
                 # direct (@mention or reply to Commodore), admin, in a chat
@@ -4524,14 +4734,18 @@ def poll():
                         # Q&A: slash form takes the captured group as the
                         # question; natural form passes the whole post-mention
                         # text. Q&A is gated to Bot HQ ∪ Lev Dev ∪ Agent Chat
-                        # ∪ admin DM by _can_qa inside handle_qa.
+                        # ∪ Atlas ∪ admin DM by _can_qa inside handle_qa.
                         # Kill switch: QA_ENABLED=0 short-circuits this branch
-                        # so direct messages fall through to generate_response
-                        # (normal LLM chat) instead of the Q&A pipeline.
-                        qa_match = _QA_RE.search(stripped_no_mention)
-                        if qa_match:
-                            question = qa_match.group(1) or stripped_no_mention
-                            response = handle_qa(msg, question.strip())
+                        # so text-only messages fall through to normal chat;
+                        # documents receive an explicit unavailable diagnostic.
+                        question = _qa_question_for_text(
+                            stripped_no_mention,
+                            has_attachment=attachment is not None,
+                        )
+                        if question is not None:
+                            response = handle_qa(
+                                msg, question, attachment=attachment,
+                            )
 
                 if response is None:
                     response = generate_response(

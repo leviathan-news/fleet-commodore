@@ -68,6 +68,24 @@ Allowed repos (in-code allowlist in `commodore.py`):
 PRs are authored by the separate GitHub user `leviathan-commodore` with a
 scoped PAT mounted read-only at `/run/secrets/gh_pat` in the container.
 
+## Telegram document review
+
+A directly addressed document in a Q&A-authorized room (including Lev Dev and
+Leviathan Atlas) is retrieved through Telegram's Bot API and handed to the
+read-only Q&A worker. Media captions are treated as the message text, so a
+captioned `@commodore please review this draft` works without a question mark.
+The same request works as a direct reply to a preceding document-only message;
+the reply remains the request while its parent's document is reviewed.
+
+Intake accepts UTF-8 `.md`, `.markdown`, `.txt`, `.rst`, `.json`, `.csv`,
+`.yaml`, and `.yml` files with compatible text MIME metadata. The default limit
+is 128 KiB and `TELEGRAM_TEXT_DOCUMENT_MAX_BYTES` may lower it or raise it only
+up to the hard 256 KiB ceiling. The worker receives the attachment separately
+from the asker's question and labels it untrusted data; text inside the file is
+never treated as instructions. Rejections and retrieval failures acknowledge
+that the attachment arrived and state the safe reason, without logging the bot
+token, authenticated file URL, or document body.
+
 ## Tests
 
 ```bash
