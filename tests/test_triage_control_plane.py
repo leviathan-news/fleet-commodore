@@ -5,6 +5,7 @@ control plane must stay testable while its posting gate is off.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sqlite3
 import sys
@@ -225,6 +226,47 @@ def test_stale_claim_is_requeued_instead_of_lost_after_interrupted_process(triag
     assert recovered.alerts == [{"alert_id": VALID_ALERT_A, "summary": f"alert {VALID_ALERT_A}"}]
 
 
+def test_stale_reaper_cannot_delete_an_owner_renewed_after_stale_selection(
+    triage, monkeypatch,
+):
+    """Force the select/heartbeat/delete interleaving Luna flagged."""
+    triage.enqueue_alert(VALID_ALERT_A, "one")
+    status, batch = triage._take_ready_batch()
+    assert status == "batch"
+    assert isinstance(batch, triage.ClaimBatch)
+    with sqlite3.connect(str(triage.DB_FILE)) as conn:
+        conn.execute(
+            "UPDATE triaged_alerts SET lease_expires_at='2000-01-01T00:00:00+00:00' "
+            "WHERE alert_id=?",
+            (VALID_ALERT_A,),
+        )
+
+    delete_exact_owner = triage._delete_stale_pre_send_claim
+
+    def renew_between_selection_and_delete(conn, stale, cutoff):
+        conn.execute(
+            "UPDATE triaged_alerts SET lease_expires_at=? WHERE alert_id=?",
+            ("2999-01-01T00:00:00+00:00", stale["alert_id"]),
+        )
+        return delete_exact_owner(conn, stale, cutoff)
+
+    monkeypatch.setattr(triage, "_delete_stale_pre_send_claim", renew_between_selection_and_delete)
+    conn = triage._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        triage._clear_stale_claims(conn)
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    assert _rows(
+        triage.DB_FILE,
+        "SELECT claim_token, lease_expires_at, post_state FROM triaged_alerts WHERE alert_id=?",
+        (VALID_ALERT_A,),
+    ) == [(batch.token, "2999-01-01T00:00:00+00:00", "claimed")]
+    assert _rows(triage.DB_FILE, "SELECT alert_id FROM pending") == []
+
+
 def test_short_claim_lease_is_refused_before_any_dequeue(triage, monkeypatch):
     triage.enqueue_alert(VALID_ALERT_A, "one")
     monkeypatch.setattr(triage, "CLAIM_LEASE_S", triage.MIN_CLAIM_LEASE_S - 1)
@@ -292,7 +334,7 @@ def test_successful_live_post_records_every_claim_once(triage, monkeypatch):
     triage.enqueue_alert(VALID_ALERT_B, "two")
     monkeypatch.setattr(triage, "ask_claude", lambda *args, **kwargs: _valid_note())
     calls = []
-    def send(chat, note):
+    def send(chat, note, **kwargs):
         calls.append((chat, note))
         attempts = _rows(
             triage.DB_FILE,
@@ -324,7 +366,9 @@ def test_invalid_telegram_receipt_is_outcome_unknown_and_never_blindly_resent(tr
     monkeypatch.setattr(triage, "ask_claude", lambda *args, **kwargs: _valid_note())
     calls = []
     monkeypatch.setattr(
-        triage, "send_message", lambda chat, note: calls.append((chat, note)) or {"ok": True, "result": {}},
+        triage,
+        "send_message",
+        lambda chat, note, **kwargs: calls.append((chat, note)) or {"ok": True, "result": {}},
     )
 
     assert triage.process_pending(dry_run=False) == "post_outcome_unknown"
@@ -349,7 +393,7 @@ def test_send_exception_is_held_unknown_without_a_retry(triage, monkeypatch):
     monkeypatch.setattr(triage, "ask_claude", lambda *args, **kwargs: _valid_note())
     calls = []
 
-    def explode(chat, note):
+    def explode(chat, note, **kwargs):
         calls.append((chat, note))
         raise RuntimeError("simulated Telegram transport loss")
 
@@ -359,6 +403,90 @@ def test_send_exception_is_held_unknown_without_a_retry(triage, monkeypatch):
     assert len(calls) == 1
     assert triage.process_pending(dry_run=False) == "empty"
     assert len(calls) == 1
+
+
+def test_operator_reconciliation_is_default_off_and_receipt_resolution_never_resends(
+    triage, monkeypatch,
+):
+    monkeypatch.setenv("TRIAGE_POSTING_ENABLED", "1")
+    triage.enqueue_alert(VALID_ALERT_A, "one")
+    monkeypatch.setattr(triage, "ask_claude", lambda *args, **kwargs: _valid_note())
+    sends = []
+    monkeypatch.setattr(
+        triage,
+        "send_message",
+        lambda chat, note, **kwargs: sends.append((chat, note, kwargs))
+        or {"ok": True, "result": {}},
+    )
+
+    assert triage.process_pending(dry_run=False) == "post_outcome_unknown"
+    assert len(sends) == 1
+    attempt_token = _rows(
+        triage.DB_FILE, "SELECT attempt_token FROM triage_post_attempts"
+    )[0][0]
+    with pytest.raises(triage.TriageError, match="disabled"):
+        triage.list_outcome_unknown()
+    assert triage.main(["--list-outcome-unknown"]) == 1
+
+    monkeypatch.setenv("TRIAGE_OPERATOR_RECONCILE_ENABLED", "1")
+    listed = triage.list_outcome_unknown()
+    assert len(listed) == 1
+    assert listed[0]["attempt_token"] == attempt_token
+    assert listed[0]["verdict"] == "benign"
+    assert listed[0]["detail"] == "Telegram response lacked a valid receipt"
+    assert listed[0]["telegram_message_id"] is None
+    assert listed[0]["alert_ids"] == [VALID_ALERT_A]
+    inspection = triage.inspect_outcome_unknown(attempt_token)
+    assert inspection is not None
+    assert inspection["rendered_note"] == triage._render_post_note(_valid_note(), "benign")
+    assert inspection["note_sha256"] == hashlib.sha256(
+        inspection["rendered_note"].encode("utf-8")
+    ).hexdigest()
+    assert inspection["receipt"]["telegram_message_id"] is None
+    assert len(inspection["alerts"]) == 1
+    assert inspection["alerts"][0]["alert_id"] == VALID_ALERT_A
+    assert inspection["alerts"][0]["post_state"] == "outcome_unknown"
+
+    monkeypatch.setattr(
+        triage, "send_message", lambda *args, **kwargs: pytest.fail("reconciliation must not send")
+    )
+    assert triage.resolve_outcome_unknown(attempt_token, receipt_message_id=444) is True
+    assert _rows(
+        triage.DB_FILE,
+        "SELECT outcome, telegram_message_id FROM triage_post_attempts",
+    ) == [("operator_receipt_reconciled", 444)]
+    assert _rows(
+        triage.DB_FILE,
+        "SELECT post_state, message_id FROM triaged_alerts WHERE alert_id=?",
+        (VALID_ALERT_A,),
+    ) == [("completed", 444)]
+    assert triage.process_pending(dry_run=False) == "empty"
+
+
+def test_operator_can_close_unknown_without_receipt_but_never_requeue_it(triage, monkeypatch):
+    monkeypatch.setenv("TRIAGE_POSTING_ENABLED", "1")
+    monkeypatch.setenv("TRIAGE_OPERATOR_RECONCILE_ENABLED", "1")
+    triage.enqueue_alert(VALID_ALERT_A, "one")
+    monkeypatch.setattr(triage, "ask_claude", lambda *args, **kwargs: _valid_note())
+    monkeypatch.setattr(
+        triage, "send_message", lambda *args, **kwargs: {"ok": True, "result": {}},
+    )
+    assert triage.process_pending(dry_run=False) == "post_outcome_unknown"
+    attempt_token = _rows(
+        triage.DB_FILE, "SELECT attempt_token FROM triage_post_attempts"
+    )[0][0]
+
+    assert triage.resolve_outcome_unknown(attempt_token, close_without_receipt=True) is True
+    assert _rows(
+        triage.DB_FILE, "SELECT outcome FROM triage_post_attempts"
+    ) == [("operator_closed_no_resend",)]
+    assert _rows(
+        triage.DB_FILE,
+        "SELECT post_state, triaged_at FROM triaged_alerts WHERE alert_id=?",
+        (VALID_ALERT_A,),
+    ) == [("operator_closed_no_resend", None)]
+    assert triage.enqueue_alert(VALID_ALERT_A, "must not requeue") is False
+    assert _rows(triage.DB_FILE, "SELECT alert_id FROM pending") == []
 
 
 def test_crash_after_pre_send_fence_expires_to_unknown_without_requeue(triage):

@@ -17,8 +17,11 @@ from the Telegram polling loop.
 - `TRIAGE_POSTING_ENABLED` defaults to `0`. A disabled gate does not claim, post, or DM
   alerts; use `--dry-run` to inspect an agent result safely.
 - Dequeue and claim commit atomically with a token-bound, batch-sized lease. A stale
-  pre-send claim is requeued; a crashed or receipt-less post is durably
-  `outcome_unknown` and is never blindly resent.
+  pre-send claim is requeued only with an exact owner-token/expiry compare-and-delete;
+  a crashed or receipt-less post is durably `outcome_unknown` and is never blindly
+  resent. `TRIAGE_OPERATOR_RECONCILE_ENABLED` also defaults to `0`: it exposes a
+  local, `--operator-confirm` inspect/list/terminal-resolution path with the
+  rendered-note artifact and receipt evidence, but no automatic resend.
 - `cron/commodore-triage.sh` supplies the Mini's documented five-minute cron command;
   deployment review must install it explicitly. It does not restart or otherwise control
   the bot.

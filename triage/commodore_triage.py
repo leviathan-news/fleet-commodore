@@ -85,9 +85,12 @@ class ClaimBatch:
 class PostAttempt:
     """Durable pre-send fence for one Telegram group-message attempt."""
 
-    def __init__(self, *, token: str, note_sha256: str, verdict: str):
+    def __init__(
+        self, *, token: str, note_sha256: str, rendered_note: str, verdict: str
+    ):
         self.token = token
         self.note_sha256 = note_sha256
+        self.rendered_note = rendered_note
         self.verdict = verdict
 
 
@@ -98,6 +101,11 @@ class TriageError(RuntimeError):
 def posting_enabled() -> bool:
     """Live messages are opt-in.  Absence of the env var is always safe."""
     return os.environ.get("TRIAGE_POSTING_ENABLED", "0") == "1"
+
+
+def reconciliation_enabled() -> bool:
+    """Keep local outcome reconciliation disabled until an operator enables it."""
+    return os.environ.get("TRIAGE_OPERATOR_RECONCILE_ENABLED", "0") == "1"
 
 
 def _utc_now() -> datetime:
@@ -120,6 +128,23 @@ def _validate_alert_id(value: str) -> str:
         return str(uuid.UUID(value))
     except (ValueError, AttributeError) as exc:
         raise argparse.ArgumentTypeError("alert id must be a UUID") from exc
+
+
+def _validate_attempt_token(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError) as exc:
+        raise argparse.ArgumentTypeError("attempt token must be a UUID") from exc
+
+
+def _validate_message_id(value: str) -> int:
+    try:
+        message_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("receipt message id must be a positive integer") from exc
+    if message_id <= 0:
+        raise argparse.ArgumentTypeError("receipt message id must be a positive integer")
+    return message_id
 
 
 def _connect(db_file: Path = DB_FILE) -> sqlite3.Connection:
@@ -164,6 +189,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             attempt_token TEXT PRIMARY KEY,
             claim_token TEXT NOT NULL,
             note_sha256 TEXT NOT NULL,
+            rendered_note TEXT NOT NULL DEFAULT '',
             verdict TEXT NOT NULL,
             attempted_at TEXT NOT NULL,
             outcome TEXT NOT NULL,
@@ -185,6 +211,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE triaged_alerts ADD COLUMN {name} {definition}")
+    attempt_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(triage_post_attempts)")
+    }
+    if "rendered_note" not in attempt_columns:
+        conn.execute(
+            "ALTER TABLE triage_post_attempts "
+            "ADD COLUMN rendered_note TEXT NOT NULL DEFAULT ''"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS triaged_alerts_claim_lease "
         "ON triaged_alerts(claim_token, lease_expires_at)"
@@ -222,6 +256,30 @@ def _validate_claim_configuration() -> None:
         )
 
 
+def _delete_stale_pre_send_claim(
+    conn: sqlite3.Connection, stale: sqlite3.Row, cutoff: str
+) -> bool:
+    """Delete only the exact expired owner observed by the stale reaper.
+
+    A lease heartbeat may have renewed the same alert after the reaper selected
+    it.  Matching the original owner token and expiry (as well as the captured
+    cutoff) makes that interleaving a harmless no-op rather than deleting the
+    renewed owner and stranding or duplicating work.
+    """
+    cursor = conn.execute(
+        "DELETE FROM triaged_alerts WHERE alert_id=? AND claim_token=? "
+        "AND lease_expires_at=? AND lease_expires_at <= ? AND triaged_at IS NULL "
+        "AND post_attempt_token IS NULL AND post_state='claimed'",
+        (
+            stale["alert_id"],
+            stale["claim_token"],
+            stale["lease_expires_at"],
+            cutoff,
+        ),
+    )
+    return cursor.rowcount == 1
+
+
 def _clear_stale_claims(conn: sqlite3.Connection) -> None:
     """Requeue only expired claims that never reached a Telegram send fence.
 
@@ -230,6 +288,8 @@ def _clear_stale_claims(conn: sqlite3.Connection) -> None:
     lost.  Such rows become ``outcome_unknown`` and remain held for explicit
     reconciliation; they must never be silently requeued or resent.
     """
+    if not conn.in_transaction:
+        raise TriageError("stale claim cleanup requires a BEGIN IMMEDIATE transaction")
     now = _iso_now()
     conn.execute(
         "UPDATE triage_post_attempts SET outcome='outcome_unknown', "
@@ -248,22 +308,23 @@ def _clear_stale_claims(conn: sqlite3.Connection) -> None:
         (now,),
     )
     stale = conn.execute(
-        "SELECT alert_id FROM triaged_alerts "
+        "SELECT alert_id, claim_token, lease_expires_at FROM triaged_alerts "
         "WHERE triaged_at IS NULL AND post_attempt_token IS NULL "
-        "AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+        "AND post_state='claimed' AND lease_expires_at IS NOT NULL "
+        "AND lease_expires_at <= ?",
         (now,),
     ).fetchall()
-    if stale:
-        queued_at = time.time()
-        conn.executemany(
-            "INSERT OR IGNORE INTO pending(alert_id, enqueued_at, summary) VALUES (?, ?, ?)",
-            [(row["alert_id"], queued_at, f"alert {row['alert_id']}") for row in stale],
-        )
-        conn.executemany(
-            "DELETE FROM triaged_alerts WHERE alert_id=? AND triaged_at IS NULL "
-            "AND post_attempt_token IS NULL",
-            [(row["alert_id"],) for row in stale],
-        )
+    for row in stale:
+        # Requeue only after compare-and-delete succeeds.  Doing this in the
+        # opposite order could leave an active renewed owner plus a duplicate
+        # pending row.  Callers hold BEGIN IMMEDIATE for the full cleanup, and
+        # this predicate protects future callers from the same race too.
+        if _delete_stale_pre_send_claim(conn, row, now):
+            conn.execute(
+                "INSERT OR IGNORE INTO pending(alert_id, enqueued_at, summary) "
+                "VALUES (?, ?, ?)",
+                (row["alert_id"], time.time(), f"alert {row['alert_id']}"),
+            )
 
 
 def _one_line_summary(alert: dict[str, Any]) -> str:
@@ -297,7 +358,12 @@ def enqueue_alert(
     except argparse.ArgumentTypeError as exc:
         raise TriageError(str(exc)) from exc
     safe_summary = _vetted_summary_text(summary or f"alert {alert_id}")
-    with _connect(db_file) as conn:
+    conn = _connect(db_file)
+    try:
+        # The stale reaper and the enqueue decision must share the writer lock.
+        # Otherwise a heartbeat could renew an owner after stale selection but
+        # before a separate enqueue process deletes it.
+        conn.execute("BEGIN IMMEDIATE")
         _clear_stale_claims(conn)
         existing = conn.execute(
             "SELECT triaged_at FROM triaged_alerts WHERE alert_id=?", (alert_id,)
@@ -306,6 +372,7 @@ def enqueue_alert(
         # non-enqueueable.  The latter rule is what prevents a second send
         # after an ambiguous Telegram outcome.
         if existing:
+            conn.execute("COMMIT")
             return False
         cursor = conn.execute(
             "INSERT OR IGNORE INTO pending(alert_id, enqueued_at, summary) VALUES (?, ?, ?)",
@@ -315,7 +382,14 @@ def enqueue_alert(
             "INSERT OR IGNORE INTO alert_arrivals(alert_id, arrived_at) VALUES (?, ?)",
             (alert_id, time.time()),
         )
-    return bool(cursor.rowcount)
+        conn.execute("COMMIT")
+        return bool(cursor.rowcount)
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def _scan_feed_json(args: list[str]) -> Any:
@@ -560,13 +634,18 @@ def _return_claim_to_pending(batch: ClaimBatch, *, db_file: Path = DB_FILE) -> b
 
 
 def _prepare_post_attempt(
-    batch: ClaimBatch, note: str, verdict: str, *, db_file: Path = DB_FILE
+    batch: ClaimBatch, rendered_note: str, verdict: str, *, db_file: Path = DB_FILE
 ) -> PostAttempt | None:
     """Persist the irreversible Telegram fence before attempting a send."""
     if not batch.alerts:
         return None
-    note_sha256 = hashlib.sha256(note.encode("utf-8")).hexdigest()
-    attempt = PostAttempt(token=str(uuid.uuid4()), note_sha256=note_sha256, verdict=verdict)
+    note_sha256 = hashlib.sha256(rendered_note.encode("utf-8")).hexdigest()
+    attempt = PostAttempt(
+        token=str(uuid.uuid4()),
+        note_sha256=note_sha256,
+        rendered_note=rendered_note,
+        verdict=verdict,
+    )
     conn = _connect(db_file)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -582,9 +661,16 @@ def _prepare_post_attempt(
             return None
         conn.execute(
             "INSERT INTO triage_post_attempts("
-            "attempt_token, claim_token, note_sha256, verdict, attempted_at, outcome"
-            ") VALUES (?, ?, ?, ?, ?, 'send_started')",
-            (attempt.token, batch.token, attempt.note_sha256, verdict, now),
+            "attempt_token, claim_token, note_sha256, rendered_note, verdict, attempted_at, outcome"
+            ") VALUES (?, ?, ?, ?, ?, ?, 'send_started')",
+            (
+                attempt.token,
+                batch.token,
+                attempt.note_sha256,
+                attempt.rendered_note,
+                verdict,
+                now,
+            ),
         )
         cursor = conn.execute(
             "UPDATE triaged_alerts SET post_attempt_token=?, post_state='send_started', "
@@ -659,6 +745,189 @@ def _complete_post_with_receipt(
             "AND triaged_at IS NULL",
             (completed_at, attempt.verdict, message_id, batch.token, attempt.token),
         )
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def _require_operator_reconciliation() -> None:
+    """Guard a local-only path that can inspect or resolve uncertain sends."""
+    if not reconciliation_enabled():
+        raise TriageError(
+            "outcome reconciliation is disabled; set TRIAGE_OPERATOR_RECONCILE_ENABLED=1 "
+            "for one supervised operator session"
+        )
+
+
+def list_outcome_unknown(*, db_file: Path = DB_FILE) -> list[dict[str, Any]]:
+    """Return minimal, operator-only indexes for unresolved send outcomes.
+
+    This is deliberately a ledger inspection only.  It performs no Telegram
+    lookup, no provider call, and never changes queue state.
+    """
+    _require_operator_reconciliation()
+    with _connect(db_file) as conn:
+        rows = conn.execute(
+            "SELECT p.attempt_token, p.claim_token, p.note_sha256, p.verdict, "
+            "p.attempted_at, p.outcome_recorded_at, p.detail, "
+            "p.telegram_message_id, GROUP_CONCAT(a.alert_id, ',') AS alert_ids "
+            "FROM triage_post_attempts p "
+            "JOIN triaged_alerts a ON a.post_attempt_token=p.attempt_token "
+            "WHERE p.outcome='outcome_unknown' AND a.triaged_at IS NULL "
+            "AND a.post_state='outcome_unknown' "
+            "GROUP BY p.attempt_token "
+            "ORDER BY p.attempted_at, p.attempt_token"
+        ).fetchall()
+    return [
+        {
+            "attempt_token": row["attempt_token"],
+            "claim_token": row["claim_token"],
+            "note_sha256": row["note_sha256"],
+            "verdict": row["verdict"],
+            "attempted_at": row["attempted_at"],
+            "outcome_recorded_at": row["outcome_recorded_at"],
+            "detail": row["detail"],
+            "telegram_message_id": row["telegram_message_id"],
+            "alert_ids": row["alert_ids"].split(",") if row["alert_ids"] else [],
+        }
+        for row in rows
+    ]
+
+
+def inspect_outcome_unknown(
+    attempt_token: str, *, db_file: Path = DB_FILE
+) -> dict[str, Any] | None:
+    """Return the immutable note artifact and receipt record for one attempt."""
+    _require_operator_reconciliation()
+    try:
+        attempt_token = _validate_attempt_token(attempt_token)
+    except argparse.ArgumentTypeError as exc:
+        raise TriageError(str(exc)) from exc
+    with _connect(db_file) as conn:
+        attempt = conn.execute(
+            "SELECT attempt_token, claim_token, note_sha256, rendered_note, verdict, "
+            "attempted_at, outcome, telegram_message_id, outcome_recorded_at, detail "
+            "FROM triage_post_attempts WHERE attempt_token=? AND outcome='outcome_unknown'",
+            (attempt_token,),
+        ).fetchone()
+        if attempt is None:
+            return None
+        alerts = conn.execute(
+            "SELECT alert_id, claimed_at, lease_expires_at, post_state "
+            "FROM triaged_alerts WHERE post_attempt_token=? ORDER BY alert_id",
+            (attempt_token,),
+        ).fetchall()
+    return {
+        "attempt_token": attempt["attempt_token"],
+        "claim_token": attempt["claim_token"],
+        "note_sha256": attempt["note_sha256"],
+        # ``rendered_note`` is the exact safe Telegram-HTML payload persisted
+        # before the irreversible request.  Older pre-release records may not
+        # contain it; the hash remains available for those records.
+        "rendered_note": attempt["rendered_note"] or None,
+        "verdict": attempt["verdict"],
+        "attempted_at": attempt["attempted_at"],
+        "outcome": attempt["outcome"],
+        "receipt": {
+            "telegram_message_id": attempt["telegram_message_id"],
+            "outcome_recorded_at": attempt["outcome_recorded_at"],
+            "detail": attempt["detail"],
+        },
+        "alerts": [dict(row) for row in alerts],
+    }
+
+
+def resolve_outcome_unknown(
+    attempt_token: str,
+    *,
+    receipt_message_id: int | None = None,
+    close_without_receipt: bool = False,
+    db_file: Path = DB_FILE,
+) -> bool:
+    """Terminally reconcile one unknown outcome without ever sending again.
+
+    A valid manually located Telegram message id can finish the exact fenced
+    attempt.  If no receipt can be established, the operator may close it as a
+    held, no-resend record.  Neither resolution path requeues or calls Telegram.
+    """
+    _require_operator_reconciliation()
+    try:
+        attempt_token = _validate_attempt_token(attempt_token)
+    except argparse.ArgumentTypeError as exc:
+        raise TriageError(str(exc)) from exc
+    if (receipt_message_id is not None) == close_without_receipt:
+        raise TriageError(
+            "resolve exactly one way: a positive receipt_message_id or close_without_receipt"
+        )
+    if receipt_message_id is not None and (
+        isinstance(receipt_message_id, bool)
+        or not isinstance(receipt_message_id, int)
+        or receipt_message_id <= 0
+    ):
+        raise TriageError("receipt message id must be a positive integer")
+
+    conn = _connect(db_file)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        attempt = conn.execute(
+            "SELECT claim_token, verdict FROM triage_post_attempts "
+            "WHERE attempt_token=? AND outcome='outcome_unknown'",
+            (attempt_token,),
+        ).fetchone()
+        if attempt is None:
+            conn.execute("COMMIT")
+            return False
+        owned = conn.execute(
+            "SELECT COUNT(*) FROM triaged_alerts WHERE claim_token=? "
+            "AND post_attempt_token=? AND triaged_at IS NULL "
+            "AND post_state='outcome_unknown'",
+            (attempt["claim_token"], attempt_token),
+        ).fetchone()[0]
+        if owned == 0:
+            conn.execute("COMMIT")
+            return False
+
+        resolved_at = _iso_now()
+        if receipt_message_id is not None:
+            conn.execute(
+                "UPDATE triage_post_attempts SET outcome='operator_receipt_reconciled', "
+                "telegram_message_id=?, outcome_recorded_at=?, "
+                "detail='operator_reconciled_receipt' WHERE attempt_token=? "
+                "AND outcome='outcome_unknown'",
+                (receipt_message_id, resolved_at, attempt_token),
+            )
+            cursor = conn.execute(
+                "UPDATE triaged_alerts SET triaged_at=?, verdict=?, message_id=?, "
+                "post_state='completed' WHERE claim_token=? AND post_attempt_token=? "
+                "AND triaged_at IS NULL AND post_state='outcome_unknown'",
+                (
+                    resolved_at,
+                    attempt["verdict"],
+                    receipt_message_id,
+                    attempt["claim_token"],
+                    attempt_token,
+                ),
+            )
+        else:
+            conn.execute(
+                "UPDATE triage_post_attempts SET outcome='operator_closed_no_resend', "
+                "outcome_recorded_at=?, detail='operator_closed_without_receipt' "
+                "WHERE attempt_token=? AND outcome='outcome_unknown'",
+                (resolved_at, attempt_token),
+            )
+            cursor = conn.execute(
+                "UPDATE triaged_alerts SET post_state='operator_closed_no_resend', "
+                "lease_expires_at=NULL WHERE claim_token=? AND post_attempt_token=? "
+                "AND triaged_at IS NULL AND post_state='outcome_unknown'",
+                (attempt["claim_token"], attempt_token),
+            )
+        if cursor.rowcount != owned:
+            raise TriageError("attempt ownership changed during operator reconciliation")
         conn.execute("COMMIT")
         return True
     except Exception:
@@ -861,7 +1130,7 @@ def _render_triage_html(note: str) -> str:
     )
 
 
-def send_message(chat_id: int, note: str) -> Any:
+def send_message(chat_id: int, note: str, *, rendered: bool = False) -> Any:
     """Perform exactly one Telegram request for an already-fenced attempt.
 
     ``commodore.send_message`` retries as plaintext after any HTML transport or
@@ -876,7 +1145,7 @@ def send_message(chat_id: int, note: str) -> Any:
 
     return commodore.tg_request("sendMessage", {
         "chat_id": chat_id,
-        "text": _render_triage_html(note[:3800]),
+        "text": note[:3800] if rendered else _render_triage_html(note[:3800]),
         "parse_mode": "HTML",
     })
 
@@ -910,11 +1179,16 @@ def _make_needs_human_loud(note: str) -> str:
     return "<b>⚠️ NEEDS HUMAN — operator attention required</b>\n\n" + note
 
 
-def _post_note(note: str, verdict: str) -> Any:
-    """Send exactly one fenced group message and return Telegram's raw receipt."""
+def _render_post_note(note: str, verdict: str) -> str:
+    """Produce the exact safe group payload before persisting its send fence."""
     if verdict == "needs_human":
         note = _make_needs_human_loud(note)
-    response = send_message(LEV_SEC_CHAT_ID, note)
+    return _render_triage_html(note[:3800])
+
+
+def _post_note(rendered_note: str, verdict: str) -> Any:
+    """Send exactly one fenced group message and return Telegram's raw receipt."""
+    response = send_message(LEV_SEC_CHAT_ID, rendered_note, rendered=True)
     message_id = _message_id(response)
     if verdict == "needs_human" and message_id is not None:
         operator_id = _operator_dm_user_id()
@@ -922,7 +1196,8 @@ def _post_note(note: str, verdict: str) -> Any:
             try:
                 send_message(
                     operator_id,
-                    "⚠️ Lev Sec triage needs human attention:\n\n" + note,
+                    "⚠️ Lev Sec triage needs human attention:\n\n" + rendered_note,
+                    rendered=True,
                 )
             except Exception as exc:  # Group post is already durable; do not duplicate it.
                 LOG.exception("Unable to DM operator after needs_human post: %s", exc)
@@ -968,10 +1243,13 @@ def process_pending(*, dry_run: bool, db_file: Path = DB_FILE) -> str:
             if not _return_claim_to_pending(batch, db_file=db_file):
                 return "claim_lost"
             return "dry_run"
-        post_attempt = _prepare_post_attempt(batch, note, verdict, db_file=db_file)
+        rendered_note = _render_post_note(note, verdict)
+        post_attempt = _prepare_post_attempt(
+            batch, rendered_note, verdict, db_file=db_file
+        )
         if post_attempt is None:
             return "claim_lost"
-        response = _post_note(note, verdict)
+        response = _post_note(post_attempt.rendered_note, verdict)
         message_id = _message_id(response)
         if message_id is None:
             _record_post_outcome_unknown(
@@ -1025,7 +1303,18 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--alert-id", type=_validate_alert_id)
     mode.add_argument("--scan-db", action="store_true")
     mode.add_argument("--rearm", action="store_true", help="clear flood cooldown only")
+    mode.add_argument("--list-outcome-unknown", action="store_true")
+    mode.add_argument("--inspect-outcome-unknown", type=_validate_attempt_token)
+    mode.add_argument("--resolve-outcome-unknown", type=_validate_attempt_token)
     parser.add_argument("--dry-run", action="store_true", help="print a valid note; never post or claim")
+    parser.add_argument(
+        "--operator-confirm",
+        action="store_true",
+        help="required with every outcome-unknown reconciliation command",
+    )
+    resolution = parser.add_mutually_exclusive_group()
+    resolution.add_argument("--receipt-message-id", type=_validate_message_id)
+    resolution.add_argument("--close-without-receipt", action="store_true")
     return parser
 
 
@@ -1034,6 +1323,44 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(message)s")
     args = _parser().parse_args(argv)
     try:
+        reconciliation_command = (
+            args.list_outcome_unknown
+            or args.inspect_outcome_unknown is not None
+            or args.resolve_outcome_unknown is not None
+        )
+        if reconciliation_command:
+            if args.dry_run:
+                raise TriageError("--dry-run is not valid with reconciliation commands")
+            if not args.operator_confirm:
+                raise TriageError(
+                    "--operator-confirm is required for outcome-unknown reconciliation"
+                )
+            if (
+                (args.list_outcome_unknown or args.inspect_outcome_unknown is not None)
+                and (args.receipt_message_id is not None or args.close_without_receipt)
+            ):
+                raise TriageError("a resolution choice is valid only with --resolve-outcome-unknown")
+            if args.list_outcome_unknown:
+                print(json.dumps(list_outcome_unknown(), indent=2, sort_keys=True))
+                return 0
+            if args.inspect_outcome_unknown is not None:
+                inspection = inspect_outcome_unknown(args.inspect_outcome_unknown)
+                if inspection is None:
+                    LOG.error("unknown outcome attempt not found")
+                    return 1
+                print(json.dumps(inspection, indent=2, sort_keys=True))
+                return 0
+            assert args.resolve_outcome_unknown is not None
+            resolved = resolve_outcome_unknown(
+                args.resolve_outcome_unknown,
+                receipt_message_id=args.receipt_message_id,
+                close_without_receipt=args.close_without_receipt,
+            )
+            if not resolved:
+                LOG.error("unknown outcome attempt was not resolvable")
+                return 1
+            print("outcome-unknown attempt resolved without resend")
+            return 0
         if args.rearm:
             rearm_flood_breaker()
             print("flood breaker re-armed")
