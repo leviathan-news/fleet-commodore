@@ -12,9 +12,14 @@ REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 LOG_DIR="$REPO_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+: "${FLEET_COMMODORE_CONFIG:=$REPO_DIR/.env}"
+if [[ ! -r "$FLEET_COMMODORE_CONFIG" ]]; then
+  echo "Fleet Commodore runtime config is unreadable: $FLEET_COMMODORE_CONFIG" >&2
+  exit 1
+fi
 set -a
 # shellcheck disable=SC1091
-[[ -f "$REPO_DIR/.env" ]] && source "$REPO_DIR/.env"
+source "$FLEET_COMMODORE_CONFIG"
 set +a
 
 : "${TRIAGE_POSTING_ENABLED:=0}"
