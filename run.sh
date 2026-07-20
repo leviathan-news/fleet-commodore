@@ -15,7 +15,9 @@ set -a
 source "$FLEET_COMMODORE_CONFIG"
 set +a
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+: "${FLEET_COMMODORE_STATE_DIR:=$HOME/.local/state/fleet-commodore}"
+: "${FLEET_COMMODORE_LOG_DIR:=$FLEET_COMMODORE_STATE_DIR/logs}"
+mkdir -p "$FLEET_COMMODORE_LOG_DIR"
 # PYTHONUNBUFFERED=1 so logs flush immediately without a tee buffer.
 # Redirect stderr to stdout so tmux pane + file both capture everything.
-mkdir -p logs
-exec .venv/bin/python3 -u commodore.py >> logs/commodore.log 2>&1
+exec .venv/bin/python3 -u commodore.py >> "$FLEET_COMMODORE_LOG_DIR/commodore.log" 2>&1
