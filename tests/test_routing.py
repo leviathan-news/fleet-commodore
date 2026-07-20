@@ -29,13 +29,12 @@ def test_policy_bot_hq_mention_only_and_pr_allowed():
     assert p["allow_pr"] is True
 
 
-def test_policy_cave_mention_only():
-    """Squid Cave: mention_only (2026-05-14). Commodore stays in his lane —
-    no ambient social-director duty. Persona still defines voice when hailed."""
+def test_policy_cave_is_never_model_routed():
+    """Squid Cave is public: the poll loop handles direct hails with a fixed
+    decline before policy/context/model routing, so this policy is never."""
     p = _policy_for(SQUID_CAVE_GROUP_ID, 0)
-    assert p["speak"] == "mention_only"
+    assert p["speak"] == "never"
     assert p["ambient_cooldown_s"] == 0
-    assert "squid cave" in p["persona_suffix"].lower()
 
 
 def test_policy_monetization_mention_only_market_design_persona():
@@ -100,5 +99,5 @@ def test_no_room_runs_ambient():
 
 def test_policy_unknown_chat_is_never_noisy():
     p = _policy_for(-9999999999, 0)
-    assert p["speak"] == "mention_only"
+    assert p["speak"] == "never"
     assert p["ambient_cooldown_s"] == 0

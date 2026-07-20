@@ -154,6 +154,42 @@ def test_attachment_is_framed_as_untrusted_json_without_truncation():
     assert len(decoded["content"]) > 40_442
 
 
+def test_attachment_review_uses_a_no_tools_cli_profile(monkeypatch):
+    mod = _load_module()
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0, "STATUS: DECLINED\nREASON: test", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    mod.run_claude_qa("review attachment", attachment_present=True)
+
+    assert captured["argv"] == [
+        mod.CLAUDE_BIN, "--print", "--output-format", "text",
+        "--tools", "", "--strict-mcp-config",
+    ]
+    assert "Read" not in captured["argv"]
+    assert "WebFetch" not in captured["argv"]
+
+
+def test_ordinary_qa_keeps_its_separate_read_only_tool_profile(monkeypatch):
+    mod = _load_module()
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, "STATUS: DECLINED\nREASON: test", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    mod.run_claude_qa("ordinary question", attachment_present=False)
+
+    assert captured["argv"][-2] == "--allowed-tools"
+    assert "Read" in captured["argv"][-1]
+    assert "WebFetch" in captured["argv"][-1]
+
+
 def test_hostile_phrase_inside_attachment_does_not_reclassify_benign_question(tmp_path):
     """Only the request is preflighted; quoted document prose is DATA."""
     proc = _run_worker(

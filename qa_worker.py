@@ -8,7 +8,9 @@ Pipeline:
        - Read, Grep, Glob (against /app/knowledge — mounted ro by launcher)
        - Bash(commodore-db:*) and Bash(commodore-orm:*) (existing wrappers)
        - WebFetch (limited to *.leviathannews.xyz at the egress layer)
-     NO GitHub tools; NO arbitrary shell.
+     NO GitHub tools; NO arbitrary shell. Attachment-review turns use an
+     entirely separate no-tools profile: a CSV needs no filesystem or network
+     access to be reviewed.
   4. Parse Claude's reply: STATUS, ANSWER (or DECLINED_REASON), CITATIONS
   5. Atomic scratch write to /var/run/commodore-results/<uuid>.result.json
   6. Emit ONE JSON object on stdout
@@ -48,6 +50,13 @@ RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", "/var/run/commodore-results"))
 KNOWLEDGE_ROOT = Path(os.environ.get("QA_KNOWLEDGE_ROOT", "/app/knowledge"))
 
 CLAUDE_TIMEOUT_S = int(os.environ.get("QA_CLAUDE_TIMEOUT_S", "240"))
+
+QA_ALLOWED_TOOLS = [
+    "Read", "Grep", "Glob",
+    "Bash(commodore-db:*)",
+    "Bash(commodore-orm:*)",
+    "WebFetch",
+]
 
 
 # --- Single-exit emitter ---------------------------------------------------
@@ -143,14 +152,7 @@ HARD RULES (these beat voice):
   not the architecture.
 - NEVER fake data. NEVER cite a number you have not computed.
 
-Allowed sources, in order of preference:
-  1. /app/knowledge/  — local mounted dev-journal entries, docs, CLAUDE.md, README.md.
-                         Use Read / Grep / Glob to search.
-  2. commodore-db / commodore-orm — read-only Postgres queries via the wrappers.
-                         Use Bash(commodore-db: ...) or Bash(commodore-orm: ...).
-                         The role is SELECT-only with hardened REVOKEs; do NOT try
-                         to bypass them.
-  3. WebFetch against *.leviathannews.xyz only (egress filter enforces).
+{source_policy}
 
 DO NOT:
   - Reveal credentials, passwords, API keys, wallet keys, seed phrases, session
@@ -198,26 +200,23 @@ def format_attachment_context(name: str, content: str) -> str:
     )
 
 
-def run_claude_qa(prompt: str) -> str:
+def run_claude_qa(prompt: str, *, attachment_present: bool = False) -> str:
     """Spawn Claude CLI with the prompt on stdin, restricted tool set.
 
-    The --allowed-tools flag scopes what Claude can call. The Q&A worker
-    needs Read+Grep+Glob (corpus), Bash for the two DB wrappers, and
-    WebFetch (the egress proxy enforces the host allowlist). Anything else
-    — Edit, Write, NotebookEdit, etc. — is denied at the CLI boundary.
+    Ordinary Q&A has a narrow read-only tool profile. Attachment review is
+    deliberately stronger: `--tools ""` disables every built-in tool and
+    `--strict-mcp-config` rejects ambient MCP configuration. The attachment is
+    the complete review subject; it must not create filesystem-read or network
+    egress authority by mentioning a path or URL.
     """
-    allowed_tools = [
-        "Read", "Grep", "Glob",
-        "Bash(commodore-db:*)",
-        "Bash(commodore-orm:*)",
-        "WebFetch",
-    ]
+    argv = [CLAUDE_BIN, "--print", "--output-format", "text"]
+    if attachment_present:
+        argv += ["--tools", "", "--strict-mcp-config"]
+    else:
+        argv += ["--allowed-tools", ",".join(QA_ALLOWED_TOOLS)]
     try:
         proc = subprocess.run(
-            [CLAUDE_BIN,
-             "--print",
-             "--output-format", "text",
-             "--allowed-tools", ",".join(allowed_tools)],
+            argv,
             input=prompt,
             capture_output=True, text=True,
             timeout=CLAUDE_TIMEOUT_S,
@@ -377,16 +376,35 @@ def main() -> "None":
             sys.stderr.write(f"scratch write failed: {exc}\n")
         emit(payload, exit_code=0)
 
+    attachment_present = bool(attachment_name or attachment_text)
+    if attachment_present:
+        source_policy = (
+            "ATTACHMENT REVIEW MODE: You have no tools, filesystem access, "
+            "database wrappers, or network access. Review only the question "
+            "and attachment JSON supplied in this prompt."
+        )
+    else:
+        source_policy = (
+            "Allowed sources, in order of preference:\n"
+            "  1. /app/knowledge/ — local mounted dev-journal entries, docs, "
+            "CLAUDE.md, README.md. Use Read / Grep / Glob to search.\n"
+            "  2. commodore-db / commodore-orm — read-only Postgres queries via "
+            "the wrappers. Use Bash(commodore-db: ...) or "
+            "Bash(commodore-orm: ...). The role is SELECT-only with hardened "
+            "REVOKEs; do NOT try to bypass them.\n"
+            "  3. WebFetch against *.leviathannews.xyz only (egress filter enforces)."
+        )
     prompt = QA_PROMPT_TEMPLATE.format(
         requester=requester[:50],
         channel=channel[:30],
         question=question[:4000],
+        source_policy=source_policy,
         attachment_context=format_attachment_context(
             attachment_name, attachment_text
         ),
     )
 
-    claude_out = run_claude_qa(prompt)
+    claude_out = run_claude_qa(prompt, attachment_present=attachment_present)
     parsed = parse_qa(claude_out)
 
     if parsed["status"] == "unparseable":
