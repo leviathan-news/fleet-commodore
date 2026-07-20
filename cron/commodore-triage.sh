@@ -25,6 +25,11 @@ export TRIAGE_POSTING_ENABLED
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:$PATH"
 : "${FLEET_COMMODORE_STATE_DIR:=$HOME/.local/state/fleet-commodore}"
 : "${FLEET_COMMODORE_LOG_DIR:=$FLEET_COMMODORE_STATE_DIR/logs}"
+PYTHON_BIN=${FLEET_COMMODORE_PYTHON:-"$REPO_DIR/.venv/bin/python3"}
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Fleet Commodore Python runtime is unavailable: $PYTHON_BIN" >&2
+  exit 1
+fi
 mkdir -p "$FLEET_COMMODORE_LOG_DIR"
 
 # The ledger and executor lock deliberately live outside a mutable release
@@ -55,5 +60,5 @@ if [ "$#" -eq 0 ]; then
   set -- --scan-db
 fi
 
-"$REPO_DIR/.venv/bin/python3" -u "$REPO_DIR/triage/commodore_triage.py" \
+"$PYTHON_BIN" -u "$REPO_DIR/triage/commodore_triage.py" \
   "$@" >> "$FLEET_COMMODORE_LOG_DIR/triage.log" 2>&1

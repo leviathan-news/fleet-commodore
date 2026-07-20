@@ -46,6 +46,7 @@ NON_SECRET_ENV = (
     "FLEET_COMMODORE_CONFIG",
     "FLEET_COMMODORE_STATE_DIR",
     "COMMODORE_DB_FILE",
+    "FLEET_COMMODORE_PYTHON",
 )
 
 
@@ -138,6 +139,10 @@ def build_manifest(root: Path = ROOT) -> dict:
             feed_effective
             and Path(feed_effective).expanduser().is_absolute()
             and runtime["SEC_FEED_BIN_REALPATH"]
+        ),
+        "python_runtime_resolved": bool(
+            runtime["FLEET_COMMODORE_PYTHON"]
+            and _resolved_executable(runtime["FLEET_COMMODORE_PYTHON"])
         ),
     }
     aggregate = hashlib.sha256(
