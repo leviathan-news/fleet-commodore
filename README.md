@@ -19,7 +19,9 @@ source SHAs only during an explicitly recorded transition. Set
 Mini; a release worktree must never become the owner of tokens or mutable
 runtime configuration. Cron sets both that path and
 `FLEET_COMMODORE_RELEASE_DIR` for `cron/watchdog.sh`; the watchdog passes them
-to its tmux-launched chat daemon.
+to its tmux-launched chat daemon. Set `FLEET_COMMODORE_STATE_DIR` (and, when
+needed, explicit `COMMODORE_DB_FILE` / `TRIAGE_DB_FILE`) so chat history,
+triage fences, and logs survive artifact replacement.
 
 ## Build + run
 

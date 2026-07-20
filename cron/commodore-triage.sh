@@ -9,8 +9,6 @@
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
-LOG_DIR="$REPO_DIR/logs"
-mkdir -p "$LOG_DIR"
 
 : "${FLEET_COMMODORE_CONFIG:=$REPO_DIR/.env}"
 if [[ ! -r "$FLEET_COMMODORE_CONFIG" ]]; then
@@ -25,11 +23,14 @@ set +a
 : "${TRIAGE_POSTING_ENABLED:=0}"
 export TRIAGE_POSTING_ENABLED
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+: "${FLEET_COMMODORE_STATE_DIR:=$HOME/.local/state/fleet-commodore}"
+: "${FLEET_COMMODORE_LOG_DIR:=$FLEET_COMMODORE_STATE_DIR/logs}"
+mkdir -p "$FLEET_COMMODORE_LOG_DIR"
 
 # The ledger and executor lock deliberately live outside a mutable release
 # worktree. A worktree replacement must preserve completed receipts, pending
 # claims, and outcome_unknown fences instead of silently creating a new DB.
-: "${TRIAGE_STATE_DIR:=$HOME/.local/state/fleet-commodore}"
+: "${TRIAGE_STATE_DIR:=$FLEET_COMMODORE_STATE_DIR/triage}"
 mkdir -p "$TRIAGE_STATE_DIR"
 : "${TRIAGE_DB_FILE:=$TRIAGE_STATE_DIR/triage.db}"
 export TRIAGE_DB_FILE
@@ -55,4 +56,4 @@ if [ "$#" -eq 0 ]; then
 fi
 
 "$REPO_DIR/.venv/bin/python3" -u "$REPO_DIR/triage/commodore_triage.py" \
-  "$@" >> "$LOG_DIR/triage.log" 2>&1
+  "$@" >> "$FLEET_COMMODORE_LOG_DIR/triage.log" 2>&1

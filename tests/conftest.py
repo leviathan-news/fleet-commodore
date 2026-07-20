@@ -1,6 +1,7 @@
 """Shared test environment — set env BEFORE commodore module is imported."""
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 os.environ["BOT_TOKEN"] = "TEST_TOKEN"
@@ -13,6 +14,11 @@ os.environ["ATLAS_GROUP_ID"] = "-1004291361883"
 os.environ["LEV_SEC_GROUP_ID"] = "-1005363468256"
 os.environ["ADMIN_TELEGRAM_IDS"] = "1234982301"
 os.environ["OPERATOR_DM_USER_ID"] = "1234982301"
+# The production default is a service-owned state directory. Keep direct-handler
+# tests off the developer's home state while preserving SQLite's normal parent
+# directory contract.
+_TEST_STATE_DIR = Path(tempfile.mkdtemp(prefix="fleet-commodore-test-state-"))
+os.environ["COMMODORE_DB_FILE"] = str(_TEST_STATE_DIR / "commodore.db")
 # Per-test isolation for the file-backed scratch dir
 os.environ.setdefault("COMMODORE_RESULTS_DIR",
                       str(Path("/tmp") / "commodore-test-results"))

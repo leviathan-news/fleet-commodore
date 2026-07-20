@@ -44,6 +44,8 @@ NON_SECRET_ENV = (
     "TRIAGE_POSTING_ENABLED",
     "TRIAGE_OPERATOR_RECONCILE_ENABLED",
     "FLEET_COMMODORE_CONFIG",
+    "FLEET_COMMODORE_STATE_DIR",
+    "COMMODORE_DB_FILE",
 )
 
 
@@ -88,6 +90,27 @@ def _executable_sha256(value: str | None) -> str | None:
     return _sha256(path) if path.is_file() else None
 
 
+def _python_environment() -> dict[str, str | None]:
+    """Fingerprint the interpreter/environment that generated this manifest."""
+    version = sys.version.replace("\n", " ").strip()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "freeze", "--all"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        freeze_sha256 = hashlib.sha256(result.stdout.encode()).hexdigest()
+    except (OSError, subprocess.SubprocessError):
+        freeze_sha256 = None
+    return {
+        "python_executable": str(Path(sys.executable).resolve()),
+        "python_version": version,
+        "pip_freeze_sha256": freeze_sha256,
+    }
+
+
 def build_manifest(root: Path = ROOT) -> dict:
     files: dict[str, str] = {}
     for relative in ARTIFACT_FILES:
@@ -127,6 +150,7 @@ def build_manifest(root: Path = ROOT) -> dict:
         "artifact_sha256": aggregate,
         "files": files,
         "runtime": runtime,
+        "python_environment": _python_environment(),
         "readiness": readiness,
     }
 

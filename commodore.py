@@ -821,7 +821,11 @@ def sweep_stale_tmp_files() -> int:
 
 # --- SQLite (separate DB from Benthic - no schema collision) ----------------
 
-DB_FILE = BASE_DIR / "commodore.db"
+# The conversation/action ledger is service state, not release material. A
+# promotion must preserve it just as it preserves the separate triage ledger.
+DB_FILE = Path(os.environ.get(
+    "COMMODORE_DB_FILE", "~/.local/state/fleet-commodore/commodore.db"
+)).expanduser()
 
 
 _TOKEN_LEAK_RE = re.compile(r"x-access-token:[^@\s]+@", re.IGNORECASE)
