@@ -36,6 +36,7 @@ def test_wager_regex_allows_readonly_lookups():
 
 def test_detect_pr_request_true():
     assert _detect_pr_request("Please file a PR to fix the typo in docs")
+    assert _detect_pr_request("Can you fill a PR to fix this?")
     assert _detect_pr_request("commodore, open a pr that adds tests")
     assert _detect_pr_request("Draft a PR updating the README")
 

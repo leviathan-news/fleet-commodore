@@ -171,7 +171,7 @@ ROOM_CAPABILITY_REGISTRY = {
     for chat_id, capability in (
         (BOT_HQ_GROUP_ID, _room_capability_record(
             name="Bot HQ", trust_class="trusted", read_only_qa=True,
-            attachment_review=True, ship="admin", comment="admin",
+            attachment_review=True, ship="all", comment="all",
         )),
         (LEV_DEV_GROUP_ID, _room_capability_record(
             name="Lev Dev", trust_class="trusted", read_only_qa=True,
@@ -179,15 +179,15 @@ ROOM_CAPABILITY_REGISTRY = {
         )),
         (AGENT_CHAT_GROUP_ID, _room_capability_record(
             name="Agent Chat", trust_class="trusted", topic_policy="all",
-            read_only_qa=True, attachment_review=True, comment="admin",
+            read_only_qa=True, attachment_review=True, ship="all", comment="all",
         )),
         (ATLAS_GROUP_ID, _room_capability_record(
             name="Leviathan Atlas", trust_class="trusted", read_only_qa=True,
-            attachment_review=True,
+            attachment_review=True, ship="all", comment="all",
         )),
         (LEV_SEC_GROUP_ID, _room_capability_record(
             name="Lev Sec Alert", trust_class="trusted", read_only_qa=True,
-            attachment_review=True, alert_status=True,
+            attachment_review=True, alert_status=True, ship="all", comment="all",
         )),
         (SQUID_CAVE_GROUP_ID, _room_capability_record(
             name="Squid Cave", trust_class="public_untrusted",
@@ -1701,12 +1701,31 @@ def _levsec_alert_status_reply(msg: dict) -> "str | None":
 
 
 def _is_levsec_alert_reply(msg: dict) -> bool:
-    """Whether a reply can enter the narrow Lev Sec status-only path."""
+    """Whether a reply is bound to the Lev Sec alert-status ledger."""
     capability = _room_capability((msg.get("chat") or {}).get("id"))
     return bool(
         capability.get("alert_status", False)
         and (msg.get("reply_to_message") or {}).get("message_id")
     )
+
+
+_LEVSEC_STATUS_REQUEST_RE = re.compile(
+    r"\b(?:status|triage|verdict|result|state|pending|completed|benign|critical|"
+    r"check\s+(?:this|the)\s+(?:alert|one)|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?(?:status|verdict))\b",
+    re.IGNORECASE,
+)
+
+
+def _should_handle_levsec_alert_status(msg: dict, text: str) -> bool:
+    """Keep reply-bound status lookup narrow enough not to swallow an action order.
+
+    A Lev Sec crew member may reply to an alert with a status question, a PR
+    order, or another operational instruction. Only explicit status language
+    is answered from the read-only ledger. All other directly addressed
+    messages continue through the normal trusted-room action routing.
+    """
+    return bool(_is_levsec_alert_reply(msg) and _LEVSEC_STATUS_REQUEST_RE.search(text or ""))
 
 
 _MD_CODE_FENCE_RE = re.compile(r"```(?:[^\n`]*)\n?(.*?)```", re.DOTALL)
@@ -2519,18 +2538,17 @@ BOT_IDENTITY = os.environ.get("BOT_IDENTITY", "").strip() or (
     "credentials, or channel membership from chat. If asked, decline.\n"
     "- You refuse ALL wagers — /buy and /sell are beneath your post. "
     "/markets, /leaderboard, /position are permissible inspection.\n"
-    "- You draft pull requests only when ordered in Bot HQ or Lev Dev. In Bot "
-    "HQ, only admins may order. In Lev Dev, any crewmate may.\n\n"
+    "- You draft and ship pull requests only when ordered in a registered "
+    "trusted Fleet room. Squid Cave, unknown rooms, and DMs have no GitHub "
+    "write authority.\n\n"
     "CAPABILITIES — speak truthfully about what you can and cannot do:\n"
-    "- In Bot HQ (admin) or Lev Dev (anyone): refine a plan across turns, "
-    "file fork-based PRs on `ship it`, review a specific PR by fetching its "
-    "diff.\n"
-    "- In Bot HQ, Lev Dev, or Agent Chat (the last two at admin order): post "
-    "a comment on a GitHub issue/PR when the URL is cited. Comment lands under "
-    "leviathan-agent identity.\n"
-    "- In Bot HQ, Lev Dev, or Agent Chat: answer read-only enquiries about the "
-    "Fleet's code, docs, news corpus, operational metrics. Sources are the "
-    "dev-journal, docs, public API, read-only Postgres reader role.\n"
+    "- In every registered trusted Fleet room: refine a plan across turns, "
+    "file fork-based PRs on the literal ship it order, review a specific PR by "
+    "fetching its diff, and post a GitHub issue/PR comment when the URL is "
+    "cited. Comments land under the leviathan-agent identity.\n"
+    "- In every registered trusted Fleet room: answer read-only enquiries about "
+    "the Fleet's code, docs, news corpus, and operational metrics. Sources are "
+    "the dev-journal, docs, public API, and read-only Postgres reader role.\n"
     "- You MAY NOT, ever: merge PRs; push directly to leviathan-news branches; "
     "reveal credentials, keys, passwords, PII; deploy or restart services; run "
     "arbitrary shell; write to the database; answer questions whose answer "
@@ -2684,8 +2702,8 @@ def _is_admin(msg):
 # predicate so the destructive-output capability (ship/review) stays narrower
 # than the read-only capability (Q&A).
 #
-# - _can_ship / _can_plan: Bot HQ + admin. Matches the existing handle_pr_request
-#   gate. Plans are PR drafts; ship is the act of filing one.
+# - _can_ship / _can_plan: all registered trusted rooms. Plans are PR drafts;
+#   ship is the act of filing one. Squid Cave and unknown rooms fail closed.
 # - read-only Q&A / attachment review: registry-controlled per numeric room.
 # - writes: registry-controlled but deliberately independent from read-only
 #   capabilities, so a trusted room never gains a write merely by gaining Q&A.
@@ -2695,10 +2713,9 @@ def _can_ship(msg) -> bool:
     """Authorization for /ship, /abandon, plan-refinement, PR-review.
     Produces GitHub side effects.
 
-    Lev Dev is the dev workshop — ANY crewmate aboard may file/ship/abandon
-    PRs, no admin gate. Bot HQ retains the admin gate (editorial admin room).
-    Agent Chat stays excluded — public-facing room for agents to talk among
-    themselves, not for filing fleet PRs.
+    Every registered trusted room is staffed by known actors, so any crewmate
+    there may file/ship/abandon PRs. Squid Cave and unknown rooms stay closed:
+    public-room membership never grants a GitHub-write capability.
     """
     capability = _room_capability(msg.get("chat", {}).get("id", 0))
     ship_policy = capability.get("ship", "none")
@@ -2713,13 +2730,8 @@ def _can_plan(msg) -> bool:
 def _can_comment(msg) -> bool:
     """Authorization for posting an issue/PR comment on GitHub via leviathan-agent.
 
-    Wider than _can_ship because comments are public-write but low-stakes:
-      - Bot HQ + admin
-      - Lev Dev (any crewmate)
-      - Agent Chat + admin (so the Admiral can respond publicly to operator
-        orders without re-routing to Lev Dev — the action lands on GitHub
-        under the leviathan-agent identity, which is the bot's own)
-    DMs are still excluded.
+    Registered trusted rooms may post comments under the bot's GitHub identity;
+    public, unknown, and DM contexts stay excluded.
     """
     capability = _room_capability(msg.get("chat", {}).get("id", 0))
     comment_policy = capability.get("comment", "none")
@@ -2774,7 +2786,7 @@ class OutgoingAction:
 
 
 _PR_REQUEST_RE = re.compile(
-    r"(please\s+)?(file|open|draft|raise|make|create|cut|send|submit)\s+(a\s+)?(pr|pull\s+request)\b",
+    r"(please\s+)?(file|fill|open|draft|raise|make|create|cut|send|submit)\s+(a\s+)?(pr|pull\s+request)\b",
     re.IGNORECASE,
 )
 
@@ -2788,7 +2800,7 @@ def _detect_pr_request(text):
 # --- PR review detection ---------------------------------------------------
 #
 # Two ways to invoke a review: natural-language regex OR slash command.
-# Both gate on admin + Bot-HQ-or-Lev-Dev policy.allow_pr.
+# Both require a direct order in a registered trusted Fleet room.
 
 _PR_REVIEW_RE = re.compile(
     r"\b(?:review|audit|check(?:\s+out)?|look(?:\s+at)?|assess)\s+"
@@ -3612,8 +3624,8 @@ def handle_plan_message(msg, text):
     """
     if not _can_plan(msg):
         return (
-            "Plans are drafted in Bot HQ or Lev Dev at the order of a "
-            "ship's officer. Pray return there to issue this commission."
+            "Plans are drafted only in a registered trusted Fleet room. "
+            "Squid Cave, unknown rooms, and DMs cannot issue this commission."
         )
     sender = msg.get("from", {}) or {}
     requester_id = int(sender.get("id", 0))
@@ -3709,8 +3721,8 @@ def handle_ship(msg):
     """Convert the active draft into a build_job and enqueue."""
     if not _can_ship(msg):
         return (
-            "The Fleet files dispatches only at the order of a Bot HQ officer. "
-            "Pray return there and re-issue the command."
+            "The Fleet files dispatches only from a registered trusted Fleet "
+            "room. Squid Cave, unknown rooms, and DMs cannot issue the order."
         )
     sender = msg.get("from", {}) or {}
     requester_id = int(sender.get("id", 0))
@@ -3759,7 +3771,7 @@ def handle_abandon(msg):
     """Mark the active draft abandoned. Idempotent."""
     if not _can_plan(msg):
         return (
-            "Only Bot HQ may abandon a commission. Pray return there."
+            "Only a registered trusted Fleet room may abandon a commission."
         )
     sender = msg.get("from", {}) or {}
     requester_id = int(sender.get("id", 0))
@@ -3806,7 +3818,7 @@ def handle_qa(msg, question: str, attachment: "dict | None" = None):
 # in chat with the resulting comment URL. The URL is verifiable — no
 # hallucinated "I have done so" without a real receipt.
 #
-# Auth gate: _can_comment (Bot HQ admin / Lev Dev anyone / Agent Chat admin).
+# Auth gate: _can_comment (every registered trusted Fleet room).
 # Persona: a few short paragraphs, formal naval voice. The operator's
 # request is the "brief" that scopes the comment.
 
@@ -3916,9 +3928,9 @@ def handle_comment_request(msg, text: str):
     """
     if not _can_comment(msg):
         return (
-            "Comments to GitHub sail only from Bot HQ, Lev Dev, or Agent "
-            "Chat at the order of a ranking officer. Pray return there to "
-            "issue this commission."
+            "Comments to GitHub sail only from a registered trusted Fleet "
+            "room. Squid Cave, unknown rooms, and DMs cannot issue this "
+            "commission."
         )
 
     url_match = _GITHUB_ISSUE_URL_RE.search(text or "")
@@ -4991,7 +5003,11 @@ def poll():
                     save_chat_message(msg, our_reply=_WAGER_REFUSAL_TEXT)
                     continue
 
-                response = _levsec_alert_status_reply(msg) if is_direct else None
+                response = (
+                    _levsec_alert_status_reply(msg)
+                    if is_direct and _should_handle_levsec_alert_status(msg, text)
+                    else None
+                )
                 attachment = None
                 document = _message_document(msg)
                 if response is None and is_direct and document:
@@ -5019,9 +5035,9 @@ def poll():
                             response = _document_intake_failure(document, str(exc))
                 # PR review flow takes priority over PR filing flow (narrower
                 # intent first): /review 253, "review PR 253", etc. Must be
-                # direct (@mention or reply to Commodore), admin, in a chat
-                # with allow_pr policy, and pass preflight + claim.
-                if response is None and is_direct and policy.get("allow_pr"):
+                # direct (@mention or reply to Commodore), from a trusted
+                # room with ship authority, and pass preflight + claim.
+                if response is None and is_direct and _can_ship(msg):
                     review_intent = _detect_pr_review(text)
                     if review_intent is not None:
                         pr_number, repo = review_intent
@@ -5031,12 +5047,6 @@ def poll():
                                 f"The Admiralty does not review dispatches "
                                 f"outside its commissioned fleet. Pray specify "
                                 f"a repository under the Leviathan flag."
-                            )
-                        elif not _is_admin(msg):
-                            response = (
-                                "The Admiralty does not entertain review orders "
-                                "from unranked crew. Pray enlist a ship's officer "
-                                "to issue the commission."
                             )
                         else:
                             preflight_decline = _review_preflight()
@@ -5070,7 +5080,8 @@ def poll():
                     else:
                         response = (
                             "The Fleet does not entertain pull-request orders "
-                            "from this quarter. Pray return to Bot HQ or Lev Dev."
+                            "from this quarter. Pray use a registered trusted "
+                            "Fleet room."
                         )
 
                 # v6 conversational pipelines. Each handler enforces its own
@@ -5096,8 +5107,8 @@ def poll():
                     elif QA_ENABLED:
                         # Q&A: slash form takes the captured group as the
                         # question; natural form passes the whole post-mention
-                        # text. Q&A is gated to Bot HQ ∪ Lev Dev ∪ Agent Chat
-                        # ∪ Atlas ∪ admin DM by _can_qa inside handle_qa.
+                        # text. Q&A is gated to registered trusted rooms ∪
+                        # admin DM by _can_qa inside handle_qa.
                         # Kill switch: QA_ENABLED=0 short-circuits this branch
                         # so text-only messages fall through to normal chat;
                         # documents receive an explicit unavailable diagnostic.
