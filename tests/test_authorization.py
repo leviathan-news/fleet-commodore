@@ -15,6 +15,7 @@ BOT_HQ = int(commodore.BOT_HQ_GROUP_ID)
 LEV_DEV = int(commodore.LEV_DEV_GROUP_ID)
 AGENT_CHAT = int(commodore.AGENT_CHAT_GROUP_ID)
 ATLAS = int(commodore.ATLAS_GROUP_ID)
+LEV_SEC = int(commodore.LEV_SEC_GROUP_ID)
 SQUID_CAVE = int(commodore.SQUID_CAVE_GROUP_ID)
 ADMIN_ID = next(iter(commodore.ADMIN_TELEGRAM_IDS))
 NON_ADMIN_ID = 999_999_999
@@ -44,6 +45,7 @@ def msg(chat_id, sender_id, chat_type="supergroup"):
     # ship/plan deliberately gated like Agent Chat
     ("Atlas admin",        msg(ATLAS, ADMIN_ID),                           False, False, True),
     ("Atlas random",       msg(ATLAS, NON_ADMIN_ID),                       False, False, True),
+    ("Lev Sec random",     msg(LEV_SEC, NON_ADMIN_ID),                     False, False, True),
     # Squid Cave: nothing (not in privileged set)
     ("Squid Cave admin",   msg(SQUID_CAVE, ADMIN_ID),                      False, False, False),
     ("Squid Cave random",  msg(SQUID_CAVE, NON_ADMIN_ID),                  False, False, False),

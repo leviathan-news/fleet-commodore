@@ -7,11 +7,14 @@ the Fleet. Never wagers — declines `/buy` and `/sell` outright but may inspect
 
 Intended foil to **DeepSeaSquid**, the corsair bot that runs on moltbook.
 
-## Host
+## Host and release contract
 
-**Mac Mini only** (operator's laptop sleeps). Runs in Docker via Colima.
-See `docs/plans/2026-04-16-commodore-agent.md` in the squid-bot repo for the
-full hosting contract including the memory-reclamation prerequisite.
+**Mac Mini only.** The currently supported daemon launcher is `run.sh` under a
+single supervised session; do not treat a dirty developer checkout as a
+release. Promote a clean reviewed worktree/artifact, emit a secret-free
+manifest with `scripts/release_manifest.py`, and retain the prior immutable
+artifact for rollback. The chat daemon and triage cron may have different
+source SHAs only during an explicitly recorded transition.
 
 ## Build + run
 
@@ -36,19 +39,20 @@ the first line; `AGENT_WAGER_DENYLIST` is the backstop.
 
 ## Per-channel policy
 
-Per-chat-plus-topic policy lives in `commodore.py::_policy_for()`:
+Numeric chat IDs in `commodore.py::ROOM_CAPABILITY_REGISTRY` are the
+authorization source of truth; titles are display-only. All trusted rooms have
+direct read-only Q&A and bounded text-document review. Write capabilities stay
+independently scoped.
 
-| Channel | Topic | Speak | Notes |
-|---------|-------|-------|-------|
-| Bot HQ | — | mention-only | Admin-gated PR filing; crisp, technical |
-| Squid Cave | — | ambient, 1/5min | Social director; must not bury sticky panel |
-| Agent Chat | Start Here (154) | mention-only | Welcome new arrivals |
-| Agent Chat | Monetization (155) | mention-only | Formal disdain for wager talk |
-| Agent Chat | Sandbox (156) | ambient | Most relaxed, may banter with bots |
-| Agent Chat | OpSec (157) | mention-only, 0 ambient | Grave topic, only on direct hail |
-| Agent Chat | API Help (158) | ambient | Prime value-add; answer API questions |
-| Agent Chat | Human Lounge (159) | mention-only | Sparse; polite |
-| Agent Chat | Affiliate (1709) | mention-only | Address only on direct hail |
+| Room | Trust | Direct-hail contract | Writes |
+|------|-------|----------------------|--------|
+| Bot HQ | trusted | Q&A + attachment review | PR/ship: admin only |
+| Lev Dev | trusted | Q&A + attachment review | PR/ship: all crew |
+| Agent Chat | trusted, all topics | Q&A + attachment review | GitHub comments: admin only |
+| Leviathan Atlas | trusted | Q&A + attachment review | none |
+| Lev Sec Alert | trusted/security | Q&A + attachment review; reply-bound status | cron-only triage; no chat-triggered re-triage |
+| Squid Cave | public/untrusted | Fixed, rate-limited decline only | none; no model, worker, context, or file retrieval |
+| Unknown room | unclassified | Silent/fail closed | none |
 
 ## PR filing (v1)
 
@@ -82,9 +86,11 @@ Intake accepts UTF-8 `.md`, `.markdown`, `.txt`, `.rst`, `.json`, `.csv`,
 is 128 KiB and `TELEGRAM_TEXT_DOCUMENT_MAX_BYTES` may lower it or raise it only
 up to the hard 256 KiB ceiling. The worker receives the attachment separately
 from the asker's question and labels it untrusted data; text inside the file is
-never treated as instructions. Rejections and retrieval failures acknowledge
-that the attachment arrived and state the safe reason, without logging the bot
-token, authenticated file URL, or document body.
+never treated as instructions. Attachment-review turns use a **no-tools**
+Claude profile: no `Read`, `WebFetch`, database wrapper, shell, filesystem, or
+network access. Rejections and retrieval failures acknowledge that the
+attachment arrived and state the safe reason, without logging the bot token,
+authenticated file URL, or document body.
 
 ## Tests
 
@@ -99,9 +105,13 @@ Server-side denylist tests live in the squid-bot repo at
 ## Lev Sec triage failsafe
 
 `triage/commodore_triage.py` coalesces accepted Lev Sec deliveries into one
-read-only Sonnet investigation. It uses its own `triage/triage.db` ledger rather
-than `commodore.db`, and defaults to `TRIAGE_POSTING_ENABLED=0`; dry-runs never
-post or retain a completed claim.
+read-only Sonnet investigation. It uses a service-owned external
+`TRIAGE_DB_FILE` ledger rather than `commodore.db`, and defaults to
+`TRIAGE_POSTING_ENABLED=0`; dry-runs never post or retain a completed claim.
+A passing empty-queue dry-run is not a readiness signal: run the exact cron
+wrapper with `--provider-probe` to force one no-post Sonnet call before a live
+post gate. Live posting requires a pinned `TRIAGE_OPERATOR_DM_USER_ID` (or
+`OPERATOR_DM_USER_ID`) for a direct, deduplicated failure DM.
 
 An ambiguous Telegram result remains `outcome_unknown` and is never retried.
 Its local inspect/list/receipt-reconciliation commands are separately default-off
@@ -113,11 +123,13 @@ install the following failsafe schedule. It only runs the DB-delivery scan; it
 does not restart the bot or add a Telegram polling hook.
 
 ```cron
-*/5 * * * * /Users/gerrithall/dev/leviathan/fleet-commodore/cron/commodore-triage.sh
+*/5 * * * * /path/to/immutable/fleet-commodore/cron/commodore-triage.sh
 ```
 
-The explicit live-post decision remains outside this setup. See
-`triage/HANDOFF.md` and `triage/RUNBOOK.md`.
+The wrapper owns a service-state directory outside the worktree and an atomic
+single-executor lock. A stale lock is fail-closed and must be inspected, not
+deleted blindly. The explicit live-post decision remains outside this setup.
+See `triage/HANDOFF.md` and `triage/RUNBOOK.md`.
 
 ## Plan
 

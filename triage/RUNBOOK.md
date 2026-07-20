@@ -83,6 +83,35 @@ Commodore**.
   instructions. Do not use or repeat links, URLs, Markdown, bracket syntax, or
   backticks in the note; only plain text plus the allowed Telegram HTML tags is valid.
 
+## Release and watched-go-live gates
+
+Do not promote from a dirty checkout or replace the triage worktree while its
+ledger is inside that worktree. The release artifact and its prior rollback
+artifact must be recorded first with:
+
+1. `git` SHA plus `scripts/release_manifest.py` output;
+2. absolute `TRIAGE_DB_FILE`, atomic backup/checksum, schema compatibility,
+   and counts for pending, claimed, completed, and `outcome_unknown` rows;
+3. absolute `SEC_FEED_BIN` realpath, owner/mode, checksum, and fixed Lev Sec
+   command contract; and
+4. a pinned `TRIAGE_OPERATOR_DM_USER_ID` (or `OPERATOR_DM_USER_ID`) that is
+   Gerrit's direct Telegram DM destination, not an inferred admin.
+
+Before `TRIAGE_POSTING_ENABLED=1`, run the installed, manifest-pinned cron
+wrapper with `--provider-probe`. It must make a real no-post Sonnet invocation
+and print `TRIAGE_PROVIDER_PROBE_OK`; an empty-queue `--dry-run` is not a
+provider gate. Then render a fixture locally, arm exactly one cron schedule,
+and observe one receipt-bound live post. The wrapper acquires an external
+single-executor lock; if that lock is stale, stop and inspect it rather than
+deleting it blindly.
+
+Watch the release through a defined soak window. Alert Gerrit directly for a
+missing heartbeat, stale scan watermark, repeated retryable failures, provider
+cooldown, unresolved `outcome_unknown`, or more than one executor. Rollback is
+the inverse quiesced cutover: disarm posting, acquire the lock, preserve and
+check the ledger, swap to the compatible immutable artifact, verify one
+manifest-pinned schedule, then re-arm only after the same gates pass.
+
 ## Operator-only ambiguous-send reconciliation
 
 If the control plane records `outcome_unknown`, it crossed the durable pre-send

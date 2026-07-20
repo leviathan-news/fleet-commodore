@@ -29,6 +29,7 @@ def triage(tmp_path, monkeypatch):
     monkeypatch.setenv("COALESCE_WINDOW_S", "0")
     monkeypatch.setenv("COALESCE_MAX_WAIT_S", "0")
     monkeypatch.setenv("TRIAGE_POSTING_ENABLED", "0")
+    monkeypatch.setenv("TRIAGE_OPERATOR_DM_USER_ID", "1234982301")
     name = f"commodore_triage_test_{tmp_path.name}"
     spec = importlib.util.spec_from_file_location(name, TRIAGE_SCRIPT)
     module = importlib.util.module_from_spec(spec)
@@ -83,13 +84,99 @@ def test_claude_is_leashed_to_sec_feed_and_read_only_tools(triage, monkeypatch):
     monkeypatch.setattr(triage.subprocess, "run", fake_run)
     assert triage.ask_claude("investigate") == _valid_note()
     assert captured["argv"] == [
-        triage.CLAUDE_BIN, "-p", "-", "--model", "sonnet", "--allowedTools",
+        triage._validated_claude_bin(), "-p", "-", "--model", "sonnet", "--allowedTools",
         triage.CLAUDE_ALLOWED_TOOLS,
     ]
     assert captured["kwargs"]["input"] == "investigate"
     assert captured["kwargs"].get("shell", False) is False
     assert triage.CLAUDE_ALLOWED_TOOLS == "Bash(sec_feed:*)"
     assert "Read" not in triage.CLAUDE_ALLOWED_TOOLS
+
+
+def test_provider_probe_forces_model_without_tools_or_telegram(triage, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(triage, "_validated_claude_bin", lambda: "/opt/homebrew/bin/claude")
+    monkeypatch.setattr(
+        triage.subprocess,
+        "run",
+        lambda argv, **kwargs: captured.update(argv=argv, kwargs=kwargs) or SimpleNamespace(
+            returncode=0,
+            stdout="TRIAGE_PROVIDER_PROBE_OK\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        triage,
+        "send_message",
+        lambda *_args, **_kwargs: pytest.fail("provider probe must not send Telegram"),
+    )
+
+    result = triage.provider_probe()
+
+    assert result == {
+        "claude_bin": "/opt/homebrew/bin/claude",
+        "result": "TRIAGE_PROVIDER_PROBE_OK",
+    }
+    assert captured["argv"] == [
+        "/opt/homebrew/bin/claude", "-p", "-", "--model", "sonnet",
+        "--tools", "", "--strict-mcp-config",
+    ]
+    assert captured["kwargs"]["input"] == triage._PROVIDER_PROBE_PROMPT
+
+
+def test_provider_failure_alerts_pinned_operator_once(triage, monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        triage,
+        "send_message",
+        lambda chat_id, text, **kwargs: sent.append((chat_id, text)) or {
+            "ok": True, "result": {"message_id": 123}
+        },
+    )
+
+    triage._record_claude_failure("missing executable", limit_error=False)
+    triage._record_claude_failure("missing executable", limit_error=False)
+
+    assert len(sent) == 1
+    assert sent[0][0] == triage.TRIAGE_OPERATOR_DM_USER_ID
+    assert "retryable" in sent[0][1]
+
+
+def test_live_posting_refuses_unpinned_operator_alert_channel(triage, monkeypatch):
+    monkeypatch.setattr(triage, "TRIAGE_OPERATOR_DM_USER_ID", 0)
+    monkeypatch.setenv("TRIAGE_POSTING_ENABLED", "1")
+    with pytest.raises(triage.TriageError, match="pinned TRIAGE_OPERATOR_DM_USER_ID"):
+        triage.process_pending(dry_run=False)
+
+
+def test_release_status_reports_external_ledger_and_readiness_state(triage):
+    triage.enqueue_alert(VALID_ALERT_A, "one")
+    with triage._connect() as conn:
+        triage._set_state(conn, "provider_probe_at", "2026-07-20T00:00:00+00:00")
+
+    status = triage.release_status()
+
+    assert status["triage_db_file"] == str(triage.DB_FILE)
+    assert status["pending_alerts"] == 1
+    assert status["operator_dm_configured"] is True
+    assert status["state"]["provider_probe_at"] == "2026-07-20T00:00:00+00:00"
+
+
+def test_release_status_on_missing_ledger_is_read_only(triage, tmp_path):
+    missing = tmp_path / "absent" / "triage.db"
+
+    status = triage.release_status(db_file=missing)
+
+    assert status["ledger_present"] is False
+    assert status["pending_alerts"] is None
+    assert not missing.exists()
+
+
+def test_feed_wrapper_must_be_an_explicit_absolute_executable(triage, monkeypatch):
+    monkeypatch.setattr(triage, "SEC_FEED_BIN", "sec_feed")
+
+    with pytest.raises(triage.TriageError, match="absolute, manifest-pinned"):
+        triage._validated_sec_feed_bin()
 
 
 def test_triage_sender_uses_one_direct_html_request_without_conversational_retry(
@@ -149,6 +236,31 @@ def test_scan_queues_only_feed_deliveries_and_advances_watermark(triage, monkeyp
         "SELECT state_value FROM triage_state WHERE state_key='scan_watermark'",
     )
     assert watermark == [(created_at,)]
+
+
+def test_scan_binds_original_levsec_message_for_status_lookup(triage, monkeypatch):
+    created_at = datetime.now(timezone.utc).isoformat()
+    monkeypatch.setattr(
+        triage,
+        "_scan_feed_json",
+        lambda args: [{
+            "alert_id": VALID_ALERT_A,
+            "signal": "detector_log_error",
+            "severity": "critical",
+            "created_at": created_at,
+            "levsec_delivery": {
+                "delivered": True,
+                "status": "accepted",
+                "telegram_message_id": 777,
+            },
+        }],
+    )
+
+    assert triage.scan_db() == 1
+    assert _rows(
+        triage.DB_FILE,
+        "SELECT alert_id, levsec_chat_id, levsec_message_id FROM triage_alert_bindings",
+    ) == [(VALID_ALERT_A, triage.LEV_SEC_CHAT_ID, 777)]
 
 
 def test_fast_path_enriches_uuid_only_summary_from_read_only_feed(triage, monkeypatch):
@@ -305,7 +417,7 @@ def test_breaker_probe_has_the_same_read_only_tool_leash(triage, monkeypatch):
     monkeypatch.setattr(triage.subprocess, "run", fake_run)
     assert triage._claude_available() is True
     assert captured["argv"] == [
-        triage.CLAUDE_BIN, "-p", "-", "--allowedTools", triage.CLAUDE_ALLOWED_TOOLS,
+        triage._validated_claude_bin(), "-p", "-", "--allowedTools", triage.CLAUDE_ALLOWED_TOOLS,
     ]
 
 

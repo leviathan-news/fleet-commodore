@@ -107,6 +107,7 @@ SQUID_CAVE_GROUP_ID = int(os.environ.get("SQUID_CAVE_GROUP_ID", "0"))
 AGENT_CHAT_GROUP_ID = int(os.environ.get("AGENT_CHAT_GROUP_ID", "0"))
 LEV_DEV_GROUP_ID = int(os.environ.get("LEV_DEV_GROUP_ID", "0"))
 ATLAS_GROUP_ID = int(os.environ.get("ATLAS_GROUP_ID", "0"))
+LEV_SEC_GROUP_ID = int(os.environ.get("LEV_SEC_GROUP_ID", "0"))
 
 # Telegram user_ids authorized to request draft PR filing from Bot HQ.
 ADMIN_TELEGRAM_IDS = _parse_int_set("ADMIN_TELEGRAM_IDS")
@@ -121,6 +122,106 @@ AGENT_CHAT_TOPICS = {
     "human_lounge": int(os.environ.get("AGENT_CHAT_TOPIC_HUMAN_LOUNGE", "159")),
     "affiliate": int(os.environ.get("AGENT_CHAT_TOPIC_AFFILIATE", "1709")),
 }
+
+# --- Room capability registry ----------------------------------------------
+#
+# Chat identity is the immutable numeric Telegram chat id. Titles are useful
+# display text only and must never grant a capability.  The registry is the
+# sole read-only and attachment-review authorization surface; write actions
+# remain independently scoped below.
+_UNCLASSIFIED_ROOM = {
+    "name": "Unclassified room",
+    "trust_class": "unclassified",
+    "topic_policy": "none",
+    "read_only_qa": False,
+    "attachment_review": False,
+    "alert_status": False,
+    "ship": "none",
+    "comment": "none",
+}
+
+
+def _room_capability_record(
+    *,
+    name: str,
+    trust_class: str,
+    topic_policy: str = "all",
+    read_only_qa: bool = False,
+    attachment_review: bool = False,
+    alert_status: bool = False,
+    ship: str = "none",
+    comment: str = "none",
+) -> dict:
+    return {
+        "name": name,
+        "trust_class": trust_class,
+        "topic_policy": topic_policy,
+        "read_only_qa": read_only_qa,
+        "attachment_review": attachment_review,
+        "alert_status": alert_status,
+        "ship": ship,
+        "comment": comment,
+    }
+
+
+# Do not register an unset ``0`` id.  An omitted room must fail closed rather
+# than accidentally inheriting another room's policy.
+ROOM_CAPABILITY_REGISTRY = {
+    chat_id: capability
+    for chat_id, capability in (
+        (BOT_HQ_GROUP_ID, _room_capability_record(
+            name="Bot HQ", trust_class="trusted", read_only_qa=True,
+            attachment_review=True, ship="admin", comment="admin",
+        )),
+        (LEV_DEV_GROUP_ID, _room_capability_record(
+            name="Lev Dev", trust_class="trusted", read_only_qa=True,
+            attachment_review=True, ship="all", comment="all",
+        )),
+        (AGENT_CHAT_GROUP_ID, _room_capability_record(
+            name="Agent Chat", trust_class="trusted", topic_policy="all",
+            read_only_qa=True, attachment_review=True, comment="admin",
+        )),
+        (ATLAS_GROUP_ID, _room_capability_record(
+            name="Leviathan Atlas", trust_class="trusted", read_only_qa=True,
+            attachment_review=True,
+        )),
+        (LEV_SEC_GROUP_ID, _room_capability_record(
+            name="Lev Sec Alert", trust_class="trusted", read_only_qa=True,
+            attachment_review=True, alert_status=True,
+        )),
+        (SQUID_CAVE_GROUP_ID, _room_capability_record(
+            name="Squid Cave", trust_class="public_untrusted",
+            topic_policy="none",
+        )),
+    )
+    if chat_id
+}
+
+
+def _room_capability(chat_id: int | str | None) -> dict:
+    """Return the immutable capability record for one numeric chat id."""
+    try:
+        numeric_id = int(chat_id or 0)
+    except (TypeError, ValueError):
+        return _UNCLASSIFIED_ROOM
+    return ROOM_CAPABILITY_REGISTRY.get(numeric_id, _UNCLASSIFIED_ROOM)
+
+
+def _room_allows_topic(capability: dict, topic_id: int | None) -> bool:
+    """Apply only an explicit topic contract; Agent Chat is intentional all-topic."""
+    policy = capability.get("topic_policy", "none")
+    if policy == "all":
+        return True
+    if policy == "none":
+        return False
+    return int(topic_id or 0) in policy
+
+
+# Shared, service-owned triage ledger. It lives outside a release worktree so
+# chat status reads and cron cutovers preserve fences and receipt history.
+TRIAGE_DB_FILE = Path(os.environ.get(
+    "TRIAGE_DB_FILE", "~/.local/state/fleet-commodore/triage.db"
+)).expanduser()
 
 # Leviathan News relay endpoint (Mode B receipt after native sendMessage).
 LN_API_BASE = os.environ.get("LN_API_BASE", "https://api.leviathannews.xyz/api/v1")
@@ -174,8 +275,22 @@ CLAUDE_OUTAGE_REPLY = (
 # ADMIN_TELEGRAM_IDS entry if env not set.
 OPERATOR_DM_USER_ID = int(os.environ.get("OPERATOR_DM_USER_ID", "0") or 0)
 
-ALLOWED_TOOLS = "WebSearch,WebFetch,Read,Grep,Glob"
+# Conversational chat remains a separate, trusted-room capability. Attachment
+# reviews never inherit this tool profile; qa_worker.py uses a no-tools profile
+# whenever it receives attachment content.
+CHAT_ALLOWED_TOOLS = "WebSearch,WebFetch,Read,Grep,Glob"
 POLL_TIMEOUT = 30
+
+# Squid Cave is the one deliberate public/untrusted room. Its response is
+# static (never reflects attacker text) and rate-limited so the bot cannot be
+# used as a public reply amplifier.
+PUBLIC_ROOM_DECLINE = (
+    "Squid Cave is a public quarter. I cannot process inquiries or attachments "
+    "here; hail me in a trusted wardroom."
+)
+PUBLIC_ROOM_DECLINE_COOLDOWN_S = int(
+    os.environ.get("PUBLIC_ROOM_DECLINE_COOLDOWN_S", "300")
+)
 
 # Telegram documents are user-controlled input.  Keep the accepted surface
 # deliberately narrow and bounded: enough for editorial Markdown packets such
@@ -213,6 +328,12 @@ _BASE_POLICY = {
 def _policy_for(chat_id, topic_id):
     """Return the (chat_id, topic_id) policy dict, falling back to chat-only."""
     topic_id = int(topic_id or 0)
+
+    # A missing registry record is never a conversational fallback. Unknown
+    # rooms are silent, and Squid Cave is handled by the earlier fixed-decline
+    # gate in poll() before message text enters any general routing path.
+    if _room_capability(chat_id)["trust_class"] != "trusted":
+        return {**_BASE_POLICY, "speak": "never"}
 
     if chat_id == BOT_HQ_GROUP_ID:
         return {
@@ -447,6 +568,48 @@ def _is_mention_of_benthic(msg, text_lower):
     return f"@{BENTHIC_BOT_USERNAME}" in text_lower
 
 
+def _is_fixed_public_hail(msg: dict) -> bool:
+    """Minimal direct-hail check used only inside the public-room gate.
+
+    This deliberately performs no context lookup, history write, attachment
+    inspection, model dispatch, or persona routing.  It recognizes only a
+    reply to the Commodore or one bounded textual/structured mention so Squid
+    Cave can receive a static decline without becoming a reply amplifier.
+    """
+    reply_sender = (msg.get("reply_to_message") or {}).get("from", {}) or {}
+    if (reply_sender.get("username") or "").lower() == BOT_USERNAME:
+        return True
+    text = _message_text(msg)
+    if not text:
+        return False
+    return _is_mention_of_commodore(msg, text[:500].lower())
+
+
+def _handle_public_untrusted_message(msg: dict) -> None:
+    """Issue a fixed, rate-limited Squid Cave decline and do nothing else."""
+    chat_id = int((msg.get("chat") or {}).get("id") or 0)
+    sender = msg.get("from") or {}
+    if not chat_id or sender.get("username", "").lower() == BOT_USERNAME:
+        return
+    if not _is_fixed_public_hail(msg):
+        return
+    now = time.time()
+    if now - _public_decline_last_by_chat.get(chat_id, 0.0) < PUBLIC_ROOM_DECLINE_COOLDOWN_S:
+        return
+    try:
+        send_message(
+            chat_id,
+            PUBLIC_ROOM_DECLINE,
+            thread_id=msg.get("message_thread_id"),
+            reply_to=msg.get("message_id"),
+        )
+    except Exception as exc:
+        # Do not reflect any attacker-controlled text or metadata in this log.
+        log.warning("public-room decline send failed for chat %s: %s", chat_id, type(exc).__name__)
+        return
+    _public_decline_last_by_chat[chat_id] = now
+
+
 def _nemesis_recently_present(recent_messages, lookback=5):
     """True if any of the last `lookback` messages in the buffer came from
     the Nemesis. Used to decide whether to escalate the persona tone and
@@ -549,6 +712,9 @@ _responded = set()
 _thread_depth = {}
 _msg_root = {}
 _ambient_last_post_by_chat = {}
+# Public-room decline state is intentionally memory-only: restart merely
+# restores one static response opportunity; it never unlocks Q&A or tools.
+_public_decline_last_by_chat = {}
 # Last time we broke silence specifically to engage the Nemesis (per chat).
 # Guards `NEMESIS_AMBIENT_COOLDOWN_S` so the rivalry is a running joke, not spam.
 _nemesis_ambient_last_by_chat = {}
@@ -921,6 +1087,23 @@ def _ensure_tables():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_benthic_pending_open "
             "ON benthic_pending(answered_at, cleared_at, mentioned_at)"
+        )
+        # Membership changes are an auditable signal, never an implicit grant.
+        # Unknown ids remain unclassified in the in-memory registry and cannot
+        # reach a worker/model path.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS room_membership_event (
+                update_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                old_status TEXT,
+                new_status TEXT,
+                registry_trust_class TEXT NOT NULL,
+                observed_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_room_membership_event_chat "
+            "ON room_membership_event(chat_id, observed_at)"
         )
         # Bring pre-existing pr_review rows up to v6 schema so the recovery
         # path can rely on these columns being present on every row.
@@ -1450,6 +1633,78 @@ def download_telegram_text_document(msg: dict) -> dict:
     return {"name": name, "text": body, "size": len(raw)}
 
 
+def _levsec_alert_status_reply(msg: dict) -> "str | None":
+    """Return a redacted status for one directly replied-to Lev Sec alert.
+
+    Textual alert ids are intentionally not an input to this lookup. A reply
+    must bind the same numeric chat id, original Lev Sec message id, and a
+    ledger-recorded alert id. This path never calls the model, sec_feed, or a
+    control-plane enqueue operation.
+    """
+    capability = _room_capability((msg.get("chat") or {}).get("id"))
+    if not capability.get("alert_status", False):
+        return None
+    parent = msg.get("reply_to_message") or {}
+    try:
+        parent_message_id = int(parent.get("message_id"))
+    except (TypeError, ValueError):
+        return None
+    if parent_message_id <= 0:
+        return None
+    if not TRIAGE_DB_FILE.exists():
+        return (
+            "I cannot read the Lev Sec status ledger at present. I will not "
+            "select or re-triage an alert from chat."
+        )
+    chat_id = int((msg.get("chat") or {}).get("id") or 0)
+    try:
+        conn = sqlite3.connect(f"file:{TRIAGE_DB_FILE}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                """SELECT t.post_state, t.verdict
+                   FROM triage_alert_bindings b
+                   LEFT JOIN triaged_alerts t ON t.alert_id=b.alert_id
+                   WHERE b.levsec_chat_id=? AND b.levsec_message_id=?
+                   ORDER BY b.observed_at DESC LIMIT 1""",
+                (chat_id, parent_message_id),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        log.error("Lev Sec status ledger read failed")
+        return "I cannot read the Lev Sec status ledger at present; no chat re-triage will be attempted."
+
+    if row is None:
+        return (
+            "I can report only on an accepted Lev Sec alert by replying directly "
+            "to its original alert message. I will not select an alert from text alone."
+        )
+    state = row["post_state"] or "pending"
+    if state == "completed":
+        verdict = re.sub(r"[^a-z_]", "", str(row["verdict"] or "recorded").lower())
+        return f"The replied-to Lev Sec alert is triaged: **{verdict or 'recorded'}**."
+    if state == "outcome_unknown":
+        return (
+            "The replied-to alert has a held, ambiguous Telegram outcome. It is "
+            "awaiting operator reconciliation and will not be resent automatically."
+        )
+    if state in {"claimed", "send_started"}:
+        return "The replied-to alert is under the fenced triage process; await its recorded result."
+    if state == "operator_closed_no_resend":
+        return "The replied-to alert was closed by operator reconciliation without an automatic resend."
+    return "The replied-to alert is accepted and pending the fenced triage process."
+
+
+def _is_levsec_alert_reply(msg: dict) -> bool:
+    """Whether a reply can enter the narrow Lev Sec status-only path."""
+    capability = _room_capability((msg.get("chat") or {}).get("id"))
+    return bool(
+        capability.get("alert_status", False)
+        and (msg.get("reply_to_message") or {}).get("message_id")
+    )
+
+
 _MD_CODE_FENCE_RE = re.compile(r"```(?:[^\n`]*)\n?(.*?)```", re.DOTALL)
 _MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -1969,7 +2224,7 @@ def _claude_ask(prompt, timeout=120, retries=2):
             # has its own subprocess in qa_worker.py with its own effort
             # setting for substantive research questions.
             result = subprocess.run(
-                [CLAUDE_BIN, "-p", "-", "--allowedTools", ALLOWED_TOOLS],
+                [CLAUDE_BIN, "-p", "-", "--allowedTools", CHAT_ALLOWED_TOOLS],
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -2018,13 +2273,8 @@ def _claude_ask(prompt, timeout=120, retries=2):
 
 
 def _operator_dm_user_id() -> int:
-    """Operator's user_id for outage DMs. Env override OPERATOR_DM_USER_ID
-    wins; otherwise first ADMIN_TELEGRAM_IDS entry."""
-    if OPERATOR_DM_USER_ID:
-        return OPERATOR_DM_USER_ID
-    if ADMIN_TELEGRAM_IDS:
-        return int(next(iter(ADMIN_TELEGRAM_IDS)))
-    return 0
+    """Pinned operator DM destination; never infer one from an admin set."""
+    return OPERATOR_DM_USER_ID if OPERATOR_DM_USER_ID > 0 else 0
 
 
 def _alert_operator_claude_down(reason: str = "") -> None:
@@ -2094,6 +2344,91 @@ def _alert_operator_claude_down(reason: str = "") -> None:
             conn.close()
     except Exception as exc:
         log.warning("operator alert failed: %s", exc)
+
+
+def _alert_operator_unclassified_room(chat_id: int, new_status: str) -> None:
+    """Fail loud on a bot membership the registry does not recognize."""
+    operator_id = _operator_dm_user_id()
+    if not operator_id:
+        log.critical(
+            "unclassified room membership chat=%s status=%s; "
+            "OPERATOR_DM_USER_ID is not configured",
+            chat_id, new_status,
+        )
+        return
+    try:
+        response = send_message(
+            operator_id,
+            "Commodore release alert: an unclassified Telegram room membership "
+            f"was observed (chat {chat_id}, status {new_status}). No Q&A, "
+            "attachment retrieval, model, or write capability is enabled. "
+            "Review and promote an explicit numeric registry entry before use.",
+        )
+        if not (isinstance(response, dict) and response.get("ok") is True):
+            log.error("unclassified-room operator DM did not receive a Telegram receipt")
+    except Exception as exc:
+        log.error("unclassified-room operator DM failed: %s", type(exc).__name__)
+
+
+def _record_membership_update(update: dict) -> None:
+    """Persist every membership lifecycle update; unknown rooms stay closed."""
+    member = update.get("my_chat_member") or {}
+    chat = member.get("chat") or {}
+    chat_id = int(chat.get("id") or 0)
+    if not chat_id:
+        return
+    old_status = str((member.get("old_chat_member") or {}).get("status") or "unknown")
+    new_status = str((member.get("new_chat_member") or {}).get("status") or "unknown")
+    capability = _room_capability(chat_id)
+    try:
+        conn = sqlite3.connect(str(DB_FILE), timeout=5)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """INSERT OR IGNORE INTO room_membership_event(
+                    update_id, chat_id, old_status, new_status,
+                    registry_trust_class, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    int(update.get("update_id") or 0),
+                    chat_id,
+                    old_status,
+                    new_status,
+                    capability["trust_class"],
+                    _now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.error("membership lifecycle record failed for chat %s: %s", chat_id, type(exc).__name__)
+        return
+
+    if capability["trust_class"] == "unclassified":
+        log.warning("unclassified room membership chat=%s status=%s", chat_id, new_status)
+        _alert_operator_unclassified_room(chat_id, new_status)
+
+
+def _record_chat_migration(msg: dict) -> None:
+    """Treat a Telegram group migration as a new, unclassified numeric id."""
+    source_id = int((msg.get("chat") or {}).get("id") or 0)
+    target_id = msg.get("migrate_to_chat_id")
+    try:
+        target_id = int(target_id)
+    except (TypeError, ValueError):
+        return
+    if not source_id or not target_id:
+        return
+    synthetic = {
+        "update_id": -int(msg.get("message_id") or 0),
+        "my_chat_member": {
+            "chat": {"id": target_id},
+            "old_chat_member": {"status": "migrated_from"},
+            "new_chat_member": {"status": "unclassified_migration"},
+        },
+    }
+    _record_membership_update(synthetic)
 
 
 def llm_ask(prompt, timeout=120, is_direct: bool = False):
@@ -2347,11 +2682,9 @@ def _is_admin(msg):
 #
 # - _can_ship / _can_plan: Bot HQ + admin. Matches the existing handle_pr_request
 #   gate. Plans are PR drafts; ship is the act of filing one.
-# - _can_qa: Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ admin in DM. Read-only; can be
-#   wider safely.
-
-_PRIVILEGED_CHAT_IDS = (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID, AGENT_CHAT_GROUP_ID, ATLAS_GROUP_ID)
-_SHIP_CHAT_IDS = (BOT_HQ_GROUP_ID, LEV_DEV_GROUP_ID)
+# - read-only Q&A / attachment review: registry-controlled per numeric room.
+# - writes: registry-controlled but deliberately independent from read-only
+#   capabilities, so a trusted room never gains a write merely by gaining Q&A.
 
 
 def _can_ship(msg) -> bool:
@@ -2363,14 +2696,9 @@ def _can_ship(msg) -> bool:
     Agent Chat stays excluded — public-facing room for agents to talk among
     themselves, not for filing fleet PRs.
     """
-    chat_id = msg.get("chat", {}).get("id", 0)
-    if not chat_id:
-        return False
-    if chat_id == LEV_DEV_GROUP_ID:
-        return True
-    if chat_id == BOT_HQ_GROUP_ID and _is_admin(msg):
-        return True
-    return False
+    capability = _room_capability(msg.get("chat", {}).get("id", 0))
+    ship_policy = capability.get("ship", "none")
+    return ship_policy == "all" or (ship_policy == "admin" and _is_admin(msg))
 
 
 def _can_plan(msg) -> bool:
@@ -2389,29 +2717,36 @@ def _can_comment(msg) -> bool:
         under the leviathan-agent identity, which is the bot's own)
     DMs are still excluded.
     """
-    chat_id = msg.get("chat", {}).get("id", 0)
-    if not chat_id:
-        return False
-    if chat_id == LEV_DEV_GROUP_ID:
-        return True
-    if chat_id == BOT_HQ_GROUP_ID and _is_admin(msg):
-        return True
-    if chat_id == AGENT_CHAT_GROUP_ID and _is_admin(msg):
-        return True
-    return False
+    capability = _room_capability(msg.get("chat", {}).get("id", 0))
+    comment_policy = capability.get("comment", "none")
+    return comment_policy == "all" or (
+        comment_policy == "admin" and _is_admin(msg)
+    )
 
 
 def _can_qa(msg) -> bool:
-    """Q&A is read-only. Any privileged chat OR admin in DM. No admin
-    requirement in groups — anyone in Bot HQ / Lev Dev / Agent Chat may ask."""
+    """Read-only Q&A is explicit per trusted room, or an operator DM."""
     chat = msg.get("chat", {})
     chat_id = chat.get("id", 0)
     chat_type = chat.get("type", "")
-    if chat_id and chat_id in _PRIVILEGED_CHAT_IDS:
+    capability = _room_capability(chat_id)
+    if (
+        capability.get("read_only_qa", False)
+        and _room_allows_topic(capability, msg.get("message_thread_id"))
+    ):
         return True
     if chat_type == "private" and _is_admin(msg):
         return True
     return False
+
+
+def _can_review_attachment(msg) -> bool:
+    """Attachment retrieval is separately explicit even in trusted rooms."""
+    capability = _room_capability(msg.get("chat", {}).get("id", 0))
+    return bool(
+        capability.get("attachment_review", False)
+        and _room_allows_topic(capability, msg.get("message_thread_id"))
+    )
 
 
 # --- Outgoing action enum (v6) ----------------------------------------------
@@ -4512,10 +4847,13 @@ def poll():
             updates = tg_request("getUpdates", {
                 "offset": offset,
                 "timeout": POLL_TIMEOUT,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "my_chat_member"],
             })
             for update in updates.get("result", []):
                 offset = update["update_id"] + 1
+                if update.get("my_chat_member"):
+                    _record_membership_update(update)
+                    continue
                 msg = update.get("message")
                 if not msg:
                     continue
@@ -4523,6 +4861,19 @@ def poll():
                 chat = msg.get("chat", {})
                 chat_id = chat.get("id", 0)
                 topic_id = msg.get("message_thread_id")
+                _record_chat_migration(msg)
+                capability = _room_capability(chat_id)
+
+                # This gate comes before text normalization, logging, history,
+                # mention/context parsing, attachment inspection, and every
+                # model/worker route. Squid Cave gets only its fixed decline;
+                # unknown rooms get no response at all.
+                if capability["trust_class"] == "public_untrusted":
+                    _handle_public_untrusted_message(msg)
+                    continue
+                if capability["trust_class"] != "trusted":
+                    continue
+
                 text = _message_text(msg)
                 if text and not msg.get("text"):
                     # The rest of the mature routing stack reads `text`.
@@ -4596,7 +4947,15 @@ def poll():
                     msg.get("chat", {}).get("type") == "private"
                     and _is_admin(msg)
                 )
-                is_direct = is_admin_dm or reply_to_us or is_mention or has_active_plan
+                # Lev Sec status is deliberately reply-bound. A reply to an
+                # alert message is direct enough to ask for that one alert's
+                # ledger state, even without an @mention; the lookup below
+                # still rejects unbound/foreign messages and never re-triages.
+                is_levsec_alert_reply = _is_levsec_alert_reply(msg)
+                is_direct = (
+                    is_admin_dm or reply_to_us or is_mention or has_active_plan
+                    or is_levsec_alert_reply
+                )
 
                 # Benthic backup enqueue: someone hailed @Benthic_Bot and the
                 # Commodore is covering. Record the mention; the sweeper will
@@ -4628,11 +4987,11 @@ def poll():
                     save_chat_message(msg, our_reply=_WAGER_REFUSAL_TEXT)
                     continue
 
-                response = None
+                response = _levsec_alert_status_reply(msg) if is_direct else None
                 attachment = None
                 document = _message_document(msg)
-                if is_direct and document:
-                    if not _can_qa(msg):
+                if response is None and is_direct and document:
+                    if not _can_review_attachment(msg):
                         response = _document_intake_failure(
                             document,
                             "document review is not authorized in this room; "
@@ -4658,7 +5017,7 @@ def poll():
                 # intent first): /review 253, "review PR 253", etc. Must be
                 # direct (@mention or reply to Commodore), admin, in a chat
                 # with allow_pr policy, and pass preflight + claim.
-                if is_direct and policy.get("allow_pr"):
+                if response is None and is_direct and policy.get("allow_pr"):
                     review_intent = _detect_pr_review(text)
                     if review_intent is not None:
                         pr_number, repo = review_intent

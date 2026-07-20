@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -29,10 +30,13 @@ from typing import Any, Iterable
 ROOT_DIR = Path(__file__).resolve().parent.parent
 TRIAGE_DIR = Path(__file__).resolve().parent
 RUNBOOK_FILE = TRIAGE_DIR / "RUNBOOK.md"
-DB_FILE = Path(os.environ.get("TRIAGE_DB_FILE", TRIAGE_DIR / "triage.db"))
+DB_FILE = Path(os.environ.get(
+    "TRIAGE_DB_FILE", "~/.local/state/fleet-commodore/triage.db"
+)).expanduser()
 SEC_FEED_BIN = os.environ.get("SEC_FEED_BIN", "sec_feed")
 CLAUDE_BIN = os.environ.get(
-    "CLAUDE_BIN", str(Path("~/.local/bin/claude").expanduser())
+    "CLAUDE_BIN",
+    shutil.which("claude") or str(Path("~/.local/bin/claude").expanduser()),
 )
 LEV_SEC_CHAT_ID = int(os.environ.get("LEV_SEC_CHAT_ID", "-5363468256"))
 COALESCE_WINDOW_S = int(os.environ.get("COALESCE_WINDOW_S", "90"))
@@ -46,6 +50,12 @@ CLAUDE_LIMIT_COOLDOWN_S = int(
 )
 CLAUDE_PROBE_INTERVAL_S = int(os.environ.get("CLAUDE_PROBE_INTERVAL_S", "600"))
 CLAUDE_MAX_FAILURES = 3
+TRIAGE_OPERATOR_DM_USER_ID = int(os.environ.get(
+    "TRIAGE_OPERATOR_DM_USER_ID", os.environ.get("OPERATOR_DM_USER_ID", "0")
+) or 0)
+TRIAGE_OPERATOR_ALERT_COOLDOWN_S = int(
+    os.environ.get("TRIAGE_OPERATOR_ALERT_COOLDOWN_S", "900")
+)
 SEC_FEED_TIMEOUT_S = int(os.environ.get("TRIAGE_SEC_FEED_TIMEOUT_S", "60"))
 POST_RECEIPT_MARGIN_S = int(os.environ.get("TRIAGE_POST_RECEIPT_MARGIN_S", "300"))
 # A full permitted batch can need one bounded feed read per alert, then a
@@ -157,6 +167,20 @@ def _connect(db_file: Path = DB_FILE) -> sqlite3.Connection:
     return conn
 
 
+def _connect_readonly(db_file: Path = DB_FILE) -> sqlite3.Connection:
+    """Open the existing ledger without creating or migrating anything."""
+    path = Path(db_file).expanduser()
+    if not path.is_file():
+        raise TriageError(f"triage ledger is absent: {path}")
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as exc:
+        raise TriageError(f"triage ledger is unreadable: {path}") from exc
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Create a private ledger; never share Commodore's live-bot database."""
     conn.executescript(
@@ -180,6 +204,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS alert_arrivals (
             alert_id TEXT PRIMARY KEY,
             arrived_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS triage_alert_bindings (
+            alert_id TEXT NOT NULL,
+            levsec_chat_id INTEGER NOT NULL,
+            levsec_message_id INTEGER NOT NULL,
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY(alert_id, levsec_chat_id, levsec_message_id)
         );
         CREATE TABLE IF NOT EXISTS triage_state (
             state_key TEXT PRIMARY KEY,
@@ -226,6 +257,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS triaged_alerts_post_attempt "
         "ON triaged_alerts(post_attempt_token)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS triage_alert_bindings_message "
+        "ON triage_alert_bindings(levsec_chat_id, levsec_message_id, observed_at)"
     )
 
 
@@ -336,6 +371,42 @@ def _one_line_summary(alert: dict[str, Any]) -> str:
     return f"{signal} ({severity}), source={source}, created={created}"
 
 
+def _delivery_message_id(delivery: dict[str, Any]) -> int | None:
+    """Extract only a positive original Lev Sec message id from feed metadata."""
+    nested = delivery.get("levsec_delivery")
+    candidates = [delivery.get("telegram_message_id")]
+    if isinstance(nested, dict):
+        candidates.append(nested.get("telegram_message_id"))
+    for candidate in candidates:
+        try:
+            message_id = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if message_id > 0:
+            return message_id
+    return None
+
+
+def _record_alert_binding(
+    alert_id: str, delivery: dict[str, Any], *, db_file: Path = DB_FILE
+) -> None:
+    """Bind a durable alert id to its original Lev Sec chat message.
+
+    Direct-chat status lookups use this exact relationship; a textual UUID or
+    a message from another room can never choose an alert.
+    """
+    message_id = _delivery_message_id(delivery)
+    if message_id is None:
+        return
+    with _connect(db_file) as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO triage_alert_bindings(
+                alert_id, levsec_chat_id, levsec_message_id, observed_at
+            ) VALUES (?, ?, ?, ?)""",
+            (alert_id, LEV_SEC_CHAT_ID, message_id, _iso_now()),
+        )
+
+
 def _vetted_summary_text(value: Any, *, limit: int = 240) -> str:
     """Keep alert-derived batch context inert before it reaches the prompt.
 
@@ -394,9 +465,10 @@ def enqueue_alert(
 
 def _scan_feed_json(args: list[str]) -> Any:
     """Run the operator-installed read-only feed wrapper without a shell."""
+    feed_bin = _validated_sec_feed_bin()
     try:
         result = subprocess.run(
-            [SEC_FEED_BIN, *args], capture_output=True, text=True, timeout=SEC_FEED_TIMEOUT_S,
+            [feed_bin, *args], capture_output=True, text=True, timeout=SEC_FEED_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise TriageError(f"sec_feed unavailable: {exc}") from exc
@@ -483,6 +555,7 @@ def scan_db(*, db_file: Path = DB_FILE) -> int:
                 newest = created_at
         except (TypeError, ValueError):
             LOG.warning("Ignoring malformed delivery timestamp for %s: %r", alert_id, created_at)
+        _record_alert_binding(alert_id, delivery, db_file=db_file)
         if enqueue_alert(alert_id, _one_line_summary(delivery), db_file=db_file):
             queued += 1
 
@@ -951,6 +1024,121 @@ def _build_provider_env(bin_path: str) -> dict[str, str]:
     }
 
 
+_PROVIDER_PROBE_SENTINEL = "TRIAGE_PROVIDER_PROBE_OK"
+_PROVIDER_PROBE_PROMPT = (
+    "This is a Fleet Commodore Lev Sec provider readiness probe. "
+    "Do not use tools. Reply with exactly TRIAGE_PROVIDER_PROBE_OK and nothing else."
+)
+
+
+def _validated_claude_bin() -> str:
+    """Resolve the executable before work is claimed or posting is enabled."""
+    candidate = Path(CLAUDE_BIN).expanduser()
+    if not candidate.is_absolute():
+        resolved = shutil.which(str(candidate))
+        if resolved:
+            candidate = Path(resolved)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise TriageError(f"Claude executable is unavailable: {candidate}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise TriageError(f"Claude executable is not runnable: {resolved}")
+    return str(resolved)
+
+
+def _validated_sec_feed_bin() -> str:
+    """Require the scoped feed wrapper to be explicitly pinned and runnable.
+
+    The provider receives this wrapper as its only investigation tool. Resolving
+    an unqualified ``sec_feed`` through PATH would make the release boundary
+    unknowable, so production must provide an absolute path.
+    """
+    configured = str(SEC_FEED_BIN or "").strip()
+    candidate = Path(configured).expanduser()
+    if not configured or not candidate.is_absolute():
+        raise TriageError("SEC_FEED_BIN must be an absolute, manifest-pinned executable")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise TriageError(f"sec_feed executable is unavailable: {candidate}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise TriageError(f"sec_feed executable is not runnable: {resolved}")
+    return str(resolved)
+
+
+def provider_probe(*, db_file: Path = DB_FILE) -> dict[str, str]:
+    """Force one no-post Sonnet invocation through the installed runtime.
+
+    This intentionally does not inspect pending alerts, call sec_feed, create
+    a claim, or make a Telegram request. An empty queue can therefore never
+    turn this gate into a vacuous green result.
+    """
+    claude_bin = _validated_claude_bin()
+    try:
+        result = subprocess.run(
+            [
+                claude_bin, "-p", "-", "--model", "sonnet",
+                "--tools", "", "--strict-mcp-config",
+            ],
+            input=_PROVIDER_PROBE_PROMPT,
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_TIMEOUT_S,
+            env=_build_provider_env(claude_bin),
+            cwd=str(ROOT_DIR),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _record_claude_failure(str(exc), limit_error=False, db_file=db_file)
+        raise TriageError(f"Claude provider probe failed: {exc}") from exc
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0 or stdout != _PROVIDER_PROBE_SENTINEL:
+        _record_claude_failure(
+            stdout or stderr or "provider probe returned an invalid response",
+            limit_error=_looks_like_claude_limit_error(stdout, stderr),
+            db_file=db_file,
+        )
+        raise TriageError("Claude provider probe did not return its required sentinel")
+    _record_claude_success(db_file=db_file)
+    with _connect(db_file) as conn:
+        _set_state(conn, "provider_probe_at", _iso_now())
+        _set_state(conn, "provider_probe_claude_bin", claude_bin)
+    return {"claude_bin": claude_bin, "result": _PROVIDER_PROBE_SENTINEL}
+
+
+def _alert_operator_triage_failure(reason: str, *, db_file: Path = DB_FILE) -> None:
+    """Send a deduplicated, pinned direct DM for triage/provider failures."""
+    if TRIAGE_OPERATOR_DM_USER_ID <= 0:
+        LOG.critical(
+            "Lev Sec triage failure has no pinned operator DM; "
+            "set TRIAGE_OPERATOR_DM_USER_ID (or OPERATOR_DM_USER_ID)"
+        )
+        return
+    now = time.time()
+    with _connect(db_file) as conn:
+        last = float(_get_state(conn, "operator_alert_last_at") or "0")
+    if now - last < TRIAGE_OPERATOR_ALERT_COOLDOWN_S:
+        return
+    safe_reason = _vetted_summary_text(reason, limit=180)
+    try:
+        response = send_message(
+            TRIAGE_OPERATOR_DM_USER_ID,
+            "⚠️ Fleet Commodore Lev Sec triage is unavailable. No alert was "
+            "posted; the batch remains safely retryable before its send fence. "
+            f"Reason: {safe_reason}",
+        )
+    except Exception as exc:
+        LOG.error("Lev Sec triage operator DM failed: %s", type(exc).__name__)
+        return
+    if _message_id(response) is None:
+        LOG.error("Lev Sec triage operator DM lacked a valid Telegram receipt")
+        return
+    with _connect(db_file) as conn:
+        _set_state(conn, "operator_alert_last_at", str(now))
+        _set_state(conn, "operator_alert_last_reason", safe_reason)
+
+
 def _looks_like_claude_limit_error(stdout: str, stderr: str) -> bool:
     combined = f"{stdout}\n{stderr}".lower()
     return any(
@@ -977,10 +1165,15 @@ def _claude_available(*, db_file: Path = DB_FILE) -> bool:
     with _connect(db_file) as conn:
         _set_state(conn, "claude_last_probe_at", str(time.time()))
     try:
+        claude_bin = _validated_claude_bin()
+    except TriageError as exc:
+        _record_claude_failure(str(exc), limit_error=False, db_file=db_file)
+        return False
+    try:
         probe = subprocess.run(
-            [CLAUDE_BIN, "-p", "-", "--allowedTools", CLAUDE_ALLOWED_TOOLS],
+            [claude_bin, "-p", "-", "--allowedTools", CLAUDE_ALLOWED_TOOLS],
             input="ok", capture_output=True, text=True,
-            timeout=15, env=_build_provider_env(CLAUDE_BIN), cwd=str(ROOT_DIR),
+            timeout=15, env=_build_provider_env(claude_bin), cwd=str(ROOT_DIR),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1010,6 +1203,7 @@ def _record_claude_failure(
                 str(time.time() + CLAUDE_LIMIT_COOLDOWN_S),
             )
     LOG.warning("Claude triage call failed: %s", reason[:300])
+    _alert_operator_triage_failure(reason, db_file=db_file)
 
 
 def _record_claude_success(*, db_file: Path = DB_FILE) -> None:
@@ -1059,16 +1253,21 @@ def ask_claude(prompt: str, *, db_file: Path = DB_FILE) -> str:
     if not _claude_available(db_file=db_file):
         raise TriageError("Claude circuit breaker is in cooldown")
     try:
+        claude_bin = _validated_claude_bin()
+    except TriageError as exc:
+        _record_claude_failure(str(exc), limit_error=False, db_file=db_file)
+        raise
+    try:
         result = subprocess.run(
             [
-                CLAUDE_BIN, "-p", "-", "--model", "sonnet",
+                claude_bin, "-p", "-", "--model", "sonnet",
                 "--allowedTools", CLAUDE_ALLOWED_TOOLS,
             ],
             input=prompt,
             capture_output=True,
             text=True,
             timeout=CLAUDE_TIMEOUT_S,
-            env=_build_provider_env(CLAUDE_BIN),
+            env=_build_provider_env(claude_bin),
             cwd=str(ROOT_DIR),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1208,6 +1407,11 @@ def process_pending(*, dry_run: bool, db_file: Path = DB_FILE) -> str:
     """Process one mature coalesced batch, retaining retryability on every failure."""
     if not dry_run and not posting_enabled():
         return "posting_disabled"
+    if not dry_run and TRIAGE_OPERATOR_DM_USER_ID <= 0:
+        raise TriageError(
+            "live triage requires pinned TRIAGE_OPERATOR_DM_USER_ID "
+            "(or OPERATOR_DM_USER_ID) for fail-loud operator alerts"
+        )
 
     status, payload = _take_ready_batch(db_file=db_file)
     if status in {"empty", "coalescing", "cooldown"}:
@@ -1297,11 +1501,69 @@ def rearm_flood_breaker(*, db_file: Path = DB_FILE) -> None:
         _set_state(conn, "flood_cooldown_until", "0")
 
 
+def release_status(*, db_file: Path = DB_FILE) -> dict[str, Any]:
+    """Read-only operational status for a manifest-pinned triage release."""
+    ledger_path = Path(db_file).expanduser()
+    status: dict[str, Any] = {
+        "triage_db_file": str(ledger_path),
+        "ledger_present": ledger_path.is_file(),
+        "posting_enabled": posting_enabled(),
+        "operator_dm_configured": TRIAGE_OPERATOR_DM_USER_ID > 0,
+        "claude_bin": str(Path(CLAUDE_BIN).expanduser()),
+        "claude_bin_realpath": None,
+        "sec_feed_bin": str(Path(SEC_FEED_BIN).expanduser()),
+        "sec_feed_bin_realpath": None,
+        "pending_alerts": None,
+        "post_states": {},
+        "state": {},
+    }
+    try:
+        status["claude_bin_realpath"] = _validated_claude_bin()
+    except TriageError:
+        pass
+    try:
+        status["sec_feed_bin_realpath"] = _validated_sec_feed_bin()
+    except TriageError:
+        pass
+    if not ledger_path.is_file():
+        return status
+    with _connect_readonly(ledger_path) as conn:
+        post_states = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                "SELECT post_state, COUNT(*) FROM triaged_alerts GROUP BY post_state"
+            )
+        }
+        pending = int(conn.execute("SELECT COUNT(*) FROM pending").fetchone()[0])
+        state = {
+            key: _get_state(conn, key)
+            for key in (
+                "scan_watermark",
+                "provider_probe_at",
+                "provider_probe_claude_bin",
+                "claude_unavailable_until",
+                "operator_alert_last_at",
+            )
+        }
+    status.update({
+        "pending_alerts": pending,
+        "post_states": post_states,
+        "state": state,
+    })
+    return status
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--alert-id", type=_validate_alert_id)
     mode.add_argument("--scan-db", action="store_true")
+    mode.add_argument("--status", action="store_true", help="print read-only release/ledger status")
+    mode.add_argument(
+        "--provider-probe",
+        action="store_true",
+        help="force one no-post Sonnet readiness probe; never reads the queue",
+    )
     mode.add_argument("--rearm", action="store_true", help="clear flood cooldown only")
     mode.add_argument("--list-outcome-unknown", action="store_true")
     mode.add_argument("--inspect-outcome-unknown", type=_validate_attempt_token)
@@ -1364,6 +1626,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.rearm:
             rearm_flood_breaker()
             print("flood breaker re-armed")
+            return 0
+        if args.status:
+            print(json.dumps(release_status(), sort_keys=True))
+            return 0
+        if args.provider_probe:
+            print(json.dumps(provider_probe(), sort_keys=True))
             return 0
         if args.alert_id:
             enqueue_alert(args.alert_id)

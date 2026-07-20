@@ -10,7 +10,9 @@ os.environ["SQUID_CAVE_GROUP_ID"] = "-1002222222222"
 os.environ["AGENT_CHAT_GROUP_ID"] = "-1003675648747"
 os.environ["LEV_DEV_GROUP_ID"] = "-1004444444444"
 os.environ["ATLAS_GROUP_ID"] = "-1004291361883"
+os.environ["LEV_SEC_GROUP_ID"] = "-1005363468256"
 os.environ["ADMIN_TELEGRAM_IDS"] = "1234982301"
+os.environ["OPERATOR_DM_USER_ID"] = "1234982301"
 # Per-test isolation for the file-backed scratch dir
 os.environ.setdefault("COMMODORE_RESULTS_DIR",
                       str(Path("/tmp") / "commodore-test-results"))

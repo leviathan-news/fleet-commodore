@@ -1,9 +1,9 @@
 # Handoff — Commodore Sonnet Security Triage
 
-**Implementation status:** Steps 3 and 5 are implemented and tested on the isolated
-`fleet-commodore/triage-steps-3-5` branch. They are not deployed: no Mini cron was
-installed, no Commodore process was restarted, `commodore.py::poll()` is untouched, and
-`TRIAGE_POSTING_ENABLED` remains `0` by default.
+**Implementation status:** the triage control plane is unified with the current
+chat release candidate. It is not a production authorization: promotion still
+requires the manifest, external-ledger, pinned-operator-DM, provider-probe,
+single-executor, and watched-receipt gates in `RUNBOOK.md`.
 
 The security-triage control plane is deliberately separate from `commodore.db` and
 from the Telegram polling loop.
@@ -15,7 +15,9 @@ from the Telegram polling loop.
   capability. The prompt receives only a sanitized, explicitly untrusted alert index;
   raw evidence stays behind the read-only Mini wrapper for `security_triage_feed`.
 - `TRIAGE_POSTING_ENABLED` defaults to `0`. A disabled gate does not claim, post, or DM
-  alerts; use `--dry-run` to inspect an agent result safely.
+  alerts; use `--dry-run` to inspect an agent result safely. `--provider-probe`
+  is the non-vacuous readiness gate: it forces a no-post Sonnet invocation even
+  when the queue is empty.
 - Dequeue and claim commit atomically with a token-bound, batch-sized lease. A stale
   pre-send claim is requeued only with an exact owner-token/expiry compare-and-delete;
   a crashed or receipt-less post is durably `outcome_unknown` and is never blindly
@@ -26,5 +28,7 @@ from the Telegram polling loop.
   deployment review must install it explicitly. It does not restart or otherwise control
   the bot.
 
-The Telegram `poll()` hook is intentionally not part of this implementation. It is a
-separate, live-bot decision.
+The Telegram `poll()` hook does not enqueue or synchronously invoke triage. In trusted
+Lev Sec, a direct reply to an original alert can read only its exact bound ledger
+status; textual alert IDs never select work or trigger Sonnet. Re-triage remains a
+separate control-plane decision.
