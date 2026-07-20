@@ -14,7 +14,12 @@ single supervised session; do not treat a dirty developer checkout as a
 release. Promote a clean reviewed worktree/artifact, emit a secret-free
 manifest with `scripts/release_manifest.py`, and retain the prior immutable
 artifact for rollback. The chat daemon and triage cron may have different
-source SHAs only during an explicitly recorded transition.
+source SHAs only during an explicitly recorded transition. Set
+`FLEET_COMMODORE_CONFIG` to one service-owned, non-release config file on the
+Mini; a release worktree must never become the owner of tokens or mutable
+runtime configuration. Cron sets both that path and
+`FLEET_COMMODORE_RELEASE_DIR` for `cron/watchdog.sh`; the watchdog passes them
+to its tmux-launched chat daemon.
 
 ## Build + run
 

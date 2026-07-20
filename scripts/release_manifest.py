@@ -25,6 +25,7 @@ ARTIFACT_FILES = (
     "triage/commodore_triage.py",
     "triage/RUNBOOK.md",
     "cron/commodore-triage.sh",
+    "cron/watchdog.sh",
     "run.sh",
     "scripts/release_manifest.py",
 )
@@ -42,6 +43,7 @@ NON_SECRET_ENV = (
     "TRIAGE_DB_FILE",
     "TRIAGE_POSTING_ENABLED",
     "TRIAGE_OPERATOR_RECONCILE_ENABLED",
+    "FLEET_COMMODORE_CONFIG",
 )
 
 
