@@ -9,6 +9,9 @@ venv/
 commodore.db
 commodore.db-shm
 commodore.db-wal
+triage/triage.db
+triage/triage.db-shm
+triage/triage.db-wal
 *.log
 .DS_Store
 workspace/

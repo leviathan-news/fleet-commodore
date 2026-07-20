@@ -96,6 +96,29 @@ python -m pytest tests/ -v
 Server-side denylist tests live in the squid-bot repo at
 `tests/api/test_wager_denylist.py` (12 tests, all green).
 
+## Lev Sec triage failsafe
+
+`triage/commodore_triage.py` coalesces accepted Lev Sec deliveries into one
+read-only Sonnet investigation. It uses its own `triage/triage.db` ledger rather
+than `commodore.db`, and defaults to `TRIAGE_POSTING_ENABLED=0`; dry-runs never
+post or retain a completed claim.
+
+An ambiguous Telegram result remains `outcome_unknown` and is never retried.
+Its local inspect/list/receipt-reconciliation commands are separately default-off
+behind `TRIAGE_OPERATOR_RECONCILE_ENABLED=0` and require an explicit operator
+confirmation; they do not post, invoke Claude, or install a schedule.
+
+After the read-only `~/bin/sec_feed` wrapper exists on the Mini, an operator may
+install the following failsafe schedule. It only runs the DB-delivery scan; it
+does not restart the bot or add a Telegram polling hook.
+
+```cron
+*/5 * * * * /Users/gerrithall/dev/leviathan/fleet-commodore/cron/commodore-triage.sh
+```
+
+The explicit live-post decision remains outside this setup. See
+`triage/HANDOFF.md` and `triage/RUNBOOK.md`.
+
 ## Plan
 
 Full implementation plan and server-side denylist contract:
