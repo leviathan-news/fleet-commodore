@@ -1,10 +1,9 @@
 """Per-action authorization matrix.
 
-Locks the v6.1 surface in:
-- ship/plan: ANY crewmate in Lev Dev OR admin in Bot HQ. Lev Dev is the dev
-  workshop and is open to non-admins; Bot HQ is the editorial admin room and
-  retains the admin gate.
-- qa: Bot HQ ∪ Lev Dev ∪ Agent Chat ∪ Atlas ∪ admin DM.
+Locks the trusted-room surface in:
+- ship/plan: any crewmate in a registered trusted room. Squid Cave and unknown
+  rooms stay closed because public membership must never grant GitHub writes.
+- qa: all trusted rooms ∪ admin DM.
 - Squid Cave is read-only-no-Q&A. Non-admin DM is nothing.
 """
 import pytest
@@ -29,23 +28,18 @@ def msg(chat_id, sender_id, chat_type="supergroup"):
 
 
 @pytest.mark.parametrize("label, m, ship, plan, qa", [
-    # admin in Bot HQ or Lev Dev: ship/plan + qa
+    # Every registered trusted room: ship/plan + qa.
     ("Bot HQ admin",       msg(BOT_HQ, ADMIN_ID),                          True,  True,  True),
     ("Lev Dev admin",      msg(LEV_DEV, ADMIN_ID),                         True,  True,  True),
-    # admin elsewhere: qa only (ship/plan deliberately gated)
-    ("Agent Chat admin",   msg(AGENT_CHAT, ADMIN_ID),                      False, False, True),
+    ("Agent Chat admin",   msg(AGENT_CHAT, ADMIN_ID),                      True,  True,  True),
     ("admin DM",           msg(ADMIN_ID, ADMIN_ID, chat_type="private"),   False, False, True),
-    # Bot HQ non-admin: Q&A only — Bot HQ is the editorial admin room
-    ("Bot HQ non-admin",   msg(BOT_HQ, NON_ADMIN_ID),                      False, False, True),
-    # Lev Dev non-admin: FULL ship/plan + qa — Lev Dev is the dev workshop,
-    # any crewmate aboard may order a dispatch (v6.1 widening, May 2026)
+    ("Bot HQ non-admin",   msg(BOT_HQ, NON_ADMIN_ID),                      True,  True,  True),
+    # Lev Dev non-admin: full ship/plan + qa.
     ("Lev Dev non-admin",  msg(LEV_DEV, NON_ADMIN_ID),                     True,  True,  True),
-    ("Agent Chat random",  msg(AGENT_CHAT, NON_ADMIN_ID),                  False, False, True),
-    # Atlas: Q&A only (partner-facing room, opened for Q&A July 2026);
-    # ship/plan deliberately gated like Agent Chat
-    ("Atlas admin",        msg(ATLAS, ADMIN_ID),                           False, False, True),
-    ("Atlas random",       msg(ATLAS, NON_ADMIN_ID),                       False, False, True),
-    ("Lev Sec random",     msg(LEV_SEC, NON_ADMIN_ID),                     False, False, True),
+    ("Agent Chat random",  msg(AGENT_CHAT, NON_ADMIN_ID),                  True,  True,  True),
+    ("Atlas admin",        msg(ATLAS, ADMIN_ID),                           True,  True,  True),
+    ("Atlas random",       msg(ATLAS, NON_ADMIN_ID),                       True,  True,  True),
+    ("Lev Sec random",     msg(LEV_SEC, NON_ADMIN_ID),                     True,  True,  True),
     # Squid Cave: nothing (not in privileged set)
     ("Squid Cave admin",   msg(SQUID_CAVE, ADMIN_ID),                      False, False, False),
     ("Squid Cave random",  msg(SQUID_CAVE, NON_ADMIN_ID),                  False, False, False),
@@ -71,15 +65,14 @@ def test_handle_ship_in_squid_cave_declines():
     """Squid Cave is not in the privileged set — ship must decline."""
     m = msg(SQUID_CAVE, ADMIN_ID)
     reply = commodore.handle_ship(m)
-    assert "Bot HQ" in reply or "officer" in reply.lower()
+    assert "trusted Fleet room" in reply
 
 
-def test_handle_ship_in_agent_chat_declines():
-    """Agent Chat is for agents talking to each other, not filing fleet PRs.
-    Admin in Agent Chat must still get a chat-level decline."""
+def test_handle_ship_in_agent_chat_works():
+    """Agent Chat is trusted, so a ship order must clear the chat-level gate."""
     m = msg(AGENT_CHAT, ADMIN_ID)
     reply = commodore.handle_ship(m)
-    assert "Bot HQ" in reply or "officer" in reply.lower()
+    assert "Bot HQ" not in reply, f"chat-level decline still firing: {reply}"
 
 
 def test_handle_qa_in_squid_cave_declines():

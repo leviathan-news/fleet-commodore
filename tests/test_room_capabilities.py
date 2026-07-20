@@ -31,6 +31,20 @@ def test_registry_grants_read_only_and_attachment_review_to_every_trusted_room()
         assert commodore._can_review_attachment(message), chat_id
 
 
+def test_registry_grants_pr_actions_to_every_trusted_room():
+    for chat_id in (
+        commodore.BOT_HQ_GROUP_ID,
+        commodore.LEV_DEV_GROUP_ID,
+        commodore.AGENT_CHAT_GROUP_ID,
+        commodore.ATLAS_GROUP_ID,
+        commodore.LEV_SEC_GROUP_ID,
+    ):
+        message = _message(chat_id)
+        assert commodore._can_plan(message), chat_id
+        assert commodore._can_ship(message), chat_id
+        assert commodore._can_comment(message), chat_id
+
+
 def test_registry_uses_numeric_identity_not_title_or_unknown_id():
     known = _message(commodore.LEV_DEV_GROUP_ID)
     spoofed = _message(-1009999999999)
@@ -127,6 +141,24 @@ def test_levsec_status_requires_a_bound_reply_and_never_selects_text_id(tmp_path
     assert commodore._levsec_alert_status_reply(text_only) is None
     assert not commodore._is_levsec_alert_reply(text_only)
     assert "will not select an alert from text alone" in commodore._levsec_alert_status_reply(arbitrary_reply)
+
+
+def test_levsec_status_lookup_does_not_swallow_pr_order_or_fix_request():
+    bound = _message(
+        commodore.LEV_SEC_GROUP_ID,
+        text="@commodore_lev_bot can you fill a PR to fix this?",
+        reply_to={"message_id": 777, "from": {"username": "leviathan_news_bot"}},
+    )
+    status = _message(
+        commodore.LEV_SEC_GROUP_ID,
+        text="@commodore_lev_bot what is the triage status?",
+        reply_to={"message_id": 777, "from": {"username": "leviathan_news_bot"}},
+    )
+
+    assert commodore._detect_pr_request(bound["text"])
+    assert not commodore._should_handle_levsec_alert_status(bound, bound["text"])
+    assert commodore._can_plan(bound)
+    assert commodore._should_handle_levsec_alert_status(status, status["text"])
 
 
 def test_unknown_membership_is_persisted_and_alerts_pinned_operator(tmp_path, monkeypatch):

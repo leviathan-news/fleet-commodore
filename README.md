@@ -55,11 +55,11 @@ independently scoped.
 
 | Room | Trust | Direct-hail contract | Writes |
 |------|-------|----------------------|--------|
-| Bot HQ | trusted | Q&A + attachment review | PR/ship: admin only |
+| Bot HQ | trusted | Q&A + attachment review | PR/ship + GitHub comments: all crew |
 | Lev Dev | trusted | Q&A + attachment review | PR/ship: all crew |
-| Agent Chat | trusted, all topics | Q&A + attachment review | GitHub comments: admin only |
-| Leviathan Atlas | trusted | Q&A + attachment review | none |
-| Lev Sec Alert | trusted/security | Q&A + attachment review; reply-bound status | cron-only triage; no chat-triggered re-triage |
+| Agent Chat | trusted, all topics | Q&A + attachment review | PR/ship + GitHub comments: all crew |
+| Leviathan Atlas | trusted | Q&A + attachment review | PR/ship + GitHub comments: all crew |
+| Lev Sec Alert | trusted/security | Q&A + attachment review; explicit reply-bound status | PR/ship + GitHub comments: all crew; triage remains cron-only |
 | Squid Cave | public/untrusted | Fixed, rate-limited decline only | none; no model, worker, context, or file retrieval |
 | Unknown room | unclassified | Silent/fail closed | none |
 

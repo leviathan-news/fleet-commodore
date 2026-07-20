@@ -46,15 +46,15 @@ def test_can_comment_lev_dev_anyone():
     assert c._can_comment(_msg(LEV_DEV, NON_ADMIN_ID, "x"))
 
 
-def test_can_comment_bot_hq_admin_only():
+def test_can_comment_bot_hq_anyone():
     assert c._can_comment(_msg(BOT_HQ, ADMIN_ID, "x"))
-    assert not c._can_comment(_msg(BOT_HQ, NON_ADMIN_ID, "x"))
+    assert c._can_comment(_msg(BOT_HQ, NON_ADMIN_ID, "x"))
 
 
-def test_can_comment_agent_chat_admin_only():
-    """Agent Chat is the new surface — admin only (operators publicly)."""
+def test_can_comment_agent_chat_anyone():
+    """Agent Chat is trusted, so any crew member may request a comment."""
     assert c._can_comment(_msg(AGENT_CHAT, ADMIN_ID, "x"))
-    assert not c._can_comment(_msg(AGENT_CHAT, NON_ADMIN_ID, "x"))
+    assert c._can_comment(_msg(AGENT_CHAT, NON_ADMIN_ID, "x"))
 
 
 def test_can_comment_squid_cave_no():
@@ -127,7 +127,7 @@ def test_handler_declines_in_squid_cave():
     m = _msg(SQUID_CAVE, ADMIN_ID,
              "@commodore_lev_bot comment on https://github.com/x/y/issues/1: thoughts")
     reply = c.handle_comment_request(m, m["text"])
-    assert "Bot HQ" in reply or "Lev Dev" in reply or "Agent Chat" in reply
+    assert "trusted Fleet room" in reply
     assert "github.com" not in reply  # no leakage of the rejected URL
 
 
@@ -136,7 +136,7 @@ def test_handler_declines_dm_admin():
              "comment on https://github.com/x/y/issues/1",
              chat_type="private")
     reply = c.handle_comment_request(m, m["text"])
-    assert "Bot HQ" in reply or "Lev Dev" in reply or "Agent Chat" in reply
+    assert "trusted Fleet room" in reply
 
 
 def test_handler_demands_url_when_missing():
