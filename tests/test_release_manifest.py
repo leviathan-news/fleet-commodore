@@ -28,6 +28,11 @@ def test_manifest_binds_release_files_without_reading_secret_env(monkeypatch):
     assert manifest["git_sha"]
     assert len(manifest["artifact_sha256"]) == 64
     assert set(module.ARTIFACT_FILES) == set(manifest["files"])
+    assert {
+        "bin/qa-healthcheck.py",
+        "cron/qa-healthcheck.sh",
+        "cron/claude-oauth-heartbeat.sh",
+    } <= set(manifest["files"])
     serialized = str(manifest)
     assert "must-not-appear" not in serialized
     assert manifest["runtime"]["TRIAGE_DB_FILE"] == "/tmp/service-owned-triage.db"
