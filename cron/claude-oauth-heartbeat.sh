@@ -16,22 +16,31 @@
 # invisible until the operator notices Admiral isn't replying — that took
 # ~20h on 2026-05-06.
 #
-# Cron line: */60 * * * * /Users/gerrithall/dev/leviathan/fleet-commodore/cron/claude-oauth-heartbeat.sh
+# Cron supplies FLEET_COMMODORE_RELEASE_DIR and FLEET_COMMODORE_CONFIG, so
+# this probe always runs from the immutable daemon release rather than a
+# developer checkout that may be stale or dirty.
 set -uo pipefail
 
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
-LOG=$REPO_DIR/logs/claude-heartbeat.log
+: "${FLEET_COMMODORE_CONFIG:=$REPO_DIR/.env}"
+: "${FLEET_COMMODORE_STATE_DIR:=$HOME/.local/state/fleet-commodore}"
+LOG=$FLEET_COMMODORE_STATE_DIR/logs/claude-heartbeat.log
 mkdir -p "$(dirname "$LOG")"
+
+if [[ ! -r "$FLEET_COMMODORE_CONFIG" ]]; then
+    echo "$(date -u +%FT%TZ) state=config_unreadable" >> "$LOG"
+    exit 1
+fi
 
 # tmpdir for the probe scratch
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Source the daemon's .env so BOT_TOKEN + BOT_HQ_GROUP_ID are available
+# Source the service-owned config so BOT_TOKEN + BOT_HQ_GROUP_ID are available
 # for the alert path. Set -a/+a means these get exported for child procs.
 set -a
 # shellcheck disable=SC1091
-[[ -f "$REPO_DIR/.env" ]] && source "$REPO_DIR/.env"
+source "$FLEET_COMMODORE_CONFIG"
 set +a
 
 # Claude CLI must be on PATH for cron's bare environment.
