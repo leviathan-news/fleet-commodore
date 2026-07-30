@@ -2369,6 +2369,70 @@ def _alert_operator_claude_down(reason: str = "") -> None:
         log.warning("operator alert failed: %s", exc)
 
 
+def _alert_operator_qa_down(reason: str) -> bool:
+    """Page the operator for a QA-service outage, at most once per six hours.
+
+    This mirrors the existing Claude-down alert but uses an independent key:
+    an absent reviewer image, stopped sidecar, or malformed worker response
+    needs a different repair than an expired Claude session. The caller uses
+    the boolean to avoid falsely telling a requester that an alert landed.
+    """
+    op = _operator_dm_user_id()
+    if not op:
+        log.critical("QA outage cannot page operator: OPERATOR_DM_USER_ID is unset")
+        return False
+    try:
+        conn = sqlite3.connect(str(DB_FILE), timeout=5)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS commodore_alert (
+                    alert_kind TEXT PRIMARY KEY,
+                    last_sent_at TEXT NOT NULL,
+                    last_reason TEXT
+                )"""
+            )
+            row = conn.execute(
+                "SELECT last_sent_at FROM commodore_alert WHERE alert_kind=?",
+                ("qa_down",),
+            ).fetchone()
+            if row:
+                from datetime import datetime, timedelta, timezone
+                try:
+                    last = datetime.fromisoformat(row[0])
+                    if last.tzinfo is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) - last < timedelta(hours=6):
+                        return True  # an operator was already paged for this episode
+                except (TypeError, ValueError):
+                    pass
+            safe_reason = _scrub_secrets_for_db(reason)[:500]
+            response = send_message(
+                op,
+                "Fleet Commodore QA service is down. Requesters received a "
+                "plain outage notice. Reason: " + safe_reason[:200],
+            )
+            if not (isinstance(response, dict) and response.get("ok") is True):
+                log.warning("QA outage operator DM failed: %s", str(response)[:200])
+                return False
+            conn.execute(
+                """INSERT INTO commodore_alert (alert_kind, last_sent_at, last_reason)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(alert_kind) DO UPDATE SET
+                     last_sent_at=excluded.last_sent_at,
+                     last_reason=excluded.last_reason""",
+                ("qa_down", _now_iso(), safe_reason),
+            )
+            conn.commit()
+            log.warning("alerted operator (DM): qa_down — reason=%s", safe_reason[:120])
+            return True
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("QA outage operator alert failed: %s", type(exc).__name__)
+        return False
+
+
 def _alert_operator_unclassified_room(chat_id: int, new_status: str) -> None:
     """Fail loud on a bot membership the registry does not recognize."""
     operator_id = _operator_dm_user_id()
@@ -4109,6 +4173,50 @@ def _qa_launcher_path():
     return Path(__file__).parent / "bin" / "launch-qa-container"
 
 
+def _qa_failure_detail(error: str, *, detail: str = "", result=None, proc=None) -> str:
+    """Keep the launcher's structured failure in the audit and operator page.
+
+    The user receives a one-sentence outage notice; the structured details
+    stay in the operator-only durable record, after the existing token scrub.
+    """
+    payload = {"error": error}
+    if detail:
+        payload["detail"] = detail[:500]
+    if isinstance(result, dict):
+        for key in ("error", "detail", "stderr_log", "returncode", "stdout_was_parseable"):
+            if result.get(key) not in (None, ""):
+                payload[key] = result[key]
+    if proc is not None:
+        payload.setdefault("returncode", proc.returncode)
+        if proc.stderr:
+            payload.setdefault("stderr", proc.stderr[:500])
+    return _scrub_secrets_for_db(json.dumps(payload, sort_keys=True))[:500]
+
+
+def _qa_outage_reply(operator_alerted: bool) -> str:
+    """A direct, truthful Telegram failure sentence with no persona costume."""
+    if operator_alerted:
+        return "My review service is down; the operator has been alerted."
+    return "My review service is down; the operator could not be alerted."
+
+
+def _fail_qa_service(
+    conn, job_uuid: str, chat_id: int, topic_id, request_msg_id, failure_detail: str,
+) -> None:
+    """Persist a QA outage, page the operator, then send the honest reply."""
+    conn.execute(
+        "UPDATE qa_job SET status='failed', declined_reason=?, finished_at=? WHERE job_uuid=?",
+        (failure_detail, _now_iso(), job_uuid),
+    )
+    conn.commit()
+    operator_alerted = _alert_operator_qa_down(failure_detail)
+    send_message_with_wal(
+        "qa_job", job_uuid, OutgoingAction.QA_FAILURE,
+        chat_id, _qa_outage_reply(operator_alerted),
+        thread_id=topic_id, reply_to=request_msg_id,
+    )
+
+
 def _review_launcher_path():
     return Path(__file__).parent / "bin" / "launch-review-container"
 
@@ -4384,19 +4492,9 @@ def _process_qa(job_uuid: str) -> None:
         if result is None:
             launcher = str(_qa_launcher_path())
             if not Path(launcher).exists():
-                conn.execute(
-                    "UPDATE qa_job SET status='failed', "
-                    "declined_reason='launcher_missing', finished_at=? "
-                    "WHERE job_uuid=?",
-                    (_now_iso(), job_uuid),
-                )
-                conn.commit()
-                send_message_with_wal(
-                    "qa_job", job_uuid, OutgoingAction.QA_FAILURE,
-                    chat_id,
-                    "The Admiralty's archivist is unavailable. Pray notify "
-                    "the operator.",
-                    thread_id=topic_id, reply_to=request_msg_id,
+                _fail_qa_service(
+                    conn, job_uuid, chat_id, topic_id, request_msg_id,
+                    _qa_failure_detail("launcher_missing", detail=launcher),
                 )
                 return
 
@@ -4416,17 +4514,9 @@ def _process_qa(job_uuid: str) -> None:
                 )
             except (subprocess.TimeoutExpired, OSError) as exc:
                 log.exception("qa launcher %s failed", job_uuid)
-                conn.execute(
-                    "UPDATE qa_job SET status='failed', "
-                    "declined_reason=?, finished_at=? WHERE job_uuid=?",
-                    (str(exc)[:200], _now_iso(), job_uuid),
-                )
-                conn.commit()
-                send_message_with_wal(
-                    "qa_job", job_uuid, OutgoingAction.QA_FAILURE,
-                    chat_id,
-                    "The Admiralty's archivist suffered a casualty. Pray retry.",
-                    thread_id=topic_id, reply_to=request_msg_id,
+                _fail_qa_service(
+                    conn, job_uuid, chat_id, topic_id, request_msg_id,
+                    _qa_failure_detail("launcher_exception", detail=f"{type(exc).__name__}: {exc}"),
                 )
                 return
 
@@ -4439,19 +4529,9 @@ def _process_qa(job_uuid: str) -> None:
             # If we did launch a container and it failed without producing
             # a parseable result, treat as worker failure.
             if result is None or proc.returncode != 0:
-                conn.execute(
-                    "UPDATE qa_job SET status='failed', "
-                    "declined_reason='worker produced no result', finished_at=? "
-                    "WHERE job_uuid=?",
-                    (_now_iso(), job_uuid),
-                )
-                conn.commit()
-                send_message_with_wal(
-                    "qa_job", job_uuid, OutgoingAction.QA_FAILURE,
-                    chat_id,
-                    "The Admiralty's archivist could not produce a dispatch. "
-                    "Pray re-issue the inquiry.",
-                    thread_id=topic_id, reply_to=request_msg_id,
+                _fail_qa_service(
+                    conn, job_uuid, chat_id, topic_id, request_msg_id,
+                    _qa_failure_detail("worker_failed", result=result, proc=proc),
                 )
                 return
 
@@ -4512,20 +4592,13 @@ def _process_qa(job_uuid: str) -> None:
                 conn.commit()
                 unlink_result_file(job_uuid)
         else:
-            conn.execute(
-                "UPDATE qa_job SET status='failed', "
-                "declined_reason=?, finished_at=? WHERE job_uuid=?",
-                (f"unknown worker status={status!r}", _now_iso(), job_uuid),
-            )
-            conn.commit()
-            send_message_with_wal(
-                "qa_job", job_uuid, OutgoingAction.QA_FAILURE,
-                chat_id,
-                "The dispatch returned in a state the Admiralty could not parse.",
-                thread_id=topic_id, reply_to=request_msg_id,
+            _fail_qa_service(
+                conn, job_uuid, chat_id, topic_id, request_msg_id,
+                _qa_failure_detail("unknown_worker_status", detail=str(status), result=result),
             )
     except Exception:
         log.exception("_process_qa %s top-level failure", job_uuid)
+        _alert_operator_qa_down(_qa_failure_detail("coordinator_exception"))
     finally:
         conn.close()
 

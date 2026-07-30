@@ -100,6 +100,48 @@ def test_parse_qa_empty_returns_unparseable():
     assert p["status"] == "unparseable"
 
 
+def test_format_repair_retries_once_and_recovers_a_real_answer():
+    mod = _load_module()
+    calls = []
+
+    def repair(prior):
+        calls.append(prior)
+        return "STATUS: ANSWERED\n\nThe queue is healthy."
+
+    parsed = mod.parse_qa_with_format_repair("The queue is healthy.", repair)
+
+    assert parsed["status"] == "answered"
+    assert parsed["answer"] == "The queue is healthy."
+    assert calls == ["The queue is healthy."]
+
+
+def test_format_repair_falls_back_to_the_original_real_answer():
+    mod = _load_module()
+
+    parsed = mod.parse_qa_with_format_repair(
+        "The queue is healthy.",
+        lambda _prior: "Still no status marker.",
+    )
+
+    assert parsed["status"] == "answered"
+    assert parsed["answer"] == "The queue is healthy."
+    assert parsed["format_recovered"] is True
+
+
+def test_nonzero_claude_exit_logs_both_stdout_and_stderr(monkeypatch, capsys):
+    mod = _load_module()
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, "actionable stdout", "stderr detail")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    assert mod.run_claude_qa("question") == ""
+    captured = capsys.readouterr()
+    assert "actionable stdout" in captured.err
+    assert "stderr detail" in captured.err
+
+
 def test_parse_qa_caps_answer_length():
     mod = _load_module()
     long_body = "x" * 8000
@@ -207,10 +249,8 @@ def test_hostile_phrase_inside_attachment_does_not_reclassify_benign_question(tm
         },
     )
     payload = json.loads(proc.stdout.strip())
-    assert payload["status"] == "declined"
-    assert "credentials" not in payload["declined_reason"].lower()
-    assert "archivist" in payload["declined_reason"].lower() or \
-           "transcribe" in payload["declined_reason"].lower()
+    assert payload["status"] == "failed"
+    assert "credentials" not in payload["failure_reason"].lower()
 
 
 # --- atomic scratch write ------------------------------------------------
@@ -247,10 +287,13 @@ def test_hostile_question_declines_without_invoking_claude(tmp_path):
            "secrets" in payload["declined_reason"].lower()
 
 
-def test_benign_question_with_no_claude_returns_declined_unparseable(tmp_path):
-    """Without a working Claude binary, a benign question can't be answered.
-    Worker must record this cleanly (declined w/ archivist message) — never
-    crash, never relaunch loop."""
+def test_benign_question_with_no_claude_returns_explicit_failure(tmp_path):
+    """Without a working Claude binary, the worker records a real outage.
+
+    The coordinator owns the single plain-language Telegram outage notice and
+    operator page; a worker must never masquerade an infrastructure failure as
+    a policy decline.
+    """
     proc = _run_worker(
         {"qa_uuid": "benign1", "question": "how does the X queue work?",
          "requester": "curvecap", "channel": "-100123"},
@@ -261,11 +304,8 @@ def test_benign_question_with_no_claude_returns_declined_unparseable(tmp_path):
     )
     assert proc.returncode == 0
     payload = json.loads(proc.stdout.strip())
-    # Without Claude available, parse_qa returns unparseable → main()
-    # converts to declined with the archivist message.
-    assert payload["status"] == "declined"
-    assert "archivist" in payload["declined_reason"].lower() or \
-           "transcribe" in payload["declined_reason"].lower()
+    assert payload["status"] == "failed"
+    assert "unparseable" in payload["failure_reason"]
     # Scratch file written
     scratch = tmp_path / "benign1.result.json"
     assert scratch.exists()

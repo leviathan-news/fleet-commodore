@@ -23,6 +23,14 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 mkdir -p "$FLEET_COMMODORE_LOG_DIR"
+# Do not prevent the chat daemon from starting when Q&A is degraded: it is
+# needed to issue the honest failure reply and page the operator on demand.
+# The watchdog runs the same bounded readiness check every five minutes.
+if ! "$PYTHON_BIN" "$REPO_DIR/bin/qa-healthcheck.py" --quick \
+    >> "$FLEET_COMMODORE_LOG_DIR/qa-healthcheck.log" 2>&1; then
+  echo "$(date -u +%FT%TZ) QA readiness check degraded; daemon will start" \
+    >> "$FLEET_COMMODORE_LOG_DIR/commodore.log"
+fi
 # PYTHONUNBUFFERED=1 so logs flush immediately without a tee buffer.
 # Redirect stderr to stdout so tmux pane + file both capture everything.
 exec "$PYTHON_BIN" -u commodore.py >> "$FLEET_COMMODORE_LOG_DIR/commodore.log" 2>&1
