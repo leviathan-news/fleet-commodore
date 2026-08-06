@@ -37,6 +37,21 @@ docker compose up -d
 docker compose logs -f          # primary ops surface
 ```
 
+## Exclusive helm control
+
+The optional Mini-local helm controller provides durable Telegram intake and a
+single reply lease for bounded operator absences. The ordinary release remains
+unchanged until a blue/green takeover passes isolated bridge-loss and
+watcher-loss tests. During an exclusive Sol lease, the successor Fleet process
+continues polling and queues every update before routing, but its send fence
+denies Fleet replies. Sol claims queued events through a replaceable bridge.
+
+The lease state, Telegram offset, event payloads, conversation context, send
+fences, and transition receipts live in the service state directory. A
+service-owned cron row checks the controller every minute. Expiry of the Sol,
+watcher, or bridge lease stops the successor and restores the pinned ordinary
+Fleet release. See [the helm controller runbook](docs/HELM_CONTROLLER_RUNBOOK.md).
+
 ## Server-side prerequisite (squid-bot)
 
 After the Commodore bot is registered on Telegram, look up its `telegram_user_id`

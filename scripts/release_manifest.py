@@ -21,6 +21,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_FILES = (
     "commodore.py",
+    "helm_controller.py",
+    "helm_sol_bridge.py",
+    "helm_supervisor.py",
     "qa_worker.py",
     "triage/commodore_triage.py",
     "triage/RUNBOOK.md",
@@ -29,6 +32,8 @@ ARTIFACT_FILES = (
     "cron/claude-oauth-heartbeat.sh",
     "cron/commodore-triage.sh",
     "cron/watchdog.sh",
+    "cron/helm-controller-watchdog.sh",
+    "docs/HELM_CONTROLLER_RUNBOOK.md",
     "run.sh",
     "scripts/release_manifest.py",
 )
@@ -50,6 +55,10 @@ NON_SECRET_ENV = (
     "FLEET_COMMODORE_STATE_DIR",
     "COMMODORE_DB_FILE",
     "FLEET_COMMODORE_PYTHON",
+    "HELM_CONTROLLER_DB_FILE",
+    "HELM_CONTROLLER_RUNTIME_CONFIG",
+    "HELM_FLEET_RELEASE",
+    "HELM_SUCCESSOR_RELEASE",
 )
 
 
