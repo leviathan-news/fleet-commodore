@@ -20,6 +20,7 @@ import sqlite3
 import stat
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -54,6 +55,21 @@ def _token_hash(token: str) -> str:
 
 def _json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _load_bot_token() -> str:
+    token = os.environ.get("BOT_TOKEN")
+    if token:
+        return token
+    path = Path(
+        os.environ.get("BOT_TOKEN_FILE", "/run/secrets/bot_token")
+    ).expanduser()
+    if not path.is_file():
+        raise HelmControllerError("Telegram bot token source is unavailable")
+    token = path.read_text(encoding="utf-8").strip()
+    if not token:
+        raise HelmControllerError("Telegram bot token source is empty")
+    return token
 
 
 def stable_event_id(update: dict) -> str:
@@ -695,6 +711,114 @@ class HelmController:
                 (name, int(passed), _json(evidence), now),
             )
 
+    def resolve_known_rejection(
+        self, attempt_id: str, *, evidence: str
+    ) -> str:
+        """Requeue one send only after an externally-proven rejection.
+
+        This is intentionally narrower than a generic unknown-outcome reset.
+        It preserves the original attempt and appends reconciliation evidence.
+        """
+        now = self.clock()
+        with self._write() as conn:
+            attempt = conn.execute(
+                """SELECT event_id, status, error FROM send_attempts
+                   WHERE attempt_id=?""",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise HelmControllerError("send attempt does not exist")
+            if attempt["status"] != "outcome_unknown":
+                raise HelmControllerError("send attempt is not outcome_unknown")
+            if attempt["error"] != "HTTPError":
+                raise HelmControllerError(
+                    "only a recorded HTTP rejection may be reconciled this way"
+                )
+            detail = evidence.strip()[:400]
+            if not detail:
+                raise HelmControllerError("rejection evidence is required")
+            conn.execute(
+                """UPDATE send_attempts SET status='failed',
+                   error=error || '; known rejection: ' || ?
+                   WHERE attempt_id=?""",
+                (detail, attempt_id),
+            )
+            conn.execute(
+                """UPDATE telegram_events SET state='queued', routed_actor=NULL,
+                   claim_token=NULL, claim_expires_at=NULL, completed_at=NULL,
+                   outcome='known_rejection_requeued'
+                   WHERE event_id=? AND state='held_unknown'""",
+                (attempt["event_id"],),
+            )
+            conn.execute(
+                """INSERT INTO controller_meta(key, value_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                     value_json=excluded.value_json,
+                     updated_at=excluded.updated_at""",
+                (
+                    f"reconciliation:{attempt_id}",
+                    _json({"evidence": detail, "event_id": attempt["event_id"]}),
+                    now,
+                ),
+            )
+            return attempt["event_id"]
+
+    def reconcile_private_destination(
+        self, event_id: str, *, chat_id: int, evidence: str
+    ) -> None:
+        """Map one imported archive DM to its Bot API private-chat identity."""
+        now = self.clock()
+        with self._write() as conn:
+            event = conn.execute(
+                """SELECT chat_id, sender_id, payload_json FROM telegram_events
+                   WHERE event_id=?""",
+                (event_id,),
+            ).fetchone()
+            if event is None:
+                raise HelmControllerError("event does not exist")
+            payload = json.loads(event["payload_json"])
+            message = payload.get("message") or {}
+            if (message.get("chat") or {}).get("type") != "private":
+                raise HelmControllerError("only an imported private DM may be retargeted")
+            if int(event["sender_id"] or 0) != int(chat_id):
+                raise HelmControllerError(
+                    "private Bot API destination must equal the authenticated sender"
+                )
+            detail = evidence.strip()[:400]
+            if not detail:
+                raise HelmControllerError("destination evidence is required")
+            old_chat_id = int(event["chat_id"] or 0)
+            message.setdefault("chat", {})["id"] = int(chat_id)
+            conn.execute(
+                """UPDATE telegram_events SET chat_id=?, payload_json=?
+                   WHERE event_id=?""",
+                (int(chat_id), _json(payload), event_id),
+            )
+            conn.execute(
+                """UPDATE conversation_context SET chat_id=?
+                   WHERE chat_id=? AND last_event_id=?""",
+                (int(chat_id), old_chat_id, event_id),
+            )
+            conn.execute(
+                """INSERT INTO controller_meta(key, value_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                     value_json=excluded.value_json,
+                     updated_at=excluded.updated_at""",
+                (
+                    f"destination_reconciliation:{event_id}",
+                    _json(
+                        {
+                            "evidence": detail,
+                            "from_chat_id": old_chat_id,
+                            "to_chat_id": int(chat_id),
+                        }
+                    ),
+                    now,
+                ),
+            )
+
 
 def write_token_file(path: Path | str, token: str) -> None:
     target = Path(path).expanduser()
@@ -724,9 +848,7 @@ def telegram_send_plain(
     reply_to: int | None = None,
     thread_id: int | None = None,
 ) -> dict:
-    bot_token = os.environ.get("BOT_TOKEN")
-    if not bot_token:
-        raise HelmControllerError("BOT_TOKEN is unavailable")
+    bot_token = _load_bot_token()
     body = {"chat_id": chat_id, "text": text[:3800]}
     if reply_to:
         body["reply_to_message_id"] = reply_to
@@ -744,6 +866,11 @@ def telegram_send_plain(
     try:
         with urllib.request.urlopen(request, timeout=40) as response:
             result = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        controller.finish_send(
+            attempt_id, status="failed", error=f"HTTP {exc.code} rejection"
+        )
+        raise
     except Exception as exc:
         controller.finish_send(
             attempt_id, status="outcome_unknown", error=type(exc).__name__
@@ -809,6 +936,15 @@ def _parser() -> argparse.ArgumentParser:
     reconcile = sub.add_parser("reconcile-fleet-history")
     reconcile.add_argument("commodore_db")
 
+    rejection = sub.add_parser("resolve-known-rejection")
+    rejection.add_argument("attempt_id")
+    rejection.add_argument("evidence")
+
+    destination = sub.add_parser("reconcile-private-destination")
+    destination.add_argument("event_id")
+    destination.add_argument("chat_id", type=int)
+    destination.add_argument("evidence")
+
     send = sub.add_parser("send")
     send.add_argument("--token-file", required=True)
     send.add_argument("--event-id", required=True)
@@ -864,6 +1000,16 @@ def main(argv=None) -> int:
         print(_json({"ok": True, "name": args.name}))
     elif args.command == "reconcile-fleet-history":
         print(_json({"reconciled": controller.reconcile_fleet_history(args.commodore_db)}))
+    elif args.command == "resolve-known-rejection":
+        event_id = controller.resolve_known_rejection(
+            args.attempt_id, evidence=args.evidence
+        )
+        print(_json({"ok": True, "event_id": event_id}))
+    elif args.command == "reconcile-private-destination":
+        controller.reconcile_private_destination(
+            args.event_id, chat_id=args.chat_id, evidence=args.evidence
+        )
+        print(_json({"ok": True, "event_id": args.event_id}))
     elif args.command == "send":
         result = telegram_send_plain(
             controller,
