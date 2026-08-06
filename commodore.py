@@ -19,6 +19,8 @@ Ops surface: `docker logs -f leviathan-commodore`.
 from __future__ import annotations
 
 import html
+import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -29,9 +31,17 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from helm_controller import (
+    DuplicateSendHeld,
+    HelmController,
+    ReplyLeaseDenied,
+)
 
 # --- Configuration -----------------------------------------------------------
 
@@ -826,6 +836,22 @@ def sweep_stale_tmp_files() -> int:
 DB_FILE = Path(os.environ.get(
     "COMMODORE_DB_FILE", "~/.local/state/fleet-commodore/commodore.db"
 )).expanduser()
+
+# Optional Mini-local single-writer control plane.  The ordinary immutable
+# Fleet release does not enable it.  A successor release enables it only after
+# an atomic blue/green handoff, at which point every update is committed to the
+# durable queue before routing and every Fleet send must hold the reply lease.
+HELM_CONTROLLER_ENABLED = os.environ.get("HELM_CONTROLLER_ENABLED", "0") == "1"
+HELM_CONTROLLER_DB_FILE = Path(os.environ.get(
+    "HELM_CONTROLLER_DB_FILE",
+    "~/.local/state/fleet-commodore/helm-controller/controller.db",
+)).expanduser()
+HELM_WATCHER_TTL_SECONDS = int(os.environ.get("HELM_WATCHER_TTL_SECONDS", "300"))
+HELM_ACTOR = os.environ.get("HELM_ACTOR", "fleet")
+_HELM_CONTROLLER = (
+    HelmController(HELM_CONTROLLER_DB_FILE) if HELM_CONTROLLER_ENABLED else None
+)
+_HELM_EVENT_ID = contextvars.ContextVar("helm_event_id", default=None)
 
 
 _TOKEN_LEAK_RE = re.compile(r"x-access-token:[^@\s]+@", re.IGNORECASE)
@@ -1792,12 +1818,50 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
     if reply_to:
         data["reply_to_message_id"] = reply_to
 
+    helm_attempt = None
+    if _HELM_CONTROLLER is not None:
+        event_id = _HELM_EVENT_ID.get()
+        if not event_id and reply_to:
+            event_id = f"telegram:reply:{chat_id}:{reply_to}"
+        if not event_id:
+            event_id = f"fleet:outbound:{uuid.uuid4()}"
+        intent_hash = hashlib.sha256(
+            json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        helm_attempt = _HELM_CONTROLLER.begin_send(
+            actor=HELM_ACTOR,
+            event_id=event_id,
+            intent_hash=intent_hash,
+        )
+
     try:
         resp = tg_request("sendMessage", data)
         if isinstance(resp, dict) and resp.get("ok") is False:
             raise ValueError(f"sendMessage returned ok=False: {resp}")
+        if helm_attempt:
+            sent_id = int((resp.get("result") or {}).get("message_id") or 0) or None
+            _HELM_CONTROLLER.finish_send(
+                helm_attempt, status="accepted", telegram_message_id=sent_id
+            )
         return resp
+    except (ReplyLeaseDenied, DuplicateSendHeld):
+        raise
     except Exception as exc:
+        # A network/protocol exception is an ambiguous external outcome.  The
+        # old plain-text retry was acceptable only after Telegram explicitly
+        # rejected HTML parsing.  Under the durable helm fence, never turn an
+        # ambiguous first attempt into a possible duplicate.
+        safe_plain_retry = (
+            isinstance(exc, ValueError)
+            or (isinstance(exc, urllib.error.HTTPError) and exc.code == 400)
+        )
+        if helm_attempt and not safe_plain_retry:
+            _HELM_CONTROLLER.finish_send(
+                helm_attempt,
+                status="outcome_unknown",
+                error=type(exc).__name__,
+            )
+            raise
         log.warning(
             "send_message: HTML parse_mode failed (%s), retrying as plain text",
             exc,
@@ -1807,7 +1871,30 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
             plain_data["message_thread_id"] = thread_id
         if reply_to:
             plain_data["reply_to_message_id"] = reply_to
-        return tg_request("sendMessage", plain_data)
+        try:
+            resp = tg_request("sendMessage", plain_data)
+        except Exception as plain_exc:
+            if helm_attempt:
+                _HELM_CONTROLLER.finish_send(
+                    helm_attempt,
+                    status="outcome_unknown",
+                    error=type(plain_exc).__name__,
+                )
+            raise
+        if isinstance(resp, dict) and resp.get("ok") is False:
+            if helm_attempt:
+                _HELM_CONTROLLER.finish_send(
+                    helm_attempt,
+                    status="failed",
+                    error="Telegram returned ok=false",
+                )
+            raise ValueError("sendMessage returned ok=False")
+        if helm_attempt:
+            sent_id = int((resp.get("result") or {}).get("message_id") or 0) or None
+            _HELM_CONTROLLER.finish_send(
+                helm_attempt, status="accepted", telegram_message_id=sent_id
+            )
+        return resp
 
 
 # --- Agent Chat Mode B relay receipt ----------------------------------------
@@ -4897,7 +4984,11 @@ def _start_workers():
 
 
 def poll():
-    offset = 0
+    offset = (
+        _HELM_CONTROLLER.durable_offset()
+        if _HELM_CONTROLLER is not None
+        else 0
+    )
     recent_by_chat = {}
 
     log.info("Fleet Commodore listener starting")
@@ -4938,8 +5029,24 @@ def poll():
                 "timeout": POLL_TIMEOUT,
                 "allowed_updates": ["message", "my_chat_member"],
             })
+            if _HELM_CONTROLLER is not None:
+                # Successful long-poll completion is the watcher health signal.
+                # A timer cannot renew this lease without proving Telegram
+                # intake actually returned.
+                _HELM_CONTROLLER.heartbeat_watcher(HELM_WATCHER_TTL_SECONDS)
             for update in updates.get("result", []):
-                offset = update["update_id"] + 1
+                if _HELM_CONTROLLER is not None:
+                    queued = _HELM_CONTROLLER.enqueue_update(update)
+                    event_id = queued["event_id"]
+                    offset = _HELM_CONTROLLER.durable_offset()
+                    _HELM_EVENT_ID.set(event_id)
+                    # Under an exclusive Sol lease Fleet remains the sole
+                    # Telegram poller and durable intake owner, but it cannot
+                    # route or answer.  Sol claims the already-queued event.
+                    if not _HELM_CONTROLLER.route_allowed(HELM_ACTOR, event_id):
+                        continue
+                else:
+                    offset = update["update_id"] + 1
                 if update.get("my_chat_member"):
                     _record_membership_update(update)
                     continue
