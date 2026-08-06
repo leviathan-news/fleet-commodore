@@ -1,13 +1,16 @@
 import json
 from pathlib import Path
+import urllib.error
 
 import pytest
 
 from helm_controller import (
     DuplicateSendHeld,
     HelmController,
+    HelmControllerError,
     ReplyLeaseDenied,
     stable_event_id,
+    telegram_send_plain,
 )
 from helm_supervisor import CronGate, HelmSupervisor, RuntimeErrorSafe
 
@@ -372,3 +375,109 @@ def test_controlled_send_retries_after_explicit_html_rejection(tmp_path, monkeyp
     assert len(calls) == 2
     with ctrl._connect() as conn:
         assert conn.execute("SELECT status FROM send_attempts").fetchone()[0] == "accepted"
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload):
+        self.payload = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self.payload
+
+
+def test_sol_sender_loads_token_file_and_retries_only_after_http_rejection(
+    tmp_path, monkeypatch
+):
+    ctrl = controller(tmp_path)
+    event_id = ctrl.enqueue_update(update())["event_id"]
+    token = acquire(ctrl)
+    token_file = tmp_path / "bot-token"
+    token_file.write_text("test-token\n", encoding="utf-8")
+    monkeypatch.delenv("BOT_TOKEN", raising=False)
+    monkeypatch.setenv("BOT_TOKEN_FILE", str(token_file))
+    calls = []
+
+    def reject(request, timeout):
+        calls.append((request.full_url, timeout))
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, None)
+
+    monkeypatch.setattr("helm_controller.urllib.request.urlopen", reject)
+    with pytest.raises(urllib.error.HTTPError):
+        telegram_send_plain(
+            ctrl,
+            token=token,
+            event_id=event_id,
+            chat_id=123,
+            text="canary",
+        )
+    with ctrl._connect() as conn:
+        assert conn.execute("SELECT status FROM send_attempts").fetchone()[0] == "failed"
+
+    monkeypatch.setattr(
+        "helm_controller.urllib.request.urlopen",
+        lambda request, timeout: FakeHTTPResponse(
+            {"ok": True, "result": {"message_id": 44}}
+        ),
+    )
+    result = telegram_send_plain(
+        ctrl,
+        token=token,
+        event_id=event_id,
+        chat_id=123,
+        text="canary",
+    )
+    assert result["result"]["message_id"] == 44
+
+
+def test_manual_known_rejection_requeues_legacy_http_unknown(tmp_path):
+    ctrl = controller(tmp_path)
+    event_id = ctrl.enqueue_update(update())["event_id"]
+    token = acquire(ctrl)
+    attempt = ctrl.begin_send(
+        actor="sol", event_id=event_id, intent_hash="old", token=token
+    )
+    ctrl.finish_send(attempt, status="outcome_unknown", error="HTTPError")
+
+    resolved = ctrl.resolve_known_rejection(
+        attempt, evidence="Telegram returned HTTP 400 before acceptance"
+    )
+
+    assert resolved == event_id
+    assert ctrl.status()["queue"] == {"queued": 1}
+    with ctrl._connect() as conn:
+        row = conn.execute(
+            "SELECT status, error FROM send_attempts WHERE attempt_id=?", (attempt,)
+        ).fetchone()
+    assert row["status"] == "failed"
+    assert "HTTP 400" in row["error"]
+
+
+def test_imported_private_destination_reconciles_only_to_sender(tmp_path):
+    ctrl = controller(tmp_path)
+    imported = update()
+    imported["message"]["chat"] = {"id": 999_999, "type": "private"}
+    event_id = ctrl.enqueue_update(imported)["event_id"]
+
+    with pytest.raises(HelmControllerError, match="authenticated sender"):
+        ctrl.reconcile_private_destination(
+            event_id, chat_id=456, evidence="wrong target"
+        )
+
+    ctrl.reconcile_private_destination(
+        event_id,
+        chat_id=123,
+        evidence="archive peer maps to the authenticated Bot API private chat",
+    )
+    with ctrl._connect() as conn:
+        row = conn.execute(
+            "SELECT chat_id, payload_json FROM telegram_events WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+    assert row["chat_id"] == 123
+    assert json.loads(row["payload_json"])["message"]["chat"]["id"] == 123

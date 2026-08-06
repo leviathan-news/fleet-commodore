@@ -72,8 +72,17 @@ reply uses `helm_controller.py send` with the event ID and current token. An
 accepted or ambiguous attempt prevents another send for the same event.
 
 An ambiguous network outcome is held as `outcome_unknown`; do not retry it.
+An HTTP error is a definitive API rejection and is recorded as `failed`.
 Telegram's explicit HTML rejection may fall back once to plain text because
-the rejected request had no external side effect.
+the rejected request had no external side effect. A legacy unknown row may be
+requeued only with the explicit `resolve-known-rejection` command and preserved
+evidence that the API returned a rejection before acceptance.
+
+An event imported from the archive may carry the archive peer identity rather
+than Telegram's Bot API private-chat identity. Reconcile that destination only
+for a private DM and only to the authenticated sender ID. The controller keeps
+the old and new identities with the evidence; group destinations cannot use
+this correction.
 
 After a Fleet failback, run legacy-history reconciliation before a second Sol
 takeover. This marks queued events already routed by Fleet, so the restored Sol
