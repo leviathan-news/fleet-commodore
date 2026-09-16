@@ -429,4 +429,3 @@ def generate_via_codex(
                 model, failure_class, process.returncode, len(stdout_bytes), len(stderr_bytes),
             )
         return response
-
