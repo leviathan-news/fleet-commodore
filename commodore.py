@@ -1530,9 +1530,21 @@ def _reply_chain_context(msg: dict) -> list[dict]:
         return []
 
     chain: list[dict] = []
-    quote_text = sanitize_untrusted(
-        str(_message_text(current) or ""), max_len=_MAX_REPLY_CONTEXT_TEXT
-    )
+    # Message.quote is the selected excerpt; reply_to_message contains the
+    # complete parent. Never expand a selected (or malformed) quote into the
+    # unselected parent body, including a stale copy from the local ledger.
+    if "quote" in msg:
+        selected_quote = msg["quote"]
+        if not isinstance(selected_quote, dict) or not isinstance(selected_quote.get("text"), str):
+            return []
+        quote_source = selected_quote["text"]
+        if not quote_source.strip():
+            return []
+    else:
+        quote_source = str(_message_text(current) or "")
+    quote_text = sanitize_untrusted(quote_source, max_len=_MAX_REPLY_CONTEXT_TEXT)
+    if "quote" in msg and not quote_text.strip():
+        return []
     row = _chat_history_reply_edge(chat_id, topic_id, parent_id)
     if quote_text:
         sender = current.get("from") or {}

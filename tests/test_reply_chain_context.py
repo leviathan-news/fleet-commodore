@@ -6,6 +6,8 @@ therefore come from Fleet's exact local reply-edge ledger, never chat recency.
 import json
 import sqlite3
 
+import pytest
+
 import codex_qa
 import commodore
 
@@ -153,6 +155,58 @@ def test_quote_text_is_the_direct_referent_not_a_stale_local_copy(monkeypatch, t
 
     assert context[0]["text"] == "quoted cookie-read parent"
     assert "stale local parent" not in json.dumps(context)
+
+
+def test_selected_quote_excludes_unselected_parent_from_chat_and_qa(monkeypatch, tmp_path):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch, parent_text="UNSELECTED_PARENT_CONTENT")
+    msg["quote"] = {"text": "selected cookie-read excerpt", "position": 0, "is_manual": True}
+    msg["text"] = "Can you test whether that swap is feasible?"
+    captured = {}
+
+    def fake_chat_ask(prompt, **_kwargs):
+        captured["chat"] = prompt
+        return "I will test the cookie-read change."
+
+    monkeypatch.setattr(commodore, "llm_ask", fake_chat_ask)
+    commodore.generate_response(
+        msg, is_direct=True, policy=commodore._policy_for(CHAT_ID, TOPIC_ID), recent_messages=[],
+    )
+    while not commodore._qa_queue.empty():
+        commodore._qa_queue.get_nowait()
+    commodore._qa_cooldown_by_user.pop(REQUESTER_ID, None)
+    job_uuid, _ack = commodore._claim_qa_job(msg, msg["text"])
+    with sqlite3.connect(commodore.DB_FILE) as conn:
+        context = json.loads(conn.execute(
+            "SELECT reply_context_json FROM qa_job WHERE job_uuid=?", (job_uuid,),
+        ).fetchone()[0])
+
+    def fake_qa_ask(prompt, **_kwargs):
+        captured["qa"] = prompt
+        return json.dumps({"status": "declined", "declined_reason": "fixture"})
+
+    monkeypatch.setattr(codex_qa, "ask", fake_qa_ask)
+    codex_qa.answer({"qa_uuid": job_uuid, "question": msg["text"], "reply_context": context})
+
+    assert context[0]["text"] == "selected cookie-read excerpt"
+    assert [entry["message_id"] for entry in context] == [902, 901]
+    for prompt in captured.values():
+        assert "selected cookie-read excerpt" in prompt
+        assert "UNSELECTED_PARENT_CONTENT" not in prompt
+
+
+@pytest.mark.parametrize("quote", [None, [], {}, {"text": None}, {"text": 123}, {"text": "  "}])
+def test_invalid_selected_quote_never_expands_to_parent_or_ledger(monkeypatch, tmp_path, quote):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch, parent_text="UNSELECTED_PARENT_CONTENT")
+    msg["quote"] = quote
+    assert commodore._reply_chain_context(msg) == []
+    assert commodore._reply_context_unavailable(msg)
+
+
+def test_selected_quote_is_bounded_before_forwarding(monkeypatch, tmp_path):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch)
+    msg["quote"] = {"text": "x" * 1000, "position": 0}
+    context = commodore._reply_chain_context(msg)
+    assert len(context[0]["text"]) <= commodore._MAX_REPLY_CONTEXT_TEXT
 
 
 def test_missing_exact_edge_never_substitutes_recent_pr(monkeypatch, tmp_path):
