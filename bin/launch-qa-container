@@ -146,6 +146,33 @@ def main() -> "None":
         emit({"error": "invalid_uuid"}, exit_code=2)
     container_name = f"commodore-qa-{job_uuid}"
 
+    provider = os.environ.get("FLEET_QA_PROVIDER", os.environ.get("FLEET_PROVIDER", "codex"))
+    if provider == "codex":
+        # Host subscription transport never receives application credentials.
+        # Its evidence broker executes only bounded read-only operations; SQL
+        # stays inside the existing reader-role container boundary.
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from codex_qa import answer
+        from qa_worker import write_result_atomically
+        try:
+            raw = sys.stdin.read(2_000_001)
+            if len(raw) > 2_000_000:
+                emit({"error": "job_too_large"}, exit_code=5)
+            job = json.loads(raw)
+            if not isinstance(job, dict) or not isinstance(job.get("question"), str):
+                emit({"error": "bad_job_json"}, exit_code=5)
+            job["qa_uuid"] = job_uuid
+            RESULTS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            import qa_worker
+            qa_worker.RESULTS_DIR = RESULTS_DIR
+            result = answer(job)
+            write_result_atomically(job_uuid, result)
+            emit(result)
+        except (OSError, ValueError, TypeError):
+            emit({"error": "codex_qa_failed"}, exit_code=5)
+    if provider != "claude":
+        emit({"error": "invalid_provider"}, exit_code=5)
+
     try:
         db_url = DB_URL_FILE.read_text().strip()
     except FileNotFoundError as exc:

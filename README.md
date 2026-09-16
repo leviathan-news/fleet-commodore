@@ -27,6 +27,12 @@ do not copy a virtual environment into the Git worktree.
 
 ## Build + run
 
+Conversation and read-only Q&A default to **Codex / Luna**, using the service
+account's existing ChatGPT subscription login. No API key or API-billed fallback
+is used. Set `FLEET_PROVIDER` and optionally `FLEET_QA_PROVIDER` to `claude` only
+for an intentional legacy route. Build/review and security triage still use
+Claude and are not repaired by switching the conversation provider.
+
 ```bash
 cp .env.example .env            # fill in tokens, channel ids, admin ids
 # Secrets go in ~/commodore-secrets/ on the Mini, chmod 600:
@@ -111,7 +117,7 @@ is 128 KiB and `TELEGRAM_TEXT_DOCUMENT_MAX_BYTES` may lower it or raise it only
 up to the hard 256 KiB ceiling. The worker receives the attachment separately
 from the asker's question and labels it untrusted data; text inside the file is
 never treated as instructions. Attachment-review turns use a **no-tools**
-Claude profile: no `Read`, `WebFetch`, database wrapper, shell, filesystem, or
+provider profile: no document retrieval, web fetch, database wrapper, shell, filesystem, or
 network access. Rejections and retrieval failures acknowledge that the
 attachment arrived and state the safe reason, without logging the bot token,
 authenticated file URL, or document body.
@@ -119,7 +125,7 @@ authenticated file URL, or document body.
 ## Tests
 
 For authentication outages, heartbeat semantics and live recovery verification,
-see [Claude outage recovery](docs/CLAUDE_RECOVERY.md).
+see [Provider outage recovery](docs/CLAUDE_RECOVERY.md).
 
 ```bash
 cd fleet-commodore

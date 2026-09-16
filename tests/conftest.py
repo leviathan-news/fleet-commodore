@@ -5,6 +5,9 @@ import tempfile
 from pathlib import Path
 
 os.environ["BOT_TOKEN"] = "TEST_TOKEN"
+# Legacy behavior tests opt into their original provider explicitly. Codex
+# routing has independent tests with all model/network calls stubbed.
+os.environ["FLEET_PROVIDER"] = "claude"
 os.environ["BOT_USERNAME"] = "commodore_lev_bot"
 os.environ["BOT_HQ_GROUP_ID"] = "-1001111111111"
 os.environ["SQUID_CAVE_GROUP_ID"] = "-1002222222222"

@@ -1,10 +1,44 @@
-# Claude outage recovery
+# Provider outage recovery
 
-Fleet conversation, Q&A and build/review currently require Claude. Installing
-Codex does not add a fallback provider. The dormant helm controller is outside
-this recovery slice and must not be enabled as an authentication workaround.
+Conversation and read-only Q&A default to Codex (`gpt-5.6-luna`, medium
+reasoning), using the service account's cached ChatGPT subscription login.
+Claude authentication is not a prerequisite for these routes. Build/review and
+security triage remain Claude-dependent; this release does not migrate them.
+The dormant helm controller must not be enabled as an authentication workaround.
 
-## Re-authenticate and verify
+## Codex authentication and evidence
+
+Codex is fixed at `/opt/homebrew/bin/codex`. It runs with forced ChatGPT login,
+an ephemeral empty workspace, tools/apps/MCP/hooks disabled, no inherited API
+keys or application credentials, and a bounded process group. For a new login,
+use `codex login --device-auth` on the service host and complete consent in a
+browser. Never switch to API billing as an outage workaround.
+
+Run `bin/provider-probe.py` with the service-owned Python interpreter: an exact
+neutral marker is required for success. It bypasses cached cooldown state and
+does not send Telegram. `codex login status` alone is not a transport proof.
+
+Codex chat calls are bounded to 60 seconds. Failures open an external SQLite
+health cooldown: ten minutes for authentication/quota, one minute otherwise.
+Subsequent calls fail promptly with an honest outage reply and deduplicated
+operator alert. Recovery after cooldown is demand-driven. Chat is still
+synchronous; asynchronous intake and supervised helm remain separate work.
+
+Codex itself has no tools. Q&A uses a host broker with at most four model rounds
+in 225 seconds, each call capped at 55 seconds. Typed requests can search/read
+the existing allowlisted documentation or run one query through the existing
+read-only `commodore-db` wrapper in a disposable reviewer container. Database
+credentials go only to that container, never to the model process. Queries
+retain the reader role, sensitive-table denylist, three-second statement
+timeout and 500-row cap; container output/lifetime are capped at 128 KiB/15s.
+
+Answers must cite identifiers actually retrieved by the broker. This rejects
+invented source identifiers, not every possible misinterpretation of evidence.
+SQL evidence carries an observation time; a document mtime is not deployment
+proof. Attachment review has no retrieval tools. General shell, ORM execution,
+web fetching, actions and writes are unavailable on the Codex Q&A route.
+
+## Explicit legacy Claude route
 
 On the service host, use the service account's interactive Claude subscription
 login (`claude auth login --claudeai`, or `/login` inside Claude Code). Complete
@@ -18,7 +52,7 @@ Telegram reply receipts. Check the worker container separately: its staged auth
 and egress environment can differ from the host. Do not replay historical user
 requests to obtain a success receipt.
 
-The chat breaker now opens after the first CLI timeout and suppresses immediate
+The legacy chat breaker opens after the first CLI timeout and suppresses immediate
 retries. Its next recovery probe is eligible after 600 seconds by default, when
 a call checks availability. This is demand-driven recovery, not a background
 promise to recover exactly ten minutes after login. Successful probing clears
@@ -27,7 +61,9 @@ the breaker without a restart. The first hung chat call still has its normal
 
 ## What the checks mean
 
-The hourly heartbeat alerts immediately for an explicit authentication failure,
+The hourly heartbeat probes the selected conversation provider, not both. A
+broken Claude login does not mark a healthy Codex route down. It alerts
+immediately for an explicit authentication failure,
 or after three consecutive non-OK probes of any class. Thus an unclassified
 hang can take three scheduled probes to page, while an explicit revoked-token
 fixture should page on its first probe. Success resets the failure count.
@@ -36,7 +72,8 @@ directory outside the immutable release. Accepted, rejected and uncertain
 Telegram deliveries must remain distinguishable.
 
 The no-network QA readiness report includes `provider_transport: not_checked`
-and a warning when the credential file is older than seven days. Age is only a
+and, on the legacy Claude route, a warning when credentials are older than
+seven days. Age is only a
 heuristic: old credentials may work and fresh ones may already be revoked.
 
 An explicit Q&A worker failure is reported as `worker_failed`, with the worker's
@@ -56,5 +93,6 @@ Local regressions cover timeout and recovery, actual bounded fake-CLI hangs,
 QA failure recording/paging, heartbeat streaks/delivery suppression and
 credential-age warnings. Passing these does not establish live recovery. Keep
 the incident open until authenticated runtime probes and fresh useful replies
-have been verified. Codex resilience and supervised helm recovery follow as
-separate slices after ordinary operation is restored.
+have been verified. Record exact artifact SHA, read-only SQL/document/attachment
+runtime checks, and new Telegram receipts separately. Legacy Claude-dependent
+jobs and supervised helm recovery remain outstanding, not implicitly repaired.

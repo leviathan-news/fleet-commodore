@@ -1,5 +1,5 @@
 #!/bin/bash
-# Claude OAuth heartbeat — keeps token fresh + alerts on rotation failure.
+# Selected-provider heartbeat — probes subscription transport and alerts on failure.
 #
 # Runs hourly via cron. Fires a no-op `claude --print` against the host's
 # ~/.claude/.credentials.json. Three outcomes:
@@ -46,11 +46,13 @@ CONSECUTIVE_FILE=$FLEET_COMMODORE_STATE_DIR/claude-heartbeat-consecutive
 LAST_ALERT_FILE=$FLEET_COMMODORE_STATE_DIR/claude-heartbeat-last-alert
 PENDING_ALERT_FILE=$FLEET_COMMODORE_STATE_DIR/claude-heartbeat-alert-pending
 
-# Claude CLI must be on PATH for cron's bare environment.
+# The selected provider must be first in line; the other provider is never
+# invoked as a fallback.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 CLAUDE_BIN=${CLAUDE_BIN:-claude}
 CURL_BIN=${CURL_BIN:-curl}
 PYTHON_BIN=${FLEET_COMMODORE_PYTHON:-python3}
+FLEET_PROVIDER=${FLEET_PROVIDER:-codex}
 
 # Serialize scheduled and manual probes without a crash-stale directory lock.
 if [[ "${1:-}" != "--lock-held" ]]; then
@@ -67,11 +69,34 @@ write_state() {
     printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"
 }
 
-# Run the probe with a 30s wall budget. Stderr is captured separately so
-# we can classify the failure mode without the success line being polluted.
+# Run the selected provider probe with a bounded wall budget. Stderr is
+# captured separately so classification never includes raw provider output.
 PROBE_OUT=$TMP/probe.out
 PROBE_ERR=$TMP/probe.err
+: > "$PROBE_OUT"
+: > "$PROBE_ERR"
 PROBE_RC=0
+if [[ "$FLEET_PROVIDER" == "codex" ]]; then
+    "$PYTHON_BIN" "$REPO_DIR/bin/provider-probe.py" >"$PROBE_OUT" 2>"$PROBE_ERR"
+    PROBE_RC=$?
+    PROBE_STATE=$(PROBE_JSON=$(<"$PROBE_OUT") "$PYTHON_BIN" -c '
+import json, os, sys
+try:
+    value = json.loads(os.environ["PROBE_JSON"])
+    if (isinstance(value, dict) and value.get("provider") == "codex"
+            and set(value) == {"provider", "state"}
+            and value["state"] in {"ok", "auth_failed", "timeout", "quota", "unknown_error"}):
+        print(value["state"])
+    else:
+        raise ValueError
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    sys.exit(2)
+' 2>/dev/null) || PROBE_STATE=unknown_error
+    STATE=$PROBE_STATE
+    if [[ "$STATE" == "ok" && "$PROBE_RC" -ne 0 ]]; then
+        STATE=unknown_error
+    fi
+elif [[ "$FLEET_PROVIDER" == "claude" ]]; then
 echo "ping" | "$CLAUDE_BIN" --print --output-format text >"$PROBE_OUT" 2>"$PROBE_ERR" &
 PROBE_PID=$!
 
@@ -88,23 +113,28 @@ else
     wait "$PROBE_PID" 2>/dev/null
     PROBE_RC=$?
 fi
+else
+    STATE=unknown_error
+    PROBE_RC=2
+fi
 
 OUT=$(<"$PROBE_OUT")
 ERR=$(<"$PROBE_ERR")
 COMBINED="$OUT $ERR"
 
-# Detect the auth-failure pattern. Same string the daemon's
-# _looks_like_claude_limit_error / probe checks for.
-if echo "$COMBINED" | grep -qE "Failed to authenticate|API Error: 401|authentication_error"; then
-    STATE=auth_failed
-elif [[ "$PROBE_RC" -eq 124 ]]; then
-    STATE=timeout
-elif echo "$COMBINED" | grep -qiE "usage limit|monthly usage|quota|credit balance|rate limit|too many requests"; then
-    STATE=quota
-elif [[ "$PROBE_RC" -ne 0 ]] || [[ -z "$OUT" ]]; then
-    STATE=unknown_error
-else
-    STATE=ok
+if [[ "$FLEET_PROVIDER" != "codex" ]]; then
+    # Detect Claude's auth, quota, timeout, and unexpected failures.
+    if echo "$COMBINED" | grep -qE "Failed to authenticate|API Error: 401|authentication_error"; then
+        STATE=auth_failed
+    elif [[ "$PROBE_RC" -eq 124 ]]; then
+        STATE=timeout
+    elif echo "$COMBINED" | grep -qiE "usage limit|monthly usage|quota|credit balance|rate limit|too many requests"; then
+        STATE=quota
+    elif [[ "$PROBE_RC" -ne 0 ]] || [[ -z "$OUT" ]]; then
+        STATE=unknown_error
+    else
+        STATE=ok
+    fi
 fi
 
 # Log line — always written, terse
@@ -121,9 +151,13 @@ if [[ "$STATE" != "ok" ]]; then
 
     ALERT_REASON=
     if [[ "$STATE" == "auth_failed" ]]; then
-        ALERT_REASON="Claude OAuth authentication failed on the Mini. Please run claude /login on the Mini. Last probe at $(now) returned an authentication failure."
+        if [[ "$FLEET_PROVIDER" == "codex" ]]; then
+            ALERT_REASON="Codex subscription authentication failed on the Mini. Please run codex login --device-auth on the Mini. Last probe at $(now) returned an authentication failure."
+        else
+            ALERT_REASON="Claude OAuth authentication failed on the Mini. Please run claude /login on the Mini. Last probe at $(now) returned an authentication failure."
+        fi
     elif (( CONSECUTIVE >= 3 )); then
-        ALERT_REASON="Claude heartbeat has failed for $CONSECUTIVE consecutive probes; current state is $STATE. Last probe at $(now)."
+        ALERT_REASON="$FLEET_PROVIDER heartbeat has failed for $CONSECUTIVE consecutive probes; current state is $STATE. Last probe at $(now)."
     fi
 
     if [[ -n "$ALERT_REASON" && -n "${BOT_TOKEN:-}" && -n "${BOT_HQ_GROUP_ID:-}" ]]; then

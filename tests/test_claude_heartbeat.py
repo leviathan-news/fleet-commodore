@@ -8,7 +8,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).parents[1] / "cron/claude-oauth-heartbeat.sh"
 
 
-def run_heartbeat(tmp_path, state, response='{"ok":true}', curl_rc="0"):
+def run_heartbeat(tmp_path, state, response='{"ok":true}', curl_rc="0", provider="claude", probe_rc=""):
     fake_bin = tmp_path / ".local/bin"
     fake_bin.mkdir(parents=True, exist_ok=True)
     (fake_bin / "claude").write_text(
@@ -29,6 +29,19 @@ def run_heartbeat(tmp_path, state, response='{"ok":true}', curl_rc="0"):
     )
     for program in (fake_bin / "claude", fake_bin / "curl"):
         program.chmod(0o755)
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        '#!/bin/sh\n'
+        'case "$1" in\n'
+        '  */bin/provider-probe.py)\n'
+        '    printf "{\\"provider\\":\\"codex\\",\\"state\\":\\"%s\\"}\n" "$PROBE_STATE"\n'
+        '    if [ -n "$PROBE_RC_OVERRIDE" ]; then exit "$PROBE_RC_OVERRIDE"; fi\n'
+        '    [ "$PROBE_STATE" = ok ]\n'
+        '    ;;\n'
+        '  *) exec "$REAL_PYTHON" "$@";;\n'
+        'esac\n'
+    )
+    fake_python.chmod(0o755)
     config = tmp_path / "config"
     config.write_text("BOT_TOKEN=test-token\nBOT_HQ_GROUP_ID=-123\n")
     env = os.environ.copy()
@@ -37,8 +50,11 @@ def run_heartbeat(tmp_path, state, response='{"ok":true}', curl_rc="0"):
         FLEET_COMMODORE_STATE_DIR=str(tmp_path / "state"),
         CLAUDE_BIN=str(fake_bin / "claude"),
         CURL_BIN=str(fake_bin / "curl"),
-        FLEET_COMMODORE_PYTHON=sys.executable,
+        FLEET_COMMODORE_PYTHON=str(fake_python),
+        REAL_PYTHON=sys.executable,
+        FLEET_PROVIDER=provider,
         PROBE_STATE=state,
+        PROBE_RC_OVERRIDE=probe_rc,
         CURL_RESPONSE=response,
         CURL_RC=curl_rc,
         CURL_LOG=str(tmp_path / "curl.log"),
@@ -113,3 +129,39 @@ def test_advisory_lock_blocks_overlap_and_releases_after_owner_exit(tmp_path):
     # The file remains, but no live lock owner remains: a later probe proceeds.
     assert run_heartbeat(tmp_path, "auth").returncode == 1
     assert len((tmp_path / "curl.log").read_text().splitlines()) == 1
+
+
+def test_codex_route_never_invokes_claude_and_resets_on_success(tmp_path):
+    result = run_heartbeat(tmp_path, "ok", provider="codex")
+    assert result.returncode == 0
+    assert (tmp_path / "state/claude-heartbeat-consecutive").read_text().strip() == "0"
+    assert not (tmp_path / "curl.log").exists()
+
+
+def test_codex_failed_probe_pages_after_three_and_ok_resets(tmp_path):
+    for _ in range(3):
+        assert run_heartbeat(tmp_path, "quota", provider="codex").returncode == 1
+    message = (tmp_path / "curl.log").read_text()
+    assert "codex heartbeat has failed" in message
+    assert "Claude heartbeat" not in message
+    assert run_heartbeat(tmp_path, "ok", provider="codex").returncode == 0
+    assert (tmp_path / "state/claude-heartbeat-consecutive").read_text().strip() == "0"
+
+
+def test_codex_probe_rc_zero_with_non_ok_state_is_unknown_error(tmp_path):
+    result = run_heartbeat(tmp_path, "not_a_whitelisted_state", provider="codex")
+    assert result.returncode == 1
+    assert "state=unknown_error" in (tmp_path / "state/logs/claude-heartbeat.log").read_text()
+
+
+def test_unknown_provider_never_invokes_claude(tmp_path):
+    result = run_heartbeat(tmp_path, "auth", provider="not-a-provider")
+    assert result.returncode == 1
+    assert "state=unknown_error" in (tmp_path / "state/logs/claude-heartbeat.log").read_text()
+    assert not (tmp_path / "curl.log").exists()
+
+
+def test_codex_ok_payload_with_failed_exit_is_not_health(tmp_path):
+    result = run_heartbeat(tmp_path, "ok", provider="codex", probe_rc="1")
+    assert result.returncode == 1
+    assert "state=unknown_error" in (tmp_path / "state/logs/claude-heartbeat.log").read_text()
