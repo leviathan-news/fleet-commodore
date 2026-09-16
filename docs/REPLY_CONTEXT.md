@@ -21,7 +21,9 @@ Accepted bot replies and incoming replies persist their exact edge. Startup
 adds nullable `chat_history.reply_to_msg_id` and `qa_job.reply_context_json`
 columns idempotently; historical rows remain valid and are not guessed or
 backfilled. Q&A stores the selected context with the claimed job and forwards
-it as untrusted data to the configured provider.
+it as untrusted data to the configured provider. Both Q&A providers put that
+untrusted context before a separately labelled, final current question, so a
+terse correction cannot be overridden by a parent's stale concrete referent.
 
 When a reply exists but no safe referent can be recovered, Fleet asks the
 requester to name the change or question rather than making a provider call
