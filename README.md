@@ -122,6 +122,14 @@ network access. Rejections and retrieval failures acknowledge that the
 attachment arrived and state the safe reason, without logging the bot token,
 authenticated file URL, or document body.
 
+## Reply context
+
+Conversation and Q&A use the message's exact reply referent, not whichever PR
+was mentioned most recently. Selected Telegram quotes stay selected; older
+parents come only from same-chat, same-topic reply edges in the local ledger.
+See [Reply context contract](docs/REPLY_CONTEXT.md) for bounds, migrations,
+failure behavior, and release acceptance.
+
 ## Tests
 
 For authentication outages, heartbeat semantics and live recovery verification,
