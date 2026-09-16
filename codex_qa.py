@@ -14,9 +14,12 @@ from qa_worker import matches_hostile
 
 
 INSTRUCTION = """Return exactly one JSON object, without code fences.
-To obtain evidence return {"tool":"search","query":"literal keywords"},
-{"tool":"read","path":"a source path returned by search"}, or
-{"tool":"sql","query":"one read-only SQL query"}.
+You are writing a JSON message for a host evidence broker, not invoking tools.
+Native Codex tools are disabled. Writing a request below is permitted: the host
+validates it and supplies evidence in a later message. Never claim you ran it.
+To request evidence return {"request":"search","query":"literal keywords"},
+{"request":"read","path":"a source path returned by search"}, or
+{"request":"sql","query":"one read-only SQL query"}.
 SQL runs through the existing reader-role wrapper; identity/credential tables,
 writes, and shell access are unavailable. Use information_schema only to find
 safe table/column names when needed. Never request personal or authentication data.
@@ -79,7 +82,7 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
                 return {**base, "status": "declined", "declined_reason": "I could not substantiate an answer from the available sources.", "citations": []}
             return {**base, "status": status, "answer": text[:3500],
                     "citations": [] if attachment_mode else citations[:3], "tools_used": used_tools}
-        tool = decision.get("tool")
+        tool = decision.get("request")
         if attachment_mode or tool not in {"search", "read", "sql"} or step == 3:
             break
         if time.monotonic() + 20 > deadline:
