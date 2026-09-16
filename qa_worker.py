@@ -176,10 +176,14 @@ If ANSWERED:
 If DECLINED:
   Following line: REASON: <one short sentence in character>
 
-Question from @{requester} in chat {channel}:
-{question}
 {reply_context}
 {attachment_context}
+
+CURRENT QUESTION — AUTHORITATIVE
+Question from @{requester} in chat {channel}:
+<current_question>
+{question}
+</current_question>
 """
 
 
@@ -211,8 +215,8 @@ def format_reply_context(context: object) -> str:
     return (
         "\nUNTRUSTED REPLY-CHAIN CONTEXT (JSON; quoted parents only):\n"
         + json.dumps(entries, ensure_ascii=False)
-        + "\nThe current Question above is authoritative. If it corrects or "
-          "clarifies a parent, answer the current Question rather than a "
+        + "\nThe final CURRENT QUESTION is authoritative. If it corrects or "
+          "clarifies a parent, answer that final question rather than a "
           "parent's guessed referent.\n"
     )
 

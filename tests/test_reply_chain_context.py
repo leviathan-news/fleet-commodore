@@ -10,6 +10,7 @@ import pytest
 
 import codex_qa
 import commodore
+import qa_worker
 
 
 CHAT_ID = int(commodore.LEV_DEV_GROUP_ID)
@@ -119,6 +120,57 @@ def test_correction_beats_direct_parent_guess_via_durable_root(monkeypatch, tmp_
     assert "cookie-read change" in captured["prompt"]
     assert "I meant check whether the swap is feasible." in captured["prompt"]
     assert "follow the current message; do not continue a parent's guessed referent" in captured["prompt"]
+
+
+def test_qa_correction_follows_final_current_question_not_stale_parent(monkeypatch):
+    """The real #908/#1119 confusion must not recur in either Q&A provider."""
+    current_question = "I meant test the cookie read-lane swap in PR #908."
+    context = [
+        {"message_id": 884, "sender": "@fleet", "text": "PR #1119 expiry recovery is ready."},
+        {"message_id": 883, "sender": "@zero", "text": "Good, let's test it."},
+        {"message_id": 876, "sender": "@fleet", "text": "PR #908 is the cookie read lane."},
+        {"message_id": 872, "sender": "@zero", "text": "Could we test its swap feasibility?"},
+    ]
+
+    worker_prompt = qa_worker.QA_PROMPT_TEMPLATE.format(
+        source_policy="", requester="zero", channel="Lev Dev",
+        question=current_question, reply_context=qa_worker.format_reply_context(context),
+        attachment_context="",
+    )
+    assert worker_prompt.index("PR #1119") < worker_prompt.index("CURRENT QUESTION — AUTHORITATIVE")
+    assert worker_prompt.rindex(current_question) > worker_prompt.index("CURRENT QUESTION — AUTHORITATIVE")
+    assert "final CURRENT QUESTION is authoritative" in worker_prompt
+
+    captured = []
+    decisions = iter([
+        {"request": "search", "query": "cookie read lane"},
+        {"status": "declined", "declined_reason": "fixture"},
+    ])
+
+    class FakeReader:
+        def __init__(self, _root):
+            pass
+
+        def search(self, _query):
+            return {"results": []}
+
+    def fake_ask(prompt, **_kwargs):
+        captured.append(json.loads(prompt))
+        return json.dumps(next(decisions))
+
+    monkeypatch.setattr(codex_qa, "KnowledgeReader", FakeReader)
+    monkeypatch.setattr(codex_qa, "ask", fake_ask)
+    result = codex_qa.answer({
+        "qa_uuid": "correction-fixture", "question": current_question,
+        "reply_context": context,
+    })
+
+    assert result["status"] == "declined"
+    assert len(captured) == 2
+    for prompt in captured:
+        assert list(prompt)[-1] == "current_question"
+        assert prompt["current_question"] == current_question
+        assert prompt["reply_chain_context"] == context
 
 
 def test_qa_persists_realistic_direct_quote_and_durable_root(monkeypatch, tmp_path):
