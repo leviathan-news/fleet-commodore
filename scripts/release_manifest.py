@@ -25,11 +25,20 @@ ARTIFACT_FILES = (
     "helm_sol_bridge.py",
     "helm_supervisor.py",
     "qa_worker.py",
+    "codex_provider.py",
+    "codex_runtime.py",
+    "codex_qa.py",
+    "qa_knowledge.py",
+    "qa_sql.py",
+    "bin/provider-probe.py",
+    "bin/launch-qa-container",
+    "bin/commodore-db",
     "triage/commodore_triage.py",
     "triage/RUNBOOK.md",
     "bin/qa-healthcheck.py",
     "cron/qa-healthcheck.sh",
     "cron/claude-oauth-heartbeat.sh",
+    "cron/heartbeat_state.py",
     "cron/commodore-triage.sh",
     "cron/watchdog.sh",
     "cron/helm-controller-watchdog.sh",
@@ -47,6 +56,10 @@ NON_SECRET_ENV = (
     "OPERATOR_DM_USER_ID",
     "TRIAGE_OPERATOR_DM_USER_ID",
     "CLAUDE_BIN",
+    "FLEET_PROVIDER",
+    "FLEET_QA_PROVIDER",
+    "CODEX_CHAT_MODEL",
+    "CODEX_QA_MODEL",
     "SEC_FEED_BIN",
     "TRIAGE_DB_FILE",
     "TRIAGE_POSTING_ENABLED",
@@ -144,9 +157,16 @@ def build_manifest(root: Path = ROOT) -> dict:
     runtime["SEC_FEED_BIN_REALPATH"] = _resolved_executable(feed_effective)
     runtime["CLAUDE_BIN_SHA256"] = _executable_sha256(runtime["CLAUDE_BIN_REALPATH"])
     runtime["SEC_FEED_BIN_SHA256"] = _executable_sha256(runtime["SEC_FEED_BIN_REALPATH"])
+    runtime["CODEX_BIN_REALPATH"] = _resolved_executable("/opt/homebrew/bin/codex")
+    runtime["CODEX_BIN_SHA256"] = _executable_sha256(runtime["CODEX_BIN_REALPATH"])
     readiness = {
         "operator_dm_pinned": bool(runtime["TRIAGE_OPERATOR_DM_USER_ID"] or runtime["OPERATOR_DM_USER_ID"]),
         "claude_executable_resolved": runtime["CLAUDE_BIN_REALPATH"] is not None,
+        "conversation_provider_resolved": (
+            runtime["CODEX_BIN_REALPATH"] is not None
+            if (runtime["FLEET_PROVIDER"] or "codex") == "codex"
+            else runtime["FLEET_PROVIDER"] == "claude" and runtime["CLAUDE_BIN_REALPATH"] is not None
+        ),
         "sec_feed_explicit_absolute": bool(
             feed_effective
             and Path(feed_effective).expanduser().is_absolute()

@@ -1,5 +1,7 @@
 """Contract tests for the non-network QA readiness check."""
 import importlib.util
+import os
+import time
 from pathlib import Path
 
 
@@ -54,3 +56,39 @@ def test_readiness_report_is_explicit_about_healthy_dependencies(monkeypatch, tm
 
     assert report["ok"] is True
     assert report["failed"] == []
+    assert report["warnings"] == []
+    assert report["provider_transport"] == "not_checked"
+
+    # An old file is suspicious, not proof of revocation. It must remain a
+    # visible warning without blocking the daemon from issuing outage replies.
+    old = time.time() - 8 * 24 * 3600
+    os.utime(claude_dir / ".credentials.json", (old, old))
+    report = mod.readiness_report(quick=True)
+    assert report["ok"] is True
+    assert report["warnings"] == ["claude_credentials_older_than_7_days"]
+    assert report["claude_credentials_age_seconds"] >= 8 * 24 * 3600
+    assert report["provider_transport"] == "not_checked"
+
+
+def test_codex_readiness_does_not_require_claude_auth(monkeypatch, tmp_path):
+    mod = _load_module()
+    db_url = tmp_path / "db_url"
+    db_url.write_text("postgresql://reader@localhost/db")
+    monkeypatch.setattr(mod, "FLEET_PROVIDER", "codex")
+    codex = tmp_path / "codex"
+    codex.write_text("#!/bin/sh\\n")
+    codex.chmod(0o755)
+    monkeypatch.setattr(mod, "CODEX_BIN", str(codex))
+    monkeypatch.setattr(mod, "DB_URL_FILE", db_url)
+    monkeypatch.setattr(mod, "_docker_ok", lambda *_args: True)
+    monkeypatch.setattr(mod, "_container_running", lambda _name: True)
+
+    report = mod.readiness_report(quick=True)
+
+    assert report["ok"] is True
+    assert report["provider"] == "codex"
+    assert report["checks"]["codex_executable"] is True
+    assert "claude_credentials" not in report["checks"]
+    assert "claude_config" not in report["checks"]
+    assert report["claude_credentials_age_seconds"] is None
+    assert report["provider_transport"] == "not_checked"

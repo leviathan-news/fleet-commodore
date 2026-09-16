@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -23,6 +24,8 @@ QA_TUNNEL = os.environ.get("COMMODORE_QA_DB_TUNNEL_HOST", "commodore-qa-db-tunne
 HOST_CLAUDE_DIR = Path(os.environ.get("COMMODORE_HOST_CLAUDE_DIR", "~/.claude")).expanduser()
 HOST_CLAUDE_CONFIG = Path(os.environ.get("COMMODORE_HOST_CLAUDE_CONFIG", "~/.claude.json")).expanduser()
 DB_URL_FILE = Path(os.environ.get("COMMODORE_DB_URL_FILE", "~/.config/commodore/db_url")).expanduser()
+FLEET_PROVIDER = os.environ.get("FLEET_QA_PROVIDER", os.environ.get("FLEET_PROVIDER", "codex"))
+CODEX_BIN = "/opt/homebrew/bin/codex"
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
@@ -49,22 +52,49 @@ def _readable_nonempty(path: Path) -> bool:
         return False
 
 
+def _executable(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
 def readiness_report(*, quick: bool) -> dict:
     checks = {
         "reviewer_image": _docker_ok("image", "inspect", REVIEWER_IMAGE),
         "qa_egress_proxy": _container_running(QA_PROXY),
         "qa_db_tunnel": _container_running(QA_TUNNEL),
-        "claude_credentials": _readable_nonempty(HOST_CLAUDE_DIR / ".credentials.json"),
-        "claude_config": _readable_nonempty(HOST_CLAUDE_CONFIG),
         "db_url_source": _readable_nonempty(DB_URL_FILE),
     }
+    if FLEET_PROVIDER == "codex":
+        checks["codex_executable"] = _executable(CODEX_BIN)
+    elif FLEET_PROVIDER == "claude":
+        checks["claude_credentials"] = _readable_nonempty(HOST_CLAUDE_DIR / ".credentials.json")
+        checks["claude_config"] = _readable_nonempty(HOST_CLAUDE_CONFIG)
+    else:
+        checks["valid_provider"] = False
     # Ensure an image that merely exists is still capable of running the QA
     # worker. `--version` does not contact Claude, Telegram, or Postgres.
     if not quick and checks["reviewer_image"]:
         checks["reviewer_worker"] = _docker_ok("run", "--rm", REVIEWER_IMAGE, "--version")
 
     failed = sorted(name for name, ok in checks.items() if not ok)
-    return {"ok": not failed, "checks": checks, "failed": failed}
+    warnings = []
+    credential_age_seconds = None
+    if FLEET_PROVIDER != "codex" and checks.get("claude_credentials"):
+        try:
+            credential_age_seconds = max(
+                0, int(time.time() - (HOST_CLAUDE_DIR / ".credentials.json").stat().st_mtime)
+            )
+            if credential_age_seconds > 7 * 24 * 3600:
+                warnings.append("claude_credentials_older_than_7_days")
+        except OSError:
+            warnings.append("claude_credentials_age_unavailable")
+    # Age is a warning, not token validation: old credentials may work and
+    # freshly written credentials may already be revoked.
+    return {
+        "ok": not failed, "checks": checks, "failed": failed,
+        "warnings": warnings, "claude_credentials_age_seconds": credential_age_seconds,
+        "provider": FLEET_PROVIDER,
+        "provider_transport": "not_checked",
+    }
 
 
 def main() -> int:

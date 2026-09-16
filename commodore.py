@@ -259,6 +259,8 @@ GH_REPO_ALLOWLIST = frozenset({
 })
 
 # LLM provider.
+FLEET_PROVIDER = os.environ.get("FLEET_PROVIDER", "codex")
+CODEX_CHAT_MODEL = os.environ.get("CODEX_CHAT_MODEL", "gpt-5.6-luna")
 CLAUDE_BIN = os.environ.get(
     "CLAUDE_BIN",
     shutil.which("claude") or str(Path("~/.local/bin/claude").expanduser()),
@@ -2317,7 +2319,7 @@ def _claude_is_available():
 
 
 def _claude_ask(prompt, timeout=120, retries=2):
-    global _claude_failures
+    global _claude_failures, _claude_last_probe_at
     for attempt in range(retries + 1):
         # _try_clear_breaker_via_probe gives the breaker a chance to release
         # (probes Claude every _CLAUDE_PROBE_INTERVAL_S; clears on success).
@@ -2367,10 +2369,11 @@ def _claude_ask(prompt, timeout=120, retries=2):
             return response
         except subprocess.TimeoutExpired:
             log.error("Claude CLI timed out (attempt %d/%d)", attempt + 1, retries + 1)
-            if attempt < retries:
-                time.sleep(5 * (attempt + 1))
-                continue
-            _claude_failures += 1
+            # A hanging CLI (including revoked OAuth) will not improve by
+            # blocking the poll loop twice more. Treat this attempt as the
+            # latest failed health probe so the next hail also returns promptly.
+            _mark_claude_unavailable("timeout")
+            _claude_last_probe_at = time.time()
             return ""
         except Exception as exc:
             log.error("Claude CLI error (attempt %d/%d): %s", attempt + 1, retries + 1, exc)
@@ -2387,7 +2390,7 @@ def _operator_dm_user_id() -> int:
     return OPERATOR_DM_USER_ID if OPERATOR_DM_USER_ID > 0 else 0
 
 
-def _alert_operator_claude_down(reason: str = "") -> None:
+def _alert_operator_claude_down(reason: str = "", *, provider: str = "claude") -> bool:
     """DM the operator that the LLM is unreachable. Deduped via a
     commodore_alert SQLite row keyed on alert_kind so we don't spam the
     DM every minute the breaker stays tripped.
@@ -2397,7 +2400,7 @@ def _alert_operator_claude_down(reason: str = "") -> None:
     """
     op = _operator_dm_user_id()
     if not op:
-        return  # no operator configured; nothing to do
+        return False
     cooldown_hours = 6
     try:
         conn = sqlite3.connect(str(DB_FILE), timeout=5)
@@ -2412,7 +2415,7 @@ def _alert_operator_claude_down(reason: str = "") -> None:
             )
             row = conn.execute(
                 "SELECT last_sent_at FROM commodore_alert WHERE alert_kind=?",
-                ("claude_down",),
+                (f"{provider}_down",),
             ).fetchone()
             if row:
                 from datetime import datetime, timezone, timedelta
@@ -2421,39 +2424,35 @@ def _alert_operator_claude_down(reason: str = "") -> None:
                     if last.tzinfo is None:
                         last = last.replace(tzinfo=timezone.utc)
                     if datetime.now(timezone.utc) - last < timedelta(hours=cooldown_hours):
-                        return  # within cooldown, suppress
+                        return True  # a recent accepted operator alert exists
                 except (TypeError, ValueError):
                     pass  # malformed timestamp — proceed with the alert
             # Send the DM, THEN record. If send fails, we'd rather re-try
             # next call than record a phantom delivery.
-            text = (
-                "Commodore here, breaking persona for an ops note:\n\n"
-                "Claude CLI is returning 401 / unreachable. My LLM calls are "
-                "failing. Public replies will be suppressed (ambient) or "
-                "honest-fallback (direct). Need a re-auth on the Mini host:\n\n"
-                "  /opt/homebrew/bin/claude /login\n\n"
-                "Then restart me (tmux leviathan:commodore, Ctrl-C + ./run.sh).\n\n"
-                f"Reason captured: {reason[:200] if reason else '(none)'}"
-            )
+            recovery = ("Check Codex subscription availability on the Mini; if authentication failed, "
+                        "use codex login --device-auth." if provider == "codex" else
+                        "Check Claude subscription availability on the Mini; authentication errors need /login.")
+            text = f"Fleet Commodore's {provider} provider is unavailable. {recovery} Reason: {reason[:200]}"
             resp = send_message(op, text)
             if not (resp and resp.get("ok")):
                 log.warning("alert DM to operator failed: %s", str(resp)[:200])
-                return
+                return False
             conn.execute(
                 """INSERT INTO commodore_alert (alert_kind, last_sent_at, last_reason)
                    VALUES (?, ?, ?)
                    ON CONFLICT(alert_kind) DO UPDATE SET
                      last_sent_at=excluded.last_sent_at,
                      last_reason=excluded.last_reason""",
-                ("claude_down", _now_iso(), reason[:500] if reason else None),
+                (f"{provider}_down", _now_iso(), reason[:500] if reason else None),
             )
             conn.commit()
-            log.warning("alerted operator (DM): claude_down — reason=%s",
-                        (reason or "")[:120])
+            log.warning("alerted operator (DM): %s_down", provider)
+            return True
         finally:
             conn.close()
     except Exception as exc:
         log.warning("operator alert failed: %s", exc)
+        return False
 
 
 def _alert_operator_qa_down(reason: str) -> bool:
@@ -2614,6 +2613,22 @@ def llm_ask(prompt, timeout=120, is_direct: bool = False):
     Either way, the operator gets a DM via _alert_operator_claude_down,
     deduped on a 6h DB cooldown.
     """
+    if FLEET_PROVIDER == "codex":
+        from codex_runtime import ask
+        failure = {}
+        primary = ask(prompt, model=CODEX_CHAT_MODEL, timeout=min(60, timeout), failure_context=failure)
+        if primary:
+            return primary
+        alerted = _alert_operator_claude_down(
+            str(failure.get("failure_class", "provider_unavailable")), provider="codex"
+        )
+        if not is_direct:
+            return None
+        return ("My reply service is temporarily unavailable; the operator has been alerted."
+                if alerted else "My reply service is temporarily unavailable; I could not alert the operator.")
+    if FLEET_PROVIDER != "claude":
+        log.error("Unknown Fleet provider configuration")
+        return "My reply service has a configuration problem." if is_direct else None
     primary = ""
     if _claude_is_available():
         primary = _claude_ask(prompt, timeout=timeout)
@@ -4270,6 +4285,37 @@ def _qa_failure_detail(error: str, *, detail: str = "", result=None, proc=None) 
     if detail:
         payload["detail"] = detail[:500]
     if isinstance(result, dict):
+        if result.get("status") == "failed":
+            # Worker output is untrusted and may echo a question, attachment or
+            # credential. Retain the known reason and a fixed diagnostic class,
+            # never copy a raw model excerpt into the operator page or ledger.
+            reason = result.get("failure_reason")
+            payload["failure_reason"] = (
+                reason if reason in {"qa response was empty or unparseable", "provider unavailable"}
+                else "worker reported failure"
+            )
+            codex_class = result.get("provider_failure")
+            if codex_class in {"provider_auth_failed", "provider_rate_limited", "provider_timeout",
+                               "provider_unavailable", "provider_protocol_error", "provider_no_output",
+                               "provider_health_unavailable"}:
+                payload["provider_failure"] = codex_class
+                return json.dumps(payload, sort_keys=True)
+            excerpt = str(result.get("claude_excerpt") or "").lower()
+            if any(p in excerpt for p in (
+                "authentication_error", "failed to authenticate", "token has been revoked",
+                "api error: 401",
+            )):
+                provider_failure = "authentication_failed"
+            elif "timeout" in excerpt or "timed out" in excerpt:
+                provider_failure = "timeout"
+            elif _looks_like_claude_limit_error(excerpt, ""):
+                provider_failure = "quota_or_limit"
+            elif not excerpt.strip():
+                provider_failure = "empty_output"
+            else:
+                provider_failure = "unparseable_output"
+            payload["provider_failure"] = provider_failure
+            return json.dumps(payload, sort_keys=True)
         for key in ("error", "detail", "stderr_log", "returncode", "stdout_was_parseable"):
             if result.get(key) not in (None, ""):
                 payload[key] = result[key]
@@ -4678,6 +4724,11 @@ def _process_qa(job_uuid: str) -> None:
                 )
                 conn.commit()
                 unlink_result_file(job_uuid)
+        elif status == "failed":
+            _fail_qa_service(
+                conn, job_uuid, chat_id, topic_id, request_msg_id,
+                _qa_failure_detail("worker_failed", result=result),
+            )
         else:
             _fail_qa_service(
                 conn, job_uuid, chat_id, topic_id, request_msg_id,
