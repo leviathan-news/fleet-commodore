@@ -30,6 +30,7 @@ ARTIFACT_FILES = (
     "bin/qa-healthcheck.py",
     "cron/qa-healthcheck.sh",
     "cron/claude-oauth-heartbeat.sh",
+    "cron/heartbeat_state.py",
     "cron/commodore-triage.sh",
     "cron/watchdog.sh",
     "cron/helm-controller-watchdog.sh",

@@ -9,8 +9,8 @@
 #   2. 401 / auth failure: token expired beyond auto-refresh; needs
 #      operator `claude /login`. Posts an alert to the operator's
 #      Telegram (BOT_HQ_GROUP_ID) and exits 1.
-#   3. Network / unexpected error: logs and exits 1, no alert (transient
-#      errors will self-clear next run).
+#   3. Network / unexpected error: logs and contributes to a bounded alert
+#      after three consecutive non-OK probes.
 #
 # Without this, an OAuth rotation that breaks daemon Claude calls is
 # invisible until the operator notices Admiral isn't replying — that took
@@ -25,16 +25,12 @@ REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 : "${FLEET_COMMODORE_CONFIG:=$REPO_DIR/.env}"
 : "${FLEET_COMMODORE_STATE_DIR:=$HOME/.local/state/fleet-commodore}"
 LOG=$FLEET_COMMODORE_STATE_DIR/logs/claude-heartbeat.log
-mkdir -p "$(dirname "$LOG")"
+mkdir -p "$FLEET_COMMODORE_STATE_DIR/logs"
 
 if [[ ! -r "$FLEET_COMMODORE_CONFIG" ]]; then
     echo "$(date -u +%FT%TZ) state=config_unreadable" >> "$LOG"
     exit 1
 fi
-
-# tmpdir for the probe scratch
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
 
 # Source the service-owned config so BOT_TOKEN + BOT_HQ_GROUP_ID are available
 # for the alert path. Set -a/+a means these get exported for child procs.
@@ -43,17 +39,40 @@ set -a
 source "$FLEET_COMMODORE_CONFIG"
 set +a
 
+# Resolve state after loading the authoritative service config.
+LOG=$FLEET_COMMODORE_STATE_DIR/logs/claude-heartbeat.log
+mkdir -p "$FLEET_COMMODORE_STATE_DIR/logs"
+CONSECUTIVE_FILE=$FLEET_COMMODORE_STATE_DIR/claude-heartbeat-consecutive
+LAST_ALERT_FILE=$FLEET_COMMODORE_STATE_DIR/claude-heartbeat-last-alert
+PENDING_ALERT_FILE=$FLEET_COMMODORE_STATE_DIR/claude-heartbeat-alert-pending
+
 # Claude CLI must be on PATH for cron's bare environment.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+CLAUDE_BIN=${CLAUDE_BIN:-claude}
+CURL_BIN=${CURL_BIN:-curl}
+PYTHON_BIN=${FLEET_COMMODORE_PYTHON:-python3}
+
+# Serialize scheduled and manual probes without a crash-stale directory lock.
+if [[ "${1:-}" != "--lock-held" ]]; then
+    exec "$PYTHON_BIN" "$REPO_DIR/cron/heartbeat_state.py" run \
+        "$FLEET_COMMODORE_STATE_DIR" "$REPO_DIR/cron/claude-oauth-heartbeat.sh"
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 
 now() { date -u +"%FT%TZ"; }
+write_state() {
+    # An interrupted write must not turn a pending send into an empty timestamp.
+    printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"
+}
 
 # Run the probe with a 30s wall budget. Stderr is captured separately so
 # we can classify the failure mode without the success line being polluted.
 PROBE_OUT=$TMP/probe.out
 PROBE_ERR=$TMP/probe.err
 PROBE_RC=0
-echo "ping" | claude --print --output-format text >"$PROBE_OUT" 2>"$PROBE_ERR" &
+echo "ping" | "$CLAUDE_BIN" --print --output-format text >"$PROBE_OUT" 2>"$PROBE_ERR" &
 PROBE_PID=$!
 
 # Wait up to 30s
@@ -91,29 +110,59 @@ fi
 # Log line — always written, terse
 echo "$(now) state=$STATE rc=$PROBE_RC out_len=${#OUT}" >> "$LOG"
 
-# Alert on auth_failed only — quota/timeout/unknown will self-clear
-# without operator action; auth_failed needs `claude /login`.
-if [[ "$STATE" == "auth_failed" ]]; then
-    if [[ -n "${BOT_TOKEN:-}" && -n "${BOT_HQ_GROUP_ID:-}" ]]; then
-        # Has a sustained-quiet flag: only alert if we haven't alerted
-        # in the last 6 hours (avoid spam if the operator is mid-fix).
-        ALERT_FILE=$REPO_DIR/logs/.claude-heartbeat-last-alert
-        LAST_ALERT=0
-        [[ -f "$ALERT_FILE" ]] && LAST_ALERT=$(cat "$ALERT_FILE" 2>/dev/null || echo 0)
+# Alert on auth_failed immediately; sustained quota/timeout/unknown states
+# alert after three consecutive failures.
+if [[ "$STATE" != "ok" ]]; then
+    CONSECUTIVE=0
+    [[ -r "$CONSECUTIVE_FILE" ]] && CONSECUTIVE=$(cat "$CONSECUTIVE_FILE" 2>/dev/null || echo 0)
+    [[ "$CONSECUTIVE" =~ ^[0-9]+$ ]] || CONSECUTIVE=0
+    CONSECUTIVE=$((CONSECUTIVE + 1))
+    write_state "$CONSECUTIVE_FILE" "$CONSECUTIVE" || exit 1
+
+    ALERT_REASON=
+    if [[ "$STATE" == "auth_failed" ]]; then
+        ALERT_REASON="Claude OAuth authentication failed on the Mini. Please run claude /login on the Mini. Last probe at $(now) returned an authentication failure."
+    elif (( CONSECUTIVE >= 3 )); then
+        ALERT_REASON="Claude heartbeat has failed for $CONSECUTIVE consecutive probes; current state is $STATE. Last probe at $(now)."
+    fi
+
+    if [[ -n "$ALERT_REASON" && -n "${BOT_TOKEN:-}" && -n "${BOT_HQ_GROUP_ID:-}" ]]; then
         NOW_EPOCH=$(date +%s)
-        if (( NOW_EPOCH - LAST_ALERT > 6 * 3600 )); then
-            MSG="⚠️ Fleet Commodore: Claude OAuth has expired on the Mini.\nThe daemon will fall back to Codex (also broken) until you run \`claude /login\` on the Mini.\nLast probe at $(now) returned 401."
-            curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                -d "chat_id=${BOT_HQ_GROUP_ID}" \
-                -d "text=$MSG" \
-                >/dev/null 2>&1 || true
-            echo "$NOW_EPOCH" > "$ALERT_FILE"
-            echo "$(now) alerted Bot HQ" >> "$LOG"
+        LAST_ALERT=0
+        [[ -r "$LAST_ALERT_FILE" ]] && LAST_ALERT=$(cat "$LAST_ALERT_FILE" 2>/dev/null || echo 0)
+        PENDING=0
+        [[ -r "$PENDING_ALERT_FILE" ]] && PENDING=$(cat "$PENDING_ALERT_FILE" 2>/dev/null || echo 0)
+        [[ "$LAST_ALERT" =~ ^[0-9]+$ ]] || LAST_ALERT=0
+        [[ "$PENDING" =~ ^[0-9]+$ ]] || PENDING=0
+        if (( NOW_EPOCH - LAST_ALERT > 6 * 3600 && NOW_EPOCH - PENDING > 6 * 3600 )); then
+            # Plain text is deliberate: this alert contains no Telegram markup.
+            MSG="⚠️ Fleet Commodore: $ALERT_REASON"
+            # Hold before sending: a crash or dropped response must not replay
+            # immediately on the next cron tick.
+            write_state "$PENDING_ALERT_FILE" "$NOW_EPOCH" || exit 1
+            RESPONSE=$("$CURL_BIN" --connect-timeout 5 --max-time 15 -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${BOT_HQ_GROUP_ID}" \
+                --data-urlencode "text=$MSG" 2>/dev/null)
+            CURL_RC=$?
+            SEND_RESULT=$(printf '%s' "$RESPONSE" | "$PYTHON_BIN" "$REPO_DIR/cron/heartbeat_state.py" classify 2>/dev/null)
+            if (( CURL_RC == 0 )) && [[ "$SEND_RESULT" == accepted ]]; then
+                write_state "$LAST_ALERT_FILE" "$NOW_EPOCH" || exit 1
+                rm -f "$PENDING_ALERT_FILE"
+                echo "$(now) alert accepted by Telegram" >> "$LOG"
+            elif (( CURL_RC == 0 )) && [[ "$SEND_RESULT" == rejected ]]; then
+                rm -f "$PENDING_ALERT_FILE"
+                echo "$(now) alert rejected by Telegram" >> "$LOG"
+            else
+                # The outcome may be unknown (e.g. a dropped response). Hold it
+                # for the dedup window so we never immediately replay an alert.
+                echo "$(now) alert outcome ambiguous; held" >> "$LOG"
+            fi
         fi
     fi
     exit 1
 fi
 
-# On any non-OK state, exit non-zero so cron's MAILTO can pick it up if set.
-[[ "$STATE" == "ok" ]] || exit 1
+# A successful probe clears the sustained-failure counter.
+write_state "$CONSECUTIVE_FILE" 0 || exit 1
+
 exit 0

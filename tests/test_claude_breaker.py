@@ -1,7 +1,7 @@
 """Self-healing Claude circuit-breaker tests.
 
-The breaker trips when Claude returns auth/quota/rate-limit errors, falling
-the daemon back to Codex. Without self-healing, the breaker stays tripped
+The breaker trips when Claude is unavailable, returning an honest outage
+response. Without self-healing, the breaker stays tripped
 until daemon restart — even after the operator does `claude /login` to fix
 expired OAuth (2026-05-06 incident: ~20h of silent dead bot).
 
@@ -9,6 +9,8 @@ These tests pin the contract: when tripped, the breaker probes Claude every
 _CLAUDE_PROBE_INTERVAL_S and releases on a clean success.
 """
 import time
+import subprocess
+import sys
 from unittest import mock
 
 import pytest
@@ -128,3 +130,40 @@ def test_claude_ask_short_circuits_when_breaker_tripped_and_probe_fails():
     # subprocess.run should NOT have been called for the actual Claude CLI
     # (we never got past the breaker check).
     m_run.assert_not_called()
+
+
+def test_timeout_trips_immediately_without_retry_or_immediate_reprobe():
+    with mock.patch.object(
+        commodore.subprocess, "run", side_effect=subprocess.TimeoutExpired("claude", 120)
+    ) as run, mock.patch.object(commodore.time, "sleep") as sleep:
+        assert commodore._claude_ask("first hail") == ""
+        assert commodore._claude_ask("next hail") == ""
+    run.assert_called_once()
+    assert run.call_args.kwargs["timeout"] == 120
+    sleep.assert_not_called()
+    assert commodore._claude_failures == commodore._claude_max_failures
+
+
+def test_timeout_recovers_after_probe_interval_without_restart():
+    with mock.patch.object(
+        commodore.subprocess, "run", side_effect=subprocess.TimeoutExpired("claude", 120)
+    ):
+        assert commodore._claude_ask("first hail") == ""
+    commodore._claude_last_probe_at -= commodore._CLAUDE_PROBE_INTERVAL_S + 1
+    response = mock.Mock(returncode=0, stdout="Recovered answer", stderr="")
+    with mock.patch.object(commodore, "_probe_claude", return_value=True), \
+            mock.patch.object(commodore.subprocess, "run", return_value=response):
+        assert commodore._claude_ask("new hail after login") == "Recovered answer"
+    assert commodore._claude_failures == 0
+
+
+def test_real_hung_cli_returns_direct_outage_with_one_bounded_attempt(monkeypatch, tmp_path):
+    fake_cli = tmp_path / "hung-claude"
+    fake_cli.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+    fake_cli.chmod(0o700)
+    monkeypatch.setattr(commodore, "CLAUDE_BIN", str(fake_cli))
+    monkeypatch.setattr(commodore, "_alert_operator_claude_down", lambda **kw: None)
+    started = time.monotonic()
+    assert commodore.llm_ask("synthetic hail", timeout=0.1, is_direct=True) == commodore.CLAUDE_OUTAGE_REPLY
+    assert commodore.llm_ask("next synthetic hail", timeout=0.1, is_direct=True) == commodore.CLAUDE_OUTAGE_REPLY
+    assert time.monotonic() - started < 2

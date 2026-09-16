@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -64,7 +65,24 @@ def readiness_report(*, quick: bool) -> dict:
         checks["reviewer_worker"] = _docker_ok("run", "--rm", REVIEWER_IMAGE, "--version")
 
     failed = sorted(name for name, ok in checks.items() if not ok)
-    return {"ok": not failed, "checks": checks, "failed": failed}
+    warnings = []
+    credential_age_seconds = None
+    if checks["claude_credentials"]:
+        try:
+            credential_age_seconds = max(
+                0, int(time.time() - (HOST_CLAUDE_DIR / ".credentials.json").stat().st_mtime)
+            )
+            if credential_age_seconds > 7 * 24 * 3600:
+                warnings.append("claude_credentials_older_than_7_days")
+        except OSError:
+            warnings.append("claude_credentials_age_unavailable")
+    # Age is a warning, not token validation: old credentials may work and
+    # freshly written credentials may already be revoked.
+    return {
+        "ok": not failed, "checks": checks, "failed": failed,
+        "warnings": warnings, "claude_credentials_age_seconds": credential_age_seconds,
+        "provider_transport": "not_checked",
+    }
 
 
 def main() -> int:

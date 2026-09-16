@@ -1,5 +1,7 @@
 """Contract tests for the non-network QA readiness check."""
 import importlib.util
+import os
+import time
 from pathlib import Path
 
 
@@ -54,3 +56,15 @@ def test_readiness_report_is_explicit_about_healthy_dependencies(monkeypatch, tm
 
     assert report["ok"] is True
     assert report["failed"] == []
+    assert report["warnings"] == []
+    assert report["provider_transport"] == "not_checked"
+
+    # An old file is suspicious, not proof of revocation. It must remain a
+    # visible warning without blocking the daemon from issuing outage replies.
+    old = time.time() - 8 * 24 * 3600
+    os.utime(claude_dir / ".credentials.json", (old, old))
+    report = mod.readiness_report(quick=True)
+    assert report["ok"] is True
+    assert report["warnings"] == ["claude_credentials_older_than_7_days"]
+    assert report["claude_credentials_age_seconds"] >= 8 * 24 * 3600
+    assert report["provider_transport"] == "not_checked"

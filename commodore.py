@@ -2317,7 +2317,7 @@ def _claude_is_available():
 
 
 def _claude_ask(prompt, timeout=120, retries=2):
-    global _claude_failures
+    global _claude_failures, _claude_last_probe_at
     for attempt in range(retries + 1):
         # _try_clear_breaker_via_probe gives the breaker a chance to release
         # (probes Claude every _CLAUDE_PROBE_INTERVAL_S; clears on success).
@@ -2367,10 +2367,11 @@ def _claude_ask(prompt, timeout=120, retries=2):
             return response
         except subprocess.TimeoutExpired:
             log.error("Claude CLI timed out (attempt %d/%d)", attempt + 1, retries + 1)
-            if attempt < retries:
-                time.sleep(5 * (attempt + 1))
-                continue
-            _claude_failures += 1
+            # A hanging CLI (including revoked OAuth) will not improve by
+            # blocking the poll loop twice more. Treat this attempt as the
+            # latest failed health probe so the next hail also returns promptly.
+            _mark_claude_unavailable("timeout")
+            _claude_last_probe_at = time.time()
             return ""
         except Exception as exc:
             log.error("Claude CLI error (attempt %d/%d): %s", attempt + 1, retries + 1, exc)
@@ -4270,6 +4271,31 @@ def _qa_failure_detail(error: str, *, detail: str = "", result=None, proc=None) 
     if detail:
         payload["detail"] = detail[:500]
     if isinstance(result, dict):
+        if result.get("status") == "failed":
+            # Worker output is untrusted and may echo a question, attachment or
+            # credential. Retain the known reason and a fixed diagnostic class,
+            # never copy a raw model excerpt into the operator page or ledger.
+            reason = result.get("failure_reason")
+            payload["failure_reason"] = (
+                reason if reason == "qa response was empty or unparseable"
+                else "worker reported failure"
+            )
+            excerpt = str(result.get("claude_excerpt") or "").lower()
+            if any(p in excerpt for p in (
+                "authentication_error", "failed to authenticate", "token has been revoked",
+                "api error: 401",
+            )):
+                provider_failure = "authentication_failed"
+            elif "timeout" in excerpt or "timed out" in excerpt:
+                provider_failure = "timeout"
+            elif _looks_like_claude_limit_error(excerpt, ""):
+                provider_failure = "quota_or_limit"
+            elif not excerpt.strip():
+                provider_failure = "empty_output"
+            else:
+                provider_failure = "unparseable_output"
+            payload["provider_failure"] = provider_failure
+            return json.dumps(payload, sort_keys=True)
         for key in ("error", "detail", "stderr_log", "returncode", "stdout_was_parseable"):
             if result.get(key) not in (None, ""):
                 payload[key] = result[key]
@@ -4678,6 +4704,11 @@ def _process_qa(job_uuid: str) -> None:
                 )
                 conn.commit()
                 unlink_result_file(job_uuid)
+        elif status == "failed":
+            _fail_qa_service(
+                conn, job_uuid, chat_id, topic_id, request_msg_id,
+                _qa_failure_detail("worker_failed", result=result),
+            )
         else:
             _fail_qa_service(
                 conn, job_uuid, chat_id, topic_id, request_msg_id,

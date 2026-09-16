@@ -118,6 +118,9 @@ authenticated file URL, or document body.
 
 ## Tests
 
+For authentication outages, heartbeat semantics and live recovery verification,
+see [Claude outage recovery](docs/CLAUDE_RECOVERY.md).
+
 ```bash
 cd fleet-commodore
 python -m pytest tests/ -v
