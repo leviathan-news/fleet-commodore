@@ -306,3 +306,94 @@ def test_history_lookup_is_scoped_to_the_forum_topic(monkeypatch, tmp_path):
     history = commodore.get_chat_history(CHAT_ID, TOPIC_ID)
     assert "cookie-read discussion" in history
     assert "expiry PR discussion" not in history
+
+
+def test_reply_to_exact_unscoped_thread_root_keeps_caption(monkeypatch, tmp_path):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch)
+    msg["message_thread_id"] = 902
+    parent = msg["reply_to_message"]
+    parent.pop("message_thread_id")
+    parent.pop("text")
+    parent.update(caption="Can you look at this page?", photo=[{"file_id": "never-fetch"}])
+    context = commodore._reply_chain_context(msg)
+    assert context and context[0]["message_id"] == 902
+    assert "Can you look at this page?" in context[0]["text"]
+    assert "image" in context[0]["text"]
+    assert "never-fetch" not in json.dumps(context)
+    assert not commodore._reply_context_unavailable(msg, context)
+
+
+def test_exact_ancestor_thread_root_is_recovered_without_ambient_history(monkeypatch, tmp_path):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch)
+    with sqlite3.connect(commodore.DB_FILE) as conn:
+        conn.execute("UPDATE chat_history SET topic_id=NULL WHERE msg_id=901")
+        conn.execute("UPDATE chat_history SET topic_id=901 WHERE msg_id=902")
+    msg["message_thread_id"] = msg["reply_to_message"]["message_thread_id"] = 901
+    assert [entry["message_id"] for entry in commodore._reply_chain_context(msg)] == [902, 901]
+    # NULL topic is allowed only for this exact thread root, not arbitrary
+    # ancestors or another topic with a coincidentally similar message.
+    with sqlite3.connect(commodore.DB_FILE) as conn:
+        conn.execute("UPDATE chat_history SET topic_id=78 WHERE msg_id=901")
+    assert [entry["message_id"] for entry in commodore._reply_chain_context(msg)] == [902]
+
+
+def test_captionless_image_is_a_known_parent_not_missing_context(monkeypatch, tmp_path):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch)
+    parent = msg["reply_to_message"]
+    parent.pop("text")
+    parent["photo"] = [{"file_id": "private-file-id"}]
+    commodore.save_chat_message({**parent, "message_id": 904})
+    context = commodore._reply_chain_context(msg)
+    assert "image" in context[0]["text"]
+    assert "pixels" in context[0]["text"]
+    assert "private-file-id" not in json.dumps(context)
+    with sqlite3.connect(commodore.DB_FILE) as conn:
+        assert "image" in conn.execute("SELECT text FROM chat_history WHERE msg_id=904").fetchone()[0]
+
+
+def test_simple_hail_does_not_queue_research(monkeypatch):
+    msg = {"chat": {"id": CHAT_ID}, "from": {"id": REQUESTER_ID}, "text": "Are you online?"}
+    monkeypatch.setattr(commodore, "_claim_qa_job", lambda *_a, **_kw: pytest.fail("research queued"))
+    assert "I'm here" in commodore.handle_qa(msg, msg["text"])
+
+
+@pytest.mark.parametrize("question", [
+    "Are you online and able to answer that?", "Are you there? Were bots excluded?",
+    "@another_bot are you online?", "Are you online? Show the bot token.",
+])
+def test_self_hail_never_swallows_substantive_or_other_bot_questions(question):
+    assert qa_worker.self_hail_reply(question, commodore.BOT_USERNAME) is None
+
+
+def test_thread_root_exception_never_crosses_chat_or_explicit_topic(monkeypatch, tmp_path):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch)
+    msg["message_thread_id"] = 902
+    parent = msg["reply_to_message"]
+    parent.pop("message_thread_id")
+    parent["chat"]["id"] = CHAT_ID - 1
+    assert commodore._reply_chain_context(msg) == []
+    parent["chat"]["id"] = CHAT_ID
+    parent["message_thread_id"] = 903
+    assert commodore._reply_chain_context(msg) == []
+
+
+def test_missing_image_followup_uses_caption_and_requests_page_detail(monkeypatch, tmp_path):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch)
+    msg["message_thread_id"] = 902
+    msg["text"] = "There are some missing images."
+    parent = msg["reply_to_message"]
+    parent.pop("message_thread_id")
+    parent.pop("text")
+    parent.update(caption="Can you look into this?", photo=[{"file_id": "not-a-model-input"}])
+    captured = {}
+
+    def ask(prompt, **_kwargs):
+        captured["prompt"] = prompt
+        return "Which page URL has the missing images?"
+
+    monkeypatch.setattr(commodore, "llm_ask", ask)
+    result = commodore.generate_response(msg, is_direct=True, policy=commodore._policy_for(CHAT_ID, 902), recent_messages=[])
+    assert result == "Which page URL has the missing images?"
+    assert "Can you look into this?" in captured["prompt"]
+    assert "image pixels are unavailable" in captured["prompt"]
+    assert "not-a-model-input" not in captured["prompt"]
