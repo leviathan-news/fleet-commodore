@@ -65,3 +65,32 @@ def test_live_sql_result_is_provided_with_receipt(monkeypatch, tmp_path):
 def test_sensitive_question_is_declined_before_model(monkeypatch):
     monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("model reached")))
     assert codex_qa.answer({"question": "What is the bot token?"})["status"] == "declined"
+
+
+def test_simple_self_hail_is_answered_without_model_or_citations(monkeypatch):
+    monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("model reached")))
+    result = codex_qa.answer({"question": "@commodore_lev_bot are you online?"})
+    assert result["status"] == "answered"
+    assert "I'm here" in result["answer"]
+    assert result["citations"] == []
+
+
+def test_mixed_hail_preserves_parent_subject_and_requires_evidence(monkeypatch, tmp_path):
+    fixture_knowledge(monkeypatch, tmp_path)
+    captured = {}
+
+    def ask(prompt, **kw):
+        captured.update(json.loads(prompt))
+        captured["instruction"] = kw["instruction"]
+        return json.dumps({"status": "answered", "answer": "All bots were excluded.", "citations": []})
+
+    monkeypatch.setattr(codex_qa, "ask", ask)
+    result = codex_qa.answer({
+        "question": "Are you online and able to answer that?",
+        "reply_context": [{"message_id": 22, "text": "Were bots excluded from the traffic report?"}],
+    })
+    assert result["status"] == "declined"  # identity does not substantiate analytics
+    assert captured["runtime_context"]["identity"] == "Fleet Commodore"
+    assert captured["reply_chain_context"][0]["message_id"] == 22
+    assert "that" in captured["instruction"]
+    assert "parent" in captured["instruction"]

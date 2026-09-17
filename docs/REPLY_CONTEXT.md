@@ -12,7 +12,11 @@ copy.
 
 Older parents are recovered only by following exact `reply_to_msg_id` edges in
 the local `chat_history` ledger. Every lookup stays within the same chat and
-forum topic. Cycles, missing edges, invalid IDs, and unavailable ledgers stop
+forum topic. An exact thread root is also valid when its message ID equals
+the current thread ID and the root has no topic ID: Telegram uses this shape
+for ordinary supergroup reply threads. This exception never admits another
+NULL-topic message, a different explicit topic, or another chat.
+Cycles, missing edges, invalid IDs, and unavailable ledgers stop
 the walk; chat recency is never a substitute. Context contains at most four
 parents, each with at most 500 sanitized text characters and a bounded sender
 label. Replies do not use the ambient recent-message buffer as model context.
@@ -29,6 +33,21 @@ When a reply exists but no safe referent can be recovered, Fleet asks the
 requester to name the change or question rather than making a provider call
 with a guessed subject. Document-review intake remains separately governed by
 its attachment contract.
+
+Photo and image-document parents retain a bounded image-presence marker and
+their caption in context/history, never file IDs or image bytes. The marker
+explicitly says pixels are unavailable. A text-only worker uses the caption
+and request, and asks for a page URL or description when required. Selected
+quotes remain limited to the selected text, including on image messages.
+
+Simple complete self-hails receive a deterministic identity/receipt response
+without model research. This does not attest provider or fleet-wide health.
+Mixed hails remain grounded Q&A: pronouns such as "that" use the quoted parent
+as their subject; only an actual correction overrides it. The Q&A prompt
+supplies host identity separately from untrusted context. Identity is not a
+citable source for analytics or deployment claims. Missing evidence yields a
+plain, subject-specific limitation or clarifying question, without a ceremonial
+refusal prefix. No citation requirement for substantive answers is relaxed.
 
 ## Verification
 

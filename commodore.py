@@ -1201,7 +1201,7 @@ def save_chat_message(msg, our_reply=None):
                 msg.get("message_thread_id"),
                 sender.get("username", sender.get("first_name", "?")),
                 int(sender.get("is_bot", False)),
-                _message_text(msg)[:500],
+                _reply_message_text(msg)[:500],
                 (our_reply or "")[:500],
                 _reply_to_message_id(msg),
                 datetime.now(timezone.utc).isoformat(),
@@ -1490,9 +1490,19 @@ def sweep_benthic_pending():
 _MAX_REPLY_CONTEXT_PARENTS = 4
 _MAX_REPLY_CONTEXT_TEXT = 500
 _REPLY_CONTEXT_UNAVAILABLE_REPLY = (
-    "I cannot safely recover the message you replied to. Please name the "
-    "change or question in a new message."
+    "I don't have the quoted message's contents. Could you paste the relevant "
+    "text or page URL here?"
 )
+
+
+def _reply_message_text(msg: dict) -> str:
+    """Preserve media presence without retaining file IDs or claiming vision."""
+    text = _message_text(msg)
+    document = msg.get("document") or {}
+    image_document = isinstance(document, dict) and str(document.get("mime_type", "")).startswith("image/")
+    if msg.get("photo") or image_document:
+        return "[Telegram image attached; image pixels are unavailable.] " + text
+    return text
 
 
 def _reply_chain_context(msg: dict) -> list[dict]:
@@ -1520,13 +1530,17 @@ def _reply_chain_context(msg: dict) -> list[dict]:
     if parent_chat.get("id") is not None and parent_chat.get("id") != chat_id:
         return []
     parent_topic_id = current.get("message_thread_id")
-    if parent_topic_id != topic_id and (topic_id is not None or parent_topic_id is not None):
-        return []
     try:
         parent_id = int(current.get("message_id"))
     except (TypeError, ValueError):
         return []
     if parent_id <= 0:
+        return []
+    # Ordinary supergroup reply threads give the root no topic ID, while
+    # descendants carry that root's message ID. This is an exact edge, not
+    # permission to read other NULL-topic messages or another forum topic.
+    is_thread_root = type(topic_id) is int and topic_id > 0 and parent_id == topic_id and parent_topic_id is None
+    if parent_topic_id != topic_id and not is_thread_root:
         return []
 
     chain: list[dict] = []
@@ -1541,7 +1555,7 @@ def _reply_chain_context(msg: dict) -> list[dict]:
         if not quote_source.strip():
             return []
     else:
-        quote_source = str(_message_text(current) or "")
+        quote_source = str(_reply_message_text(current) or "")
     quote_text = sanitize_untrusted(quote_source, max_len=_MAX_REPLY_CONTEXT_TEXT)
     if "quote" in msg and not quote_text.strip():
         return []
@@ -1593,8 +1607,9 @@ def _chat_history_reply_edge(chat_id, topic_id, message_id):
             ).fetchone()
         return conn.execute(
             "SELECT msg_id, sender_username, text, reply_to_msg_id FROM chat_history "
-            "WHERE chat_id=? AND topic_id=? AND msg_id=? LIMIT 1",
-            (chat_id, topic_id, message_id),
+            "WHERE chat_id=? AND msg_id=? AND (topic_id=? OR "
+            "(topic_id IS NULL AND msg_id=?)) LIMIT 1",
+            (chat_id, message_id, topic_id, topic_id),
         ).fetchone()
     except sqlite3.Error:
         log.warning("Reply-context edge lookup failed")
@@ -1643,7 +1658,10 @@ def _reply_context_prompt(context: list[dict]) -> str:
         + json.dumps(context, ensure_ascii=False)
         + "\nThe CURRENT MESSAGE is authoritative. If it corrects or clarifies "
           "a parent, follow the current message; do not continue a parent's "
-          "guessed referent.\n"
+          "guessed referent. Resolve 'this', 'that', and 'it' from these parents. "
+          "Image-presence markers provide no pixels: use the caption and text, "
+          "and ask for the page URL or a description if needed. Never claim to "
+          "have inspected an image or performed a repair.\n"
     )
 
 
@@ -4210,6 +4228,11 @@ def handle_qa(msg, question: str, attachment: "dict | None" = None):
         )
     if not question or not question.strip():
         return None  # let the normal chat handler deal with empty
+    if attachment is None:
+        from qa_worker import self_hail_reply
+        hail = self_hail_reply(question, BOT_USERNAME)
+        if hail:
+            return hail
     # A reply normally supplies the referent for terse questions. Do not queue
     # a model job that could guess from unrelated evidence when Telegram no
     # longer supplies that parent. A successfully retrieved document remains
@@ -4954,7 +4977,7 @@ def _process_qa(job_uuid: str) -> None:
             wal = send_message_with_wal(
                 "qa_job", job_uuid, OutgoingAction.QA_DECLINE,
                 chat_id,
-                f"The Admiralty declines that inquiry: {reason}"[:4000],
+                reason[:4000],
                 thread_id=topic_id, reply_to=request_msg_id,
             )
             msg_id = (wal.get("result") or {}).get("message_id") if wal.get("ok") else None
