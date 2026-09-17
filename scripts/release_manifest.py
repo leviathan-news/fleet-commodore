@@ -24,6 +24,7 @@ ARTIFACT_FILES = (
     "chat_intake.py",
     "chat_dispatch.py",
     "fleet_watchdog.py",
+    "outcome_watch.py",
     "helm_controller.py",
     "helm_sol_bridge.py",
     "helm_supervisor.py",

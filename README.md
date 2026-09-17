@@ -29,6 +29,9 @@ The registered watchdog checks the actual sole process, release and tmux pane,
 not window existence alone. Restarts are bounded and fail closed around live
 shells, foreign/duplicate actors and takeover ownership. Its `--inspect` option
 is read-only; see [the supervision contract](docs/CHAT_DELIVERY.md#ordinary-process-supervision).
+The QA-readiness wrapper also inspects stored outcomes without a model. Its
+explicit `--page` mode adds receipt-fenced operator alerts; register that changed
+mode before enabling it on the Mini. See [outcome paging](docs/CHAT_DELIVERY.md#independent-outcome-paging).
 
 ## Build + run
 

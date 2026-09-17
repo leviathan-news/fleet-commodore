@@ -28,8 +28,22 @@ def main() -> int:
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         print("ambiguous")
         return 0
-    ok = value.get("ok") if isinstance(value, dict) else None
-    print("accepted" if ok is True else "rejected" if ok is False else "ambiguous")
+    if not isinstance(value, dict):
+        print("ambiguous")
+        return 0
+    ok = value.get("ok")
+    result = value.get("result")
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    accepted = (
+        ok is True and type(message_id) is int and not isinstance(message_id, bool)
+        and message_id > 0
+    )
+    error_code = value.get("error_code")
+    rejected = (
+        ok is False and type(error_code) is int and not isinstance(error_code, bool)
+        and 400 <= error_code <= 499
+    )
+    print("accepted" if accepted else "rejected" if rejected else "ambiguous")
     return 0
 
 

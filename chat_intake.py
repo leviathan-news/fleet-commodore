@@ -77,6 +77,8 @@ class ChatIntake:
                 if name not in columns:
                     conn.execute(f"ALTER TABLE chat_intake_event ADD COLUMN {name} {column_type}")
             conn.commit()
+            conn.execute("INSERT OR IGNORE INTO chat_intake_meta(name,value) VALUES ('created_at',?)", (int(self.clock()),))
+            conn.commit()
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.path, timeout=5.0)
@@ -159,6 +161,17 @@ class ChatIntake:
     def offset(self) -> int:
         with self._connect() as conn:
             return int(conn.execute("SELECT value FROM chat_intake_meta WHERE name='cursor'").fetchone()[0])
+
+    def note_poll(self, *, router_alive: bool) -> None:
+        """Only after getUpdates and durable admission succeed; no timer renewal."""
+        if not isinstance(router_alive, bool):
+            raise ValueError("router health must be boolean")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany("INSERT OR REPLACE INTO chat_intake_meta(name,value) VALUES (?,?)", (
+                ("last_poll_at", int(self.clock())), ("router_alive", int(router_alive)),
+            ))
+            conn.commit()
 
     def claim_next(self) -> dict[str, Any] | None:
         now = self.clock()

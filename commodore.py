@@ -5837,6 +5837,7 @@ def _poll_owned():
                 # cursor. A failed commit leaves Telegram offset unchanged.
                 intake.ingest_batch([_admit_chat_update(update) for update in batch])
                 offset = intake.offset()
+                intake.note_poll(router_alive=dispatcher.alive())
                 _reconcile_chat_handoffs(intake)
                 if time.time() - last_status_at >= 60:
                     log.info("chat intake outcomes=%s router_alive=%s", intake.snapshot(), dispatcher.alive())

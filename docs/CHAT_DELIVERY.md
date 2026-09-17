@@ -37,9 +37,9 @@ must prove rejection and acquire a fresh authorized claim.
 This prevents automatic replay; it does not guarantee eventual delivery. A
 prepared intent may represent a current sender or a dead sender. Do not clear
 it while an actor could still send. Inspect ownership and an independent
-Telegram receipt before any reconciliation. No automated reconciliation or
-outcome watchdog is introduced by this foundation release. Until those gates
-are completed, held requests require operator review. Do not delete the intent
+Telegram receipt before any reconciliation. No automated request/receipt
+reconciliation is introduced. The independent pager below reports held work
+but cannot resolve it. Held requests still require operator review. Do not delete the intent
 or result file to force a replay or replace an unknown result with success.
 
 Read-only inspection against the service-owned database:
@@ -97,7 +97,52 @@ age and the latest receipt-backed terminal time with SQLite `mode=ro`. It warns
 about held requests or an oldest age over 120 seconds without claiming that
 dependency readiness validates provider transport. Missing intake state is
 reported as not installed, not silently created. This diagnostic does not yet
-page the operator or supervise a stuck router.
+page the operator or supervise a stuck router by itself.
+
+## Independent outcome paging
+
+`outcome_watch.py` reads intake counts, unresolved age, latest receipt-backed
+resolved time and poll/router metadata with SQLite `mode=ro`. It never reads
+stored message payloads, invokes a model, changes request state or retries an
+answer. Missing/unreadable intake, stale polling, a dead router, held outcomes
+and work unresolved over 120 seconds are separate fixed problem classes. Counts
+include all admitted updates, not only direct hails; an alert does not claim
+every stored update is an unanswered question. Latest resolved time is an
+operational receipt, not a semantic audit of answer quality.
+
+Poll freshness is recorded only after a confirmed `getUpdates` batch is durably
+admitted. A timer cannot renew it. Router liveness is a separate observation:
+a blocked but live routing thread still leaves work overdue and alertable.
+The existing `cron/qa-healthcheck.sh` inspects these outcomes independently of
+the daemon, even when dependency readiness fails. Default mode is local-only.
+Its explicit `--page` mode must be registered truthfully before enabling that
+mode in the existing Mini cron row; construction does not install it.
+
+Paging uses the pinned positive `OPERATOR_DM_USER_ID`, never an arbitrary admin
+or fallback room. One plain-prose HTML operator alert is claimed in private
+SQLite WAL/FULL state before its single POST. Acceptance requires `ok=true`,
+a positive non-boolean integer message ID and the exact destination. Explicit
+4xx refusal is failed; malformed, timed-out, 5xx or otherwise uncertain results
+remain unknown. A prepared, failed or unknown attempt suppresses further sends
+for that incident, even beyond six hours. Accepted alerts may repeat after six
+hours. A genuinely healthy inspection closes the incident without sending;
+later distinct incidents can page again. No automatic receipt reconciliation
+or request replay is provided.
+
+An OS-held lock serializes paging runs; a fifteen-second main-thread wall timer
+bounds its transport and no token enters subprocess argv or logs. Non-Fleet or
+unreadable controller ownership suppresses paging before credentials or writable
+alert state are opened. This is an interim ordinary-release boundary, not proof
+of the still-disabled full helm send protocol.
+
+The hourly heartbeat classifier likewise requires a positive message receipt;
+`ok=true` alone is not accepted. Only an explicit non-boolean 4xx code marks
+rejection. Its existing six-hour notification dedup policy remains unchanged.
+
+With the existing five-minute cron cadence, an overdue classification pages
+on the next watchdog invocation; it does not meet a 120-second end-to-end answer
+or alert SLA. Prompt backlog acknowledgements, bounded terminal outcomes, held
+receipt reconciliation and independent useful-answer verification remain gates.
 
 ## Ordinary process supervision
 
@@ -126,8 +171,8 @@ also holds. `--inspect` observes without acquiring a lock, writing restart state
 or starting a process. A reported start action is not a readiness receipt.
 
 Remaining gates include receipt reconciliation for held/legacy requests, bounded
-end-to-end deadlines and prompt acknowledgement under backlog, an active outcome
-watchdog/escalation path, live process-supervision rehearsal and controller
+end-to-end deadlines and prompt acknowledgement under backlog, registered live
+outcome-watch activation, live process-supervision rehearsal and controller
 ownership. The generic storage API is not a license to admit public-room models
 or persist arbitrary private updates. This source is not live readiness proof.
 
