@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import codex_qa
 
 
@@ -104,3 +106,61 @@ def test_exhausted_lookup_is_a_bounded_limitation_not_provider_failure(monkeypat
     assert "provider_failure" not in result
     assert result["tools_used"] == ["search"] * 3
     assert "source or page" in result["declined_reason"]
+
+
+@pytest.mark.parametrize("question", [
+    "Are you still with us?", "@commodore_lev_bot Are you still with us?",
+    "Are you still there?", "You there?", "Still awake?", "Anyone home?",
+])
+def test_presence_paraphrases_need_no_research(monkeypatch, question):
+    monkeypatch.setattr(codex_qa, "ask", lambda *_a, **_kw: pytest.fail("presence needs no research"))
+    result = codex_qa.answer({"question": question})
+    assert result["status"] == "answered"
+    assert "I'm here" in result["answer"]
+    assert result["citations"] == []
+
+
+def test_semantic_presence_response_is_rendered_from_host_facts(monkeypatch, tmp_path):
+    fixture_knowledge(monkeypatch, tmp_path)
+    responses(monkeypatch, {"status": "acknowledged", "kind": "presence"})
+    result = codex_qa.answer({"question": "Hello Commodore, did that ping reach you?"})
+    assert result["status"] == "answered"
+    assert "I'm here" in result["answer"]
+    assert result["citations"] == []
+    assert result["tools_used"] == []
+
+
+@pytest.mark.parametrize("decision", [
+    {"status": "acknowledged", "kind": "presence", "answer": "All bots were excluded."},
+    {"status": "acknowledged", "kind": "deployment"},
+    {"status": "acknowledged", "kind": []},
+    {"status": "acknowledged", "kind": "presence", "citations": ["made-up"]},
+])
+def test_conversation_contract_cannot_deliver_model_authored_facts(monkeypatch, tmp_path, decision):
+    fixture_knowledge(monkeypatch, tmp_path)
+    responses(monkeypatch, decision)
+    result = codex_qa.answer({"question": "Can you confirm the numbers?"})
+    assert result["status"] != "answered"
+
+
+def test_attachment_review_cannot_be_replaced_by_presence(monkeypatch):
+    responses(monkeypatch, {"status": "acknowledged", "kind": "presence"})
+    result = codex_qa.answer({"question": "Review this", "attachment_text": "Are you still with us?"})
+    assert result["status"] != "answered"
+
+
+def test_mixed_presence_and_factual_question_still_retrieves_evidence(monkeypatch, tmp_path):
+    path = fixture_knowledge(monkeypatch, tmp_path)
+    responses(monkeypatch, {"request": "search", "query": "stable fixture"},
+              {"status": "answered", "answer": "The publication workflow is documented.", "citations": [path]})
+    result = codex_qa.answer({"question": "Are you still with us? What is the publication workflow?"})
+    assert result["status"] == "answered"
+    assert result["tools_used"] == ["search"]
+    assert result["citations"] == [path]
+
+
+def test_semantic_presence_cannot_replace_a_completed_evidence_lookup(monkeypatch, tmp_path):
+    fixture_knowledge(monkeypatch, tmp_path)
+    responses(monkeypatch, {"request": "search", "query": "stable fixture"},
+              {"status": "acknowledged", "kind": "presence"})
+    assert codex_qa.answer({"question": "What is the workflow?"})["status"] != "answered"

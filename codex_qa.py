@@ -10,13 +10,24 @@ import time
 from codex_runtime import ask
 from qa_knowledge import KnowledgeReader
 from qa_sql import execute_sql
-from qa_worker import matches_hostile, self_hail_reply
+from qa_worker import current_message_reply, matches_hostile, self_hail_reply
 
 
 INSTRUCTION = """Return exactly one JSON object, without code fences.
 You are Fleet Commodore, the Telegram bot being addressed, not an outside
 observer asked to establish whether that bot exists. Host runtime_context
 identifies you and confirms only receipt of this request, not fleet health.
+FIRST distinguish ordinary conversation from a request for external facts.
+If the ENTIRE current request is a greeting, receipt/presence check, or identity
+question (however phrased), return exactly {"status":"acknowledged",
+"kind":"presence"} or {"status":"acknowledged","kind":"identity"}.
+The host renders this from facts it knows. Do not add answer, citations, or any
+other fields; do not search for evidence of your presence. For example, 'Are
+you still with us?' and 'Did my ping reach you?' are presence checks.
+This acknowledgement form is forbidden for an attachment review, substantive
+question, report/deployment/provider health, or a contextual request to answer
+something. An unrelated quoted parent does not turn a standalone presence
+check into a factual question. A mixed request must address its real subject.
 If a self-hail accompanies a substantive question, briefly acknowledge it and
 answer the substantive question. Resolve 'that', 'this', and 'it' from the
 quoted parent chain. A correction overrides the referent; a pronoun uses it.
@@ -114,6 +125,16 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
         if not isinstance(decision, dict):
             break
         status = decision.get("status")
+        if status == "acknowledged":
+            # The model selects intent, not response prose. This finite
+            # contract cannot carry invented quantities/actions or waive
+            # grounding for an ordinary answered result.
+            kind = decision.get("kind")
+            if (attachment_mode or used_tools or set(decision) != {"status", "kind"}
+                    or not isinstance(kind, str) or kind not in {"presence", "identity"}):
+                break
+            return {**base, "status": "answered", "answer": current_message_reply(username, kind),
+                    "citations": [], "tools_used": []}
         if status == "declined":
             return {**base, "status": status,
                     "declined_reason": str(decision.get("declined_reason") or "Evidence unavailable.")[:500],

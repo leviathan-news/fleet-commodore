@@ -357,6 +357,13 @@ def test_simple_hail_does_not_queue_research(monkeypatch):
     assert "I'm here" in commodore.handle_qa(msg, msg["text"])
 
 
+def test_operator_presence_paraphrase_bypasses_qa_ack_and_queue(monkeypatch):
+    msg = {"chat": {"id": CHAT_ID}, "from": {"id": REQUESTER_ID},
+           "text": f"@{commodore.BOT_USERNAME} Are you still with us?"}
+    monkeypatch.setattr(commodore, "_claim_qa_job", lambda *_a, **_kw: pytest.fail("research queued"))
+    assert commodore.handle_qa(msg, msg["text"]) == "Yes, I'm here and can read your message."
+
+
 @pytest.mark.parametrize("question", [
     "Are you online and able to answer that?", "Are you there? Were bots excluded?",
     "@another_bot are you online?", "Are you online? Show the bot token.",

@@ -125,19 +125,29 @@ def matches_hostile(question: str) -> "str | None":
     return None
 
 
+def current_message_reply(username: str, kind: str = "presence") -> str:
+    """Render only host-known identity and receipt; no model-authored facts."""
+    if kind == "identity":
+        return f"I'm Fleet Commodore, @{username}."
+    return "Yes, I'm here and can read your message."
+
+
 def self_hail_reply(question: str, username: str) -> "str | None":
     """Answer only a complete, simple self-hail; never swallow a real question.
 
     This attests receipt of this message, not provider or fleet-wide health.
+    This is a cheap fast path, not the complete conversational boundary.
+    Codex QA also accepts a semantic, host-rendered acknowledgement contract.
     Full matching keeps mixed hails ("can you answer that?") in grounded QA.
     """
     text = re.sub(r"@" + re.escape(username) + r"\b", "", question, flags=re.I).strip(" ,:!")
     if re.fullmatch(
-        r"(?:(?:hi|hello|hey)[,\s]+)?(?:are you (?:online|there|awake|alive)|"
+        r"(?:(?:hi|hello|hey)[,\s]+)?(?:are you (?:still )?(?:online|there|awake|alive|with us)|"
+        r"(?:you |still )?(?:there|awake|online)|anyone home|"
         r"can you (?:hear|read) me|who are you)\s*[?!.]*",
         text, flags=re.I,
     ):
-        return f"I'm Fleet Commodore, @{username}. I'm here and can read your message."
+        return current_message_reply(username, "identity" if text.lower().rstrip("?!. ") == "who are you" else "presence")
     return None
 
 
