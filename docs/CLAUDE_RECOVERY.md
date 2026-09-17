@@ -71,6 +71,11 @@ Six-hour alert suppression and failure state live in the service state
 directory outside the immutable release. Accepted, rejected and uncertain
 Telegram deliveries must remain distinguishable.
 
+Each probe writes only its redacted timestamp, state, exit status, and output
+length both to the service-state heartbeat log and to stdout. The latter is
+intentional: cron's registered wrapper log must show the real probe freshness,
+without exposing provider output or credentials.
+
 The no-network QA readiness report includes `provider_transport: not_checked`
 and, on the legacy Claude route, a warning when credentials are older than
 seven days. Age is only a

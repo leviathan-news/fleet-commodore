@@ -27,8 +27,16 @@ REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 LOG=$FLEET_COMMODORE_STATE_DIR/logs/claude-heartbeat.log
 mkdir -p "$FLEET_COMMODORE_STATE_DIR/logs"
 
+log_status() {
+    # The immutable service log is the detailed local record.  Emit the same
+    # redacted status to stdout so cron's registered wrapper log observes the
+    # actual probe too; provider output and credentials remain private.
+    printf '%s\n' "$1" >> "$LOG"
+    printf '%s\n' "$1"
+}
+
 if [[ ! -r "$FLEET_COMMODORE_CONFIG" ]]; then
-    echo "$(date -u +%FT%TZ) state=config_unreadable" >> "$LOG"
+    log_status "$(date -u +%FT%TZ) state=config_unreadable"
     exit 1
 fi
 
@@ -138,7 +146,7 @@ if [[ "$FLEET_PROVIDER" != "codex" ]]; then
 fi
 
 # Log line — always written, terse
-echo "$(now) state=$STATE rc=$PROBE_RC out_len=${#OUT}" >> "$LOG"
+log_status "$(now) state=$STATE rc=$PROBE_RC out_len=${#OUT}"
 
 # Alert on auth_failed immediately; sustained quota/timeout/unknown states
 # alert after three consecutive failures.
@@ -182,14 +190,14 @@ if [[ "$STATE" != "ok" ]]; then
             if (( CURL_RC == 0 )) && [[ "$SEND_RESULT" == accepted ]]; then
                 write_state "$LAST_ALERT_FILE" "$NOW_EPOCH" || exit 1
                 rm -f "$PENDING_ALERT_FILE"
-                echo "$(now) alert accepted by Telegram" >> "$LOG"
+                log_status "$(now) alert accepted by Telegram"
             elif (( CURL_RC == 0 )) && [[ "$SEND_RESULT" == rejected ]]; then
                 rm -f "$PENDING_ALERT_FILE"
-                echo "$(now) alert rejected by Telegram" >> "$LOG"
+                log_status "$(now) alert rejected by Telegram"
             else
                 # The outcome may be unknown (e.g. a dropped response). Hold it
                 # for the dedup window so we never immediately replay an alert.
-                echo "$(now) alert outcome ambiguous; held" >> "$LOG"
+                log_status "$(now) alert outcome ambiguous; held"
             fi
         fi
     fi
