@@ -4,11 +4,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT = Path(__file__).parents[1] / "cron/claude-oauth-heartbeat.sh"
 
 
-def run_heartbeat(tmp_path, state, response='{"ok":true}', curl_rc="0", provider="claude", probe_rc=""):
+def run_heartbeat(tmp_path, state, response='{"ok":true,"result":{"message_id":1}}', curl_rc="0", provider="claude", probe_rc=""):
     fake_bin = tmp_path / ".local/bin"
     fake_bin.mkdir(parents=True, exist_ok=True)
     (fake_bin / "claude").write_text(
@@ -84,7 +86,7 @@ def test_auth_failure_alert_is_immediate_without_codex_claim(tmp_path):
 
 
 def test_only_telegram_ok_true_records_success(tmp_path):
-    run_heartbeat(tmp_path, "auth", response='{"meta":{"ok":true},"ok":false,"description":"blocked"}')
+    run_heartbeat(tmp_path, "auth", response='{"ok":false,"error_code":403,"description":"blocked"}')
     state = tmp_path / "state"
     assert not (state / "claude-heartbeat-last-alert").exists()
     assert "alert rejected" in (state / "logs/claude-heartbeat.log").read_text()
@@ -100,7 +102,7 @@ def test_only_telegram_ok_true_records_success(tmp_path):
     # An ambiguous result is held for the dedup window; once it expires, an
     # accepted Telegram response is the only outcome that records success.
     (state / "claude-heartbeat-alert-pending").write_text("0\n")
-    run_heartbeat(tmp_path, "auth", response='{"ok":true}')
+    run_heartbeat(tmp_path, "auth", response='{"ok":true,"result":{"message_id":1}}')
     assert (state / "claude-heartbeat-last-alert").exists()
     assert not (state / "claude-heartbeat-alert-pending").exists()
 
@@ -114,7 +116,7 @@ def test_old_lock_marker_cannot_silence_recovery(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
     (state / ".claude-heartbeat.lock").mkdir()
-    result = run_heartbeat(tmp_path, "auth", response='{"ok":true}')
+    result = run_heartbeat(tmp_path, "auth", response='{"ok":true,"result":{"message_id":1}}')
     assert result.returncode == 1
     assert "sendMessage" in (tmp_path / "curl.log").read_text()
 
@@ -165,3 +167,37 @@ def test_codex_ok_payload_with_failed_exit_is_not_health(tmp_path):
     result = run_heartbeat(tmp_path, "ok", provider="codex", probe_rc="1")
     assert result.returncode == 1
     assert "state=unknown_error" in (tmp_path / "state/logs/claude-heartbeat.log").read_text()
+
+
+@pytest.mark.parametrize(("payload", "expected"), [
+    ('{"ok":true,"result":{"message_id":1}}', "accepted"),
+    ('{"ok":true}', "ambiguous"),
+    ('{"ok":true,"result":{}}', "ambiguous"),
+    ('{"ok":true,"result":{"message_id":0}}', "ambiguous"),
+    ('{"ok":true,"result":{"message_id":-1}}', "ambiguous"),
+    ('{"ok":true,"result":{"message_id":true}}', "ambiguous"),
+    ('{"ok":true,"result":{"message_id":"1"}}', "ambiguous"),
+    ('{"ok":true,"result":{"message_id":1},"nested":{"ok":true}}', "accepted"),
+])
+def test_classifier_requires_positive_integer_telegram_receipt(tmp_path, payload, expected):
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).parents[1] / "cron/heartbeat_state.py"), "classify"],
+        input=payload, text=True, capture_output=True, check=True,
+    )
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(("payload", "expected"), [
+    ('{"ok":false,"error_code":400}', "rejected"),
+    ('{"ok":false,"error_code":499}', "rejected"),
+    ('{"ok":false,"error_code":500}', "ambiguous"),
+    ('{"ok":false,"error_code":true}', "ambiguous"),
+    ('{"ok":false}', "ambiguous"),
+    ("not-json", "ambiguous"),
+])
+def test_classifier_rejects_only_known_client_errors(tmp_path, payload, expected):
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).parents[1] / "cron/heartbeat_state.py"), "classify"],
+        input=payload, text=True, capture_output=True, check=True,
+    )
+    assert result.stdout.strip() == expected

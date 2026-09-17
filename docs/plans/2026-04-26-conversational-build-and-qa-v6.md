@@ -1,5 +1,9 @@
 # Fleet Commodore — Conversational Plan-and-Build + Read-Only Q&A (Revision 7)
 
+Historical design: its unconfirmed-intent replay contract is superseded by
+[Chat delivery certainty](../CHAT_DELIVERY.md). Preserve this document for
+rationale; do not use its duplicate-window recipes as current retry authority.
+
 ## Context
 
 This revision supersedes `eager-watching-balloon.md` (v1) after five code-review passes. v2–v5 progressively hardened durability, idempotency, scratch-file plumbing, and dedup oracle. A fifth review identified three remaining issues — two in the QA/review dedup design and one in the contract statement itself:

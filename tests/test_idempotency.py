@@ -1,8 +1,7 @@
 """Idempotency contract tests.
 
-The v6 plan promises: build is fully idempotent (no duplicate PR possible
-across any crash window); QA/review have a documented single-duplicate-at-
-worst window between intent log insert and Telegram response.
+Build reconciles its external PR oracle. Telegram intents without a positive
+receipt are held for explicit reconciliation, never automatically replayed.
 
 These tests lock that contract in. Each test simulates one crash window
 and asserts the documented recovery behavior.
@@ -170,16 +169,10 @@ def test_qa_recovery_via_scratch_posts_once(isolated_db, stub_send_message, monk
     assert not scratch.exists()
 
 
-# --- Case 4: ambiguous middle window — single duplicate possible ----------
+# --- Case 4: ambiguous middle window — receipt reconciliation required ----
 
-def test_ambiguous_window_documented_single_duplicate(isolated_db, stub_send_message):
-    """Pre-populate outgoing_msg with intent_recorded but telegram_message_id NULL
-    (the ambiguous window). Recovery's send_message_with_wal sees no confirmed
-    prior post and posts again. This is the documented single-duplicate-at-worst
-    contract for QA/review.
-
-    The test asserts: (a) the post happened, (b) post-hoc duplicate detection
-    via the operator-facing GROUP BY query would find the duplicate."""
+def test_ambiguous_window_held_without_replay(isolated_db, stub_send_message):
+    """A positive receipt dedupes; removing it requires reconciliation, not POST."""
     conn = sqlite3.connect(str(isolated_db))
     conn.execute(
         "INSERT INTO qa_job (job_uuid, chat_id, requester_id, question, status, created_at) "
@@ -215,9 +208,7 @@ def test_ambiguous_window_documented_single_duplicate(isolated_db, stub_send_mes
     # No new send_message call.
     assert len(stub_send_message) == 0
 
-    # If we wipe the telegram_message_id (simulate the row WASN'T confirmed
-    # at recovery time), recovery WOULD post again, producing the documented
-    # single duplicate.
+    # If the row was not confirmed at recovery, never gamble on another POST.
     conn = sqlite3.connect(str(isolated_db))
     conn.execute(
         "UPDATE outgoing_msg SET telegram_message_id=NULL, sent_at=NULL "
@@ -234,8 +225,14 @@ def test_ambiguous_window_documented_single_duplicate(isolated_db, stub_send_mes
 
     scratch.write_text(json.dumps({"status": "answered", "answer": "hi"}))
     commodore._process_qa("qa-D")
-    # NOW we expect exactly one new post (the WAL didn't see a confirmed row)
-    assert len(stub_send_message) == 1
+    assert len(stub_send_message) == 0
+    with sqlite3.connect(str(isolated_db)) as conn:
+        status, attempts = conn.execute(
+            "SELECT status,attempt_count FROM qa_job WHERE job_uuid='qa-D'"
+        ).fetchone()
+    assert status == "delivery_held"
+    assert attempts == 0
+    assert scratch.exists()
 
 
 # --- Case 5: rapid double `ship it` --------------------------------------

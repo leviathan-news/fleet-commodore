@@ -13,6 +13,7 @@ import subprocess
 import time
 
 from helm_controller import HelmController, write_token_file
+from fleet_watchdog import UnsafeObservation, parse_processes
 
 
 class RuntimeErrorSafe(RuntimeError):
@@ -232,25 +233,26 @@ class TmuxRuntime:
 
     def actor_release(self) -> Path | None:
         result = self._run(
-            ["/bin/ps", "-axo", "pid=,command="], check=False
+            ["/bin/ps", "-axo", "pid=,ppid=,stat=,command="], check=False
         )
+        if result.returncode:
+            raise RuntimeErrorSafe("Fleet actor observation is unavailable")
+        try:
+            processes = parse_processes(result.stdout)
+        except UnsafeObservation:
+            raise RuntimeErrorSafe("Fleet actor observation is unavailable") from None
         candidates = []
-        for line in result.stdout.splitlines():
-            if " -u commodore.py" not in line:
-                continue
-            try:
-                pid = int(line.strip().split(None, 1)[0])
-            except (ValueError, IndexError):
-                continue
+        for pid, _parent, script in processes:
             probe = self._run(
                 ["/usr/sbin/lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], check=False
             )
-            cwd = None
-            for item in probe.stdout.splitlines():
-                if item.startswith("n/"):
-                    cwd = Path(item[1:])
-            if cwd:
-                candidates.append(cwd)
+            paths = [Path(item[1:]).resolve() for item in probe.stdout.splitlines() if item.startswith("n/")]
+            if probe.returncode or len(paths) != 1:
+                raise RuntimeErrorSafe("Fleet actor observation is unavailable")
+            cwd = paths[0]
+            if (script.is_absolute() and script.resolve() != cwd / "commodore.py") or (not script.is_absolute() and script != Path("commodore.py")):
+                raise RuntimeErrorSafe("Fleet actor source is ambiguous")
+            candidates.append(cwd)
         if len(candidates) > 1:
             raise RuntimeErrorSafe("more than one Fleet Telegram actor is running")
         return candidates[0] if candidates else None

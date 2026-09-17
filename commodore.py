@@ -34,9 +34,12 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from chat_dispatch import ChatDispatcher, PollOwner
+from chat_intake import ChatIntake
 from helm_controller import (
     DuplicateSendHeld,
     HelmController,
@@ -597,7 +600,7 @@ def _is_fixed_public_hail(msg: dict) -> bool:
     return _is_mention_of_commodore(msg, text[:500].lower())
 
 
-def _handle_public_untrusted_message(msg: dict) -> None:
+def _handle_public_untrusted_message(msg: dict) -> dict | None:
     """Issue a fixed, rate-limited Squid Cave decline and do nothing else."""
     chat_id = int((msg.get("chat") or {}).get("id") or 0)
     sender = msg.get("from") or {}
@@ -609,7 +612,7 @@ def _handle_public_untrusted_message(msg: dict) -> None:
     if now - _public_decline_last_by_chat.get(chat_id, 0.0) < PUBLIC_ROOM_DECLINE_COOLDOWN_S:
         return
     try:
-        send_message(
+        result = _chat_send(
             chat_id,
             PUBLIC_ROOM_DECLINE,
             thread_id=msg.get("message_thread_id"),
@@ -618,8 +621,9 @@ def _handle_public_untrusted_message(msg: dict) -> None:
     except Exception as exc:
         # Do not reflect any attacker-controlled text or metadata in this log.
         log.warning("public-room decline send failed for chat %s: %s", chat_id, type(exc).__name__)
-        return
+        return {"outcome": "held_unknown"}
     _public_decline_last_by_chat[chat_id] = now
+    return {"outcome": "escalated", "message_id": _telegram_message_id(result)}
 
 
 def _nemesis_recently_present(recent_messages, lookback=5):
@@ -854,6 +858,8 @@ _HELM_CONTROLLER = (
     HelmController(HELM_CONTROLLER_DB_FILE) if HELM_CONTROLLER_ENABLED else None
 )
 _HELM_EVENT_ID = contextvars.ContextVar("helm_event_id", default=None)
+_CHAT_JOB_REF = contextvars.ContextVar("chat_job_ref", default=None)
+_CHAT_UPDATE_ID = contextvars.ContextVar("chat_update_id", default=None)
 
 
 _TOKEN_LEAK_RE = re.compile(r"x-access-token:[^@\s]+@", re.IGNORECASE)
@@ -1097,6 +1103,9 @@ def _ensure_tables():
             "CREATE INDEX IF NOT EXISTS idx_outgoing_msg_dedup "
             "ON outgoing_msg(dedup_token)"
         )
+        # Legacy send intents without receipts are unknown, never replayable.
+        _safe_column_add(conn, "outgoing_msg", "delivery_status",
+                         "TEXT NOT NULL DEFAULT 'outcome_unknown'")
         # benthic_pending: queue of @Benthic_Bot mentions awaiting either
         # Benthic's own reply (which clears the row) or expiry of the
         # BENTHIC_BACKUP_DELAY_S window (after which the Commodore steps in
@@ -1500,7 +1509,7 @@ def _reply_message_text(msg: dict) -> str:
     text = _message_text(msg)
     document = msg.get("document") or {}
     image_document = isinstance(document, dict) and str(document.get("mime_type", "")).startswith("image/")
-    if msg.get("photo") or image_document:
+    if msg.get("photo") or image_document or msg.get("_intake_image_present") is True:
         return "[Telegram image attached; image pixels are unavailable.] " + text
     return text
 
@@ -2044,13 +2053,39 @@ def _md_to_telegram_html(text):
     return working
 
 
+class TelegramSendRejected(ValueError):
+    """Telegram definitively rejected a send; contains no request/body data."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__("Telegram rejected sendMessage")
+
+
+def _telegram_message_id(response):
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        return None
+    result = response.get("result")
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    return message_id if type(message_id) is int and message_id > 0 else None
+
+
+def _confirmed_send_response(response):
+    if isinstance(response, dict) and response.get("ok") is False:
+        code = response.get("error_code")
+        if type(code) is int and 400 <= code < 500:
+            raise TelegramSendRejected(code)
+    if _telegram_message_id(response) is None:
+        raise RuntimeError("Telegram send outcome lacks a positive receipt")
+    return response
+
+
+def _send_rejection_code(exc):
+    return exc.code if isinstance(exc, (TelegramSendRejected, urllib.error.HTTPError)) else None
+
+
 def send_message(chat_id, text, thread_id=None, reply_to=None):
     raw_text = text[:3800]
-    data = {
-        "chat_id": chat_id,
-        "text": _md_to_telegram_html(raw_text),
-        "parse_mode": "HTML",
-    }
+    data = {"chat_id": chat_id, "text": _md_to_telegram_html(raw_text), "parse_mode": "HTML"}
     if thread_id:
         data["message_thread_id"] = thread_id
     if reply_to:
@@ -2067,76 +2102,45 @@ def send_message(chat_id, text, thread_id=None, reply_to=None):
             json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         helm_attempt = _HELM_CONTROLLER.begin_send(
-            actor=HELM_ACTOR,
-            event_id=event_id,
-            intent_hash=intent_hash,
+            actor=HELM_ACTOR, event_id=event_id, intent_hash=intent_hash,
         )
 
     try:
-        resp = tg_request("sendMessage", data)
-        if isinstance(resp, dict) and resp.get("ok") is False:
-            raise ValueError(f"sendMessage returned ok=False: {resp}")
-        sent_id = int((resp.get("result") or {}).get("message_id") or 0) or None
-        if sent_id and reply_to:
-            save_bot_reply(chat_id, sent_id, thread_id, reply_to, raw_text)
-        if helm_attempt:
-            _HELM_CONTROLLER.finish_send(
-                helm_attempt, status="accepted", telegram_message_id=sent_id
-            )
-        return resp
+        try:
+            resp = _confirmed_send_response(tg_request("sendMessage", data))
+        except Exception as exc:
+            # A transport or decoding error may follow an accepted POST.
+            # Retry only a definitive 400 refusal, never an arbitrary ValueError.
+            if _send_rejection_code(exc) != 400:
+                raise
+            log.warning("send_message: Telegram rejected HTML; retrying once as plain text")
+            plain_data = {key: value for key, value in data.items() if key != "parse_mode"}
+            plain_data["text"] = raw_text
+            resp = _confirmed_send_response(tg_request("sendMessage", plain_data))
     except (ReplyLeaseDenied, DuplicateSendHeld):
         raise
     except Exception as exc:
-        # A network/protocol exception is an ambiguous external outcome.  The
-        # old plain-text retry was acceptable only after Telegram explicitly
-        # rejected HTML parsing.  Under the durable helm fence, never turn an
-        # ambiguous first attempt into a possible duplicate.
-        safe_plain_retry = (
-            isinstance(exc, ValueError)
-            or (isinstance(exc, urllib.error.HTTPError) and exc.code == 400)
-        )
-        if helm_attempt and not safe_plain_retry:
+        if helm_attempt:
+            code = _send_rejection_code(exc)
             _HELM_CONTROLLER.finish_send(
                 helm_attempt,
-                status="outcome_unknown",
+                status="failed" if type(code) is int and 400 <= code < 500 else "outcome_unknown",
                 error=type(exc).__name__,
             )
-            raise
-        log.warning(
-            "send_message: HTML parse_mode failed (%s), retrying as plain text",
-            exc,
-        )
-        plain_data = {"chat_id": chat_id, "text": raw_text}
-        if thread_id:
-            plain_data["message_thread_id"] = thread_id
-        if reply_to:
-            plain_data["reply_to_message_id"] = reply_to
+        raise
+
+    sent_id = _telegram_message_id(resp)
+    if reply_to:
         try:
-            resp = tg_request("sendMessage", plain_data)
-        except Exception as plain_exc:
-            if helm_attempt:
-                _HELM_CONTROLLER.finish_send(
-                    helm_attempt,
-                    status="outcome_unknown",
-                    error=type(plain_exc).__name__,
-                )
-            raise
-        if isinstance(resp, dict) and resp.get("ok") is False:
-            if helm_attempt:
-                _HELM_CONTROLLER.finish_send(
-                    helm_attempt,
-                    status="failed",
-                    error="Telegram returned ok=false",
-                )
-            raise ValueError("sendMessage returned ok=False")
-        sent_id = int((resp.get("result") or {}).get("message_id") or 0) or None
-        if sent_id and reply_to:
             save_bot_reply(chat_id, sent_id, thread_id, reply_to, raw_text)
-        if helm_attempt:
-            _HELM_CONTROLLER.finish_send(
-                helm_attempt, status="accepted", telegram_message_id=sent_id
-            )
-        return resp
+        except Exception as exc:
+            # Local history cannot undo a confirmed external send.
+            log.error("accepted reply history persistence failed: %s", type(exc).__name__)
+    if helm_attempt:
+        _HELM_CONTROLLER.finish_send(
+            helm_attempt, status="accepted", telegram_message_id=sent_id,
+        )
+    return resp
 
 
 # --- Agent Chat Mode B relay receipt ----------------------------------------
@@ -3378,16 +3382,14 @@ REVIEW_COOLDOWN_S = int(os.environ.get("REVIEW_COOLDOWN_S", "300"))
 QA_COOLDOWN_S = int(os.environ.get("QA_COOLDOWN_S", "60"))
 
 
-# --- Outgoing-message write-ahead log (v6 dedup oracle) ---------------------
+# --- Outgoing-message write-ahead log (receipt/uncertainty oracle) ----------
 #
 # Replaces the unimplementable "scan Telegram history" idea with a local
 # SQLite WAL. Every Telegram send issued on behalf of a job goes through
 # send_message_with_wal, which:
 #
-#   1. Pre-flight: if a row exists for (job_table, job_uuid, intent_id) with
-#      telegram_message_id NOT NULL, return the recorded message_id and skip
-#      the API call entirely. Idempotent against confirmed prior success.
-#   2. Write-ahead: INSERT OR IGNORE the intent row BEFORE the API call.
+#   1. Return a positive recorded receipt, or hold any unconfirmed prior intent.
+#   2. Atomically insert/claim one prepared intent BEFORE the API call.
 #   3. Telegram POST.
 #   4. Write-after: UPDATE the row with the returned message_id (or error).
 #
@@ -3402,44 +3404,64 @@ def _intent_id(job_uuid: str, action_type: str) -> str:
     return _hashlib.sha256(f"{job_uuid}|{action_type}".encode()).hexdigest()
 
 
+def _hold_unconfirmed_job_delivery(conn, job_table, job_uuid):
+    """Stop provider relaunch as well as send replay while a receipt is missing."""
+    columns = {"qa_job": ("job_uuid", "declined_reason"),
+               "pr_review": ("review_uuid", "error"),
+               "build_job": ("job_uuid", "error")}
+    key, error_column = columns[job_table]
+    prior = conn.execute(
+        "SELECT 1 FROM outgoing_msg WHERE job_table=? AND job_uuid=? "
+        "AND (telegram_message_id IS NULL OR telegram_message_id <= 0) LIMIT 1",
+        (job_table, job_uuid),
+    ).fetchone()
+    if prior is None:
+        return False
+    conn.execute(
+        f"UPDATE {job_table} SET status='delivery_held', "
+        f"{error_column}='delivery requires receipt reconciliation' "
+        f"WHERE {key}=? AND status IN ('queued','in_progress','delivery_held')",
+        (job_uuid,),
+    )
+    conn.commit()
+    log.warning("%s %s delivery held for receipt reconciliation", job_table, job_uuid)
+    return True
+
+
 def send_message_with_wal(job_table: str, job_uuid: str, action_type: str,
                           chat_id: int, text: str,
                           thread_id=None, reply_to=None) -> dict:
-    """Idempotent Telegram send keyed on (job_table, job_uuid, action_type).
+    """Claim once, send once, and preserve uncertain outcomes for reconciliation.
 
-    Returns the Telegram response dict, plus a `deduped: True` flag if the
-    call short-circuited on a confirmed prior post. Callers should treat
-    `deduped=True` as a success — the message exists.
-
-    DOES NOT swallow QUIET_MODE or the daemon's circuit breakers — those
-    apply to the underlying send_message() the same as direct callers.
+    A positive receipt is reusable; an existing unconfirmed intent is not.
+    The committed prepared row covers both concurrency and the crash window
+    between POST acceptance and receipt persistence. There is no blind replay.
     """
     iid = _intent_id(job_uuid, action_type)
     dedup_token = _uuid_mod.uuid4().hex[:16]
-
     conn = sqlite3.connect(str(DB_FILE), timeout=10)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
-        # 1. Pre-flight: confirmed prior success?
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT telegram_message_id, dedup_token FROM outgoing_msg "
-            "WHERE job_table=? AND job_uuid=? AND intent_id=? "
-            "  AND telegram_message_id IS NOT NULL",
+            "SELECT telegram_message_id, dedup_token, delivery_status FROM outgoing_msg "
+            "WHERE job_table=? AND job_uuid=? AND intent_id=?",
             (job_table, job_uuid, iid),
         ).fetchone()
         if row:
-            return {
-                "ok": True,
-                "result": {"message_id": row[0]},
-                "deduped": True,
-                "dedup_token": row[1],
-            }
-        # 2. Write-ahead.
+            conn.commit()
+            if type(row[0]) is int and row[0] > 0:
+                return {"ok": True, "result": {"message_id": row[0]},
+                        "deduped": True, "dedup_token": row[1]}
+            return {"ok": False, "held": True,
+                    "outcome": "failed" if row[2] == "failed" else "outcome_unknown",
+                    "dedup_token": row[1]}
         conn.execute(
-            "INSERT OR IGNORE INTO outgoing_msg "
-            "(job_table, job_uuid, chat_id, thread_id, action_type, intent_id, "
-            " dedup_token, intent_recorded_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO outgoing_msg "
+            "(job_table,job_uuid,chat_id,thread_id,action_type,intent_id,"
+            "dedup_token,intent_recorded_at,delivery_status) "
+            "VALUES (?,?,?,?,?,?,?,?,'prepared')",
             (job_table, job_uuid, chat_id, thread_id, action_type, iid,
              dedup_token, _now_iso()),
         )
@@ -3447,39 +3469,37 @@ def send_message_with_wal(job_table: str, job_uuid: str, action_type: str,
     finally:
         conn.close()
 
-    # 3. Make the actual API call.
-    resp = send_message(chat_id, text, thread_id=thread_id, reply_to=reply_to)
-    msg_id = None
+    error = None
     try:
-        if resp and resp.get("ok"):
-            msg_id = ((resp.get("result") or {}).get("message_id"))
-    except AttributeError:
+        resp = _confirmed_send_response(
+            send_message(chat_id, text, thread_id=thread_id, reply_to=reply_to)
+        )
+        msg_id = _telegram_message_id(resp)
+        outcome = "accepted"
+    except Exception as exc:
+        # Persist only a fixed class, never authenticated URLs or reply bodies.
+        code = _send_rejection_code(exc)
+        outcome = "failed" if type(code) is int and 400 <= code < 500 else "outcome_unknown"
+        error = type(exc).__name__
         msg_id = None
+        resp = {"ok": False, "held": True, "outcome": outcome}
 
-    # 4. Write-after.
     conn = sqlite3.connect(str(DB_FILE), timeout=10)
     try:
-        if msg_id is not None:
-            conn.execute(
-                "UPDATE outgoing_msg SET telegram_message_id=?, sent_at=? "
-                "WHERE job_table=? AND job_uuid=? AND intent_id=?",
-                (msg_id, _now_iso(), job_table, job_uuid, iid),
-            )
-        else:
-            conn.execute(
-                "UPDATE outgoing_msg SET error=? "
-                "WHERE job_table=? AND job_uuid=? AND intent_id=?",
-                (str(resp)[:500], job_table, job_uuid, iid),
-            )
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(
+            "UPDATE outgoing_msg SET telegram_message_id=?, sent_at=?, "
+            "delivery_status=?,error=? "
+            "WHERE job_table=? AND job_uuid=? AND intent_id=? AND dedup_token=?",
+            (msg_id, _now_iso() if msg_id else None, outcome, error,
+             job_table, job_uuid, iid, dedup_token),
+        )
         conn.commit()
+        if msg_id is None and job_table in {"qa_job", "pr_review", "build_job"}:
+            _hold_unconfirmed_job_delivery(conn, job_table, job_uuid)
     finally:
         conn.close()
-    if resp is None:
-        return {"ok": False, "error": "send_message returned None",
-                "dedup_token": dedup_token}
-    resp = dict(resp)
-    resp["dedup_token"] = dedup_token
-    return resp
+    return dict(resp, dedup_token=dedup_token)
 
 
 def _claim_review(msg, pr_number, repo):
@@ -3615,6 +3635,7 @@ def _claim_review(msg, pr_number, repo):
 
     # Record the cooldown AFTER the claim is definitively queued.
     _review_cooldown_by_user[requester_id] = time.time()
+    _CHAT_JOB_REF.set(("pr_review", review_uuid))
 
     return (
         f"Very well, @{requester_username} — the Admiralty takes up dispatch "
@@ -3774,7 +3795,7 @@ def _active_draft_for(conn, chat_id, thread_id, requester_id,
     return conn.execute(sql, params).fetchone()
 
 
-def _claim_build_job(draft_row) -> "tuple[str, str]":
+def _claim_build_job(draft_row, request_msg_id=None) -> "tuple[str, str]":
     """Persist a build_job row and enqueue. Returns (job_uuid, ack_string).
 
     Mirrors _claim_review's persist-then-enqueue pattern. The full job_payload
@@ -3815,7 +3836,7 @@ def _claim_build_job(draft_row) -> "tuple[str, str]":
                 (
                     job_uuid, draft_row["draft_uuid"], draft_row["chat_id"],
                     draft_row["thread_id"], draft_row["requester_id"],
-                    draft_row["requester_username"], None,
+                    draft_row["requester_username"], request_msg_id,
                     draft_row["target_repo"], draft_row["target_branch"],
                     json.dumps(job_payload), idem, _now_iso(),
                 ),
@@ -4185,7 +4206,8 @@ def handle_ship(msg):
     finally:
         conn.close()
 
-    _job_uuid, ack = _claim_build_job(draft_row)
+    _job_uuid, ack = _claim_build_job(draft_row, request_msg_id=msg.get("message_id"))
+    _CHAT_JOB_REF.set(("build_job", _job_uuid))
     return ack
 
 
@@ -4240,6 +4262,7 @@ def handle_qa(msg, question: str, attachment: "dict | None" = None):
     if attachment is None and _reply_context_unavailable(msg):
         return _REPLY_CONTEXT_UNAVAILABLE_REPLY
     _job_uuid, ack = _claim_qa_job(msg, question.strip(), attachment=attachment)
+    _CHAT_JOB_REF.set(("qa_job", _job_uuid))
     return ack
 
 
@@ -4677,6 +4700,9 @@ def _process_build(job_uuid: str) -> None:
         target_repo = row["target_repo"]
         target_branch = row["target_branch"]
 
+        if _hold_unconfirmed_job_delivery(conn, "build_job", job_uuid):
+            return
+
         # Mark in_progress + bump attempt_count.
         conn.execute(
             "UPDATE build_job SET status='in_progress', started_at=?, "
@@ -4860,7 +4886,7 @@ def _process_qa(job_uuid: str) -> None:
         prior = conn.execute(
             "SELECT telegram_message_id, dedup_token, action_type "
             "FROM outgoing_msg WHERE job_table='qa_job' AND job_uuid=? "
-            "  AND telegram_message_id IS NOT NULL "
+            "  AND telegram_message_id > 0 "
             "  AND action_type IN (?, ?) "
             "ORDER BY id ASC LIMIT 1",
             (job_uuid, OutgoingAction.QA_ANSWER, OutgoingAction.QA_DECLINE),
@@ -4869,14 +4895,18 @@ def _process_qa(job_uuid: str) -> None:
             log.info("qa %s: outgoing_msg pre-flight hit msg_id=%s",
                      job_uuid, prior[0])
             conn.execute(
-                "UPDATE qa_job SET status='answered', "
+                "UPDATE qa_job SET status=?, "
                 "telegram_reply_msg_id=?, last_dedup_token=?, "
                 "side_effect_completed_at=COALESCE(side_effect_completed_at, ?), "
                 "finished_at=COALESCE(finished_at, ?) WHERE job_uuid=?",
-                (prior[0], prior[1], _now_iso(), _now_iso(), job_uuid),
+                ("declined" if prior[2] == OutgoingAction.QA_DECLINE else "answered",
+                 prior[0], prior[1], _now_iso(), _now_iso(), job_uuid),
             )
             conn.commit()
             unlink_result_file(job_uuid)
+            return
+
+        if _hold_unconfirmed_job_delivery(conn, "qa_job", job_uuid):
             return
 
         # Mark in_progress + bump attempt_count.
@@ -5031,7 +5061,7 @@ def _process_review(job_uuid: str) -> None:
         prior = conn.execute(
             "SELECT telegram_message_id, dedup_token "
             "FROM outgoing_msg WHERE job_table='pr_review' AND job_uuid=? "
-            "  AND telegram_message_id IS NOT NULL "
+            "  AND telegram_message_id > 0 "
             "  AND action_type=? "
             "ORDER BY id ASC LIMIT 1",
             (job_uuid, OutgoingAction.REVIEW_POST),
@@ -5048,6 +5078,9 @@ def _process_review(job_uuid: str) -> None:
             )
             conn.commit()
             unlink_result_file(job_uuid)
+            return
+
+        if _hold_unconfirmed_job_delivery(conn, "pr_review", job_uuid):
             return
 
         conn.execute(
@@ -5209,13 +5242,24 @@ def _recover_jobs_on_boot() -> dict:
     Returns a summary dict for logging / tests.
     """
     summary = {"build": 0, "qa": 0, "review": 0, "tmp_swept": 0,
-               "reconciled": 0, "requeued": 0}
+               "reconciled": 0, "requeued": 0, "delivery_held": 0}
     summary["tmp_swept"] = sweep_stale_tmp_files()
 
     conn = sqlite3.connect(str(DB_FILE), timeout=10)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")
+
+        # Pending jobs with an unconfirmed send cannot safely restart their
+        # provider or external work. Reconciliation is explicit, not replay.
+        for table, key in (("build_job", "job_uuid"), ("qa_job", "job_uuid"),
+                           ("pr_review", "review_uuid")):
+            pending = conn.execute(
+                f"SELECT {key} FROM {table} WHERE status IN ('queued','in_progress')"
+            ).fetchall()
+            for pending_row in pending:
+                if _hold_unconfirmed_job_delivery(conn, table, pending_row[0]):
+                    summary["delivery_held"] += 1
 
         # build_job
         for row in conn.execute(
@@ -5299,14 +5343,470 @@ def _start_workers():
     log.info("workers started: build, qa, review")
 
 
+def _route_update(update: dict, recent_by_chat: dict) -> dict | None:
+    """Route one update; callers own intake/cursor and worker supervision."""
+    _CHAT_JOB_REF.set(None)
+    update_id = update.get("update_id")
+    _CHAT_UPDATE_ID.set(update_id if type(update_id) is int and update_id >= 0 else None)
+    if update.get("my_chat_member"):
+        _record_membership_update(update)
+        return
+    msg = update.get("message")
+    if not msg:
+        return
+
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id", 0)
+    topic_id = msg.get("message_thread_id")
+    _record_chat_migration(msg)
+    capability = _room_capability(chat_id)
+
+    # This gate comes before text normalization, logging, history,
+    # mention/context parsing, attachment inspection, and every
+    # model/worker route. Squid Cave gets only its fixed decline;
+    # unknown rooms get no response at all.
+    if capability["trust_class"] == "public_untrusted":
+        return _handle_public_untrusted_message(msg)
+    if capability["trust_class"] != "trusted":
+        return
+
+    text = _message_text(msg)
+    if text and not msg.get("text"):
+        # The rest of the mature routing stack reads `text`.
+        # Normalize Telegram media captions once, while retaining
+        # caption_entities and document metadata on the message.
+        msg = dict(msg)
+        msg["text"] = text
+    sender = msg.get("from", {})
+
+    log.info(
+        "[%s/%s] @%s bot=%s: %s",
+        chat.get("title") or chat_id, topic_id,
+        sender.get("username", "?"),
+        sender.get("is_bot", False),
+        text[:120],
+    )
+
+    # Forum topics share a numeric chat id but are separate
+    # conversations. Keep their recent context apart; otherwise
+    # a PR in one topic can become a referent in another.
+    context_key = (chat_id, topic_id)
+    buf = recent_by_chat.setdefault(context_key, [])
+    if text:
+        buf.append(msg)
+        recent_by_chat[context_key] = buf[-20:]
+
+    # Benthic backup: if Benthic himself just spoke in a chat where
+    # we're covering for him, clear any pending stand-in rows so
+    # the sweeper doesn't post on top of his reply.
+    if benthic_backup_chat_eligible(chat_id, topic_id):
+        clear_benthic_pending_if_benthic_replied(msg)
+
+    policy = _policy_for(chat_id, topic_id)
+    if policy["speak"] == "never":
+        return
+
+    text_lower = text.lower()
+    reply_msg = msg.get("reply_to_message") or {}
+    reply_to_us = (
+        reply_msg.get("from", {}).get("username", "").lower() == BOT_USERNAME
+    )
+    is_mention = _is_mention_of_commodore(msg, text_lower)
+    # If this user has an active plan_draft in this (chat, thread)
+    # they are mid-conversation with us — treat any of their next
+    # messages as implicitly directed at the Commodore. Without
+    # this, a follow-up like "Ship it!" with no @mention slips
+    # past should_respond() and the operator wonders why we
+    # ignored them. Scoped to the same (chat_id, thread_id,
+    # requester_id) tuple that owns the draft.
+    #
+    # 2026-05-15: bounded to 15 min of inactivity. Stale drafts
+    # (operator wandered off mid-plan) were causing the bot to
+    # treat every subsequent Lev Dev message from that user as
+    # "direct," bypassing mention_only. Two May 12 / April 26
+    # rows had been silently bypassing the policy for days.
+    has_active_plan = False
+    try:
+        _conn = sqlite3.connect(str(DB_FILE), timeout=5)
+        _conn.row_factory = sqlite3.Row
+        has_active_plan = _active_draft_for(
+            _conn, chat_id, topic_id, sender.get("id", 0),
+            max_age_minutes=15,
+        ) is not None
+        _conn.close()
+    except sqlite3.Error:
+        pass
+    # DMs from admins are always direct — there's nobody else
+    # in the room to address. Without this, a DM like "Status"
+    # with no @mention falls through mention_only and the bot
+    # silently ignores its own operator (2026-06-13 incident).
+    # Non-admin DMs are NOT auto-direct — random strangers
+    # discovering @leviathan_commodore_bot don't get to spend
+    # the Admiralty's LLM credits by saying "hi".
+    is_admin_dm = (
+        msg.get("chat", {}).get("type") == "private"
+        and _is_admin(msg)
+    )
+    # Lev Sec status is deliberately reply-bound. A reply to an
+    # alert message is direct enough to ask for that one alert's
+    # ledger state, even without an @mention; the lookup below
+    # still rejects unbound/foreign messages and never re-triages.
+    is_levsec_alert_reply = _is_levsec_alert_reply(msg)
+    is_direct = (
+        is_admin_dm or reply_to_us or is_mention or has_active_plan
+        or is_levsec_alert_reply
+    )
+
+    # Benthic backup enqueue: someone hailed @Benthic_Bot and the
+    # Commodore is covering. Record the mention; the sweeper will
+    # step in if Benthic doesn't reply within the delay window.
+    # We still fall through to should_respond — if the same
+    # message also @mentions the Commodore, he answers immediately
+    # in his own voice (no need to wait the delay).
+    if (
+        benthic_backup_chat_eligible(chat_id, topic_id)
+        and not is_mention
+        and not sender.get("is_bot", False)
+        and _is_mention_of_benthic(msg, text_lower)
+    ):
+        enqueue_benthic_pending(msg)
+
+    if not should_respond(msg, policy, is_direct):
+        if text:
+            save_chat_message(msg)
+        return
+
+    # Wager refusal - hard bot-side first line, no LLM invocation.
+    if _WAGER_REFUSAL_RE.match(text.strip()):
+        result = _chat_send(
+            chat_id, _WAGER_REFUSAL_TEXT,
+            thread_id=topic_id, reply_to=msg["message_id"],
+        )
+        _responded.add(msg["message_id"])
+        _last_reply_to[sender.get("id", 0)] = time.time()
+        save_chat_message(msg, our_reply=_WAGER_REFUSAL_TEXT)
+        return {"outcome": "escalated", "message_id": _telegram_message_id(result)}
+
+    response = (
+        _levsec_alert_status_reply(msg)
+        if is_direct and _should_handle_levsec_alert_status(msg, text)
+        else None
+    )
+    attachment = None
+    document = _message_document(msg)
+    if response is None and is_direct and document:
+        if not _can_review_attachment(msg):
+            response = _document_intake_failure(
+                document,
+                "document review is not authorized in this room; "
+                "the attachment itself did arrive.",
+            )
+        elif not QA_ENABLED:
+            response = _document_intake_failure(
+                document,
+                "document review is temporarily disabled with the "
+                "Q&A worker; the attachment itself did arrive.",
+            )
+        else:
+            try:
+                attachment = download_telegram_text_document(msg)
+            except TelegramDocumentIntakeError as exc:
+                log.warning(
+                    "Telegram document rejected chat=%s msg=%s name=%r: %s",
+                    chat_id, msg.get("message_id"),
+                    _safe_document_name(document), str(exc),
+                )
+                response = _document_intake_failure(document, str(exc))
+    # PR review flow takes priority over PR filing flow (narrower
+    # intent first): /review 253, "review PR 253", etc. Must be
+    # direct (@mention or reply to Commodore), from a trusted
+    # room with ship authority, and pass preflight + claim.
+    if response is None and is_direct and _can_ship(msg):
+        review_intent = _detect_pr_review(text)
+        if review_intent is not None:
+            pr_number, repo = review_intent
+            if repo is None:
+                # Intent detected but repo not on allowlist.
+                response = (
+                    f"The Admiralty does not review dispatches "
+                    f"outside its commissioned fleet. Pray specify "
+                    f"a repository under the Leviathan flag."
+                )
+            else:
+                preflight_decline = _review_preflight()
+                if preflight_decline is not None:
+                    response = preflight_decline
+                else:
+                    response = _claim_review(msg, pr_number, repo)
+
+    # GitHub issue/PR comment — checked BEFORE _detect_pr_request
+    # so "comment on .../pull/N" doesn't get mis-routed to the
+    # PR-filing pipeline. The URL match is the anchor; the verb
+    # disambiguates from passive references.
+    if (
+        response is None and is_direct
+        and _GITHUB_ISSUE_URL_RE.search(text or "")
+        and _COMMENT_REQUEST_RE.search(text or "")
+    ):
+        response = handle_comment_request(msg, text)
+
+    # "file a PR / open a PR / draft a PR" routes into the v6
+    # plan-refinement flow. The old v1 stub (handle_pr_request)
+    # is retained for grep purposes but no longer reachable from
+    # poll() — it announced a branch and did nothing.
+    if response is None and is_direct and _detect_pr_request(text):
+        if _can_plan(msg):
+            stripped = text.strip()
+            stripped_no_mention = re.sub(
+                r"^@\S+\s*[,:]?\s*", "", stripped, count=1,
+            )
+            response = handle_plan_message(msg, stripped_no_mention)
+        else:
+            response = (
+                "The Fleet does not entertain pull-request orders "
+                "from this quarter. Pray use a registered trusted "
+                "Fleet room."
+            )
+
+    # v6 conversational pipelines. Each handler enforces its own
+    # auth gate (_can_ship / _can_plan / _can_qa) so wrong-channel
+    # callers receive an in-character decline rather than silence.
+    #
+    # Order matters: ship/abandon/plan are slash-command-y and
+    # narrow; Q&A is broad and goes last so it catches anything
+    # ending in `?` that wasn't claimed by the other paths.
+    if response is None and is_direct:
+        stripped = text.strip()
+        # Strip leading mention so regexes anchor cleanly.
+        stripped_no_mention = re.sub(
+            r"^@\S+\s*[,:]?\s*", "", stripped, count=1,
+        )
+
+        if _SHIP_RE.search(stripped_no_mention):
+            response = handle_ship(msg)
+        elif _ABANDON_RE.search(stripped_no_mention):
+            response = handle_abandon(msg)
+        elif _PLAN_REFINE_RE.match(stripped_no_mention):
+            response = handle_plan_message(msg, stripped_no_mention)
+        elif QA_ENABLED:
+            # Q&A: slash form takes the captured group as the
+            # question; natural form passes the whole post-mention
+            # text. Q&A is gated to registered trusted rooms ∪
+            # admin DM by _can_qa inside handle_qa.
+            # Kill switch: QA_ENABLED=0 short-circuits this branch
+            # so text-only messages fall through to normal chat;
+            # documents receive an explicit unavailable diagnostic.
+            question = _qa_question_for_text(
+                stripped_no_mention,
+                has_attachment=attachment is not None,
+            )
+            if question is not None:
+                response = handle_qa(
+                    msg, question, attachment=attachment,
+                )
+
+    response_outcome = "resolved"
+    if response is None:
+        response = generate_response(
+            msg, is_direct=is_direct, policy=policy,
+            recent_messages=recent_by_chat.get(context_key, []),
+        )
+        if response and response.strip().upper() == "SKIP":
+            response = None
+        if not response and is_direct:
+            # Filtering, empty provider output or an inappropriate SKIP must
+            # not silently discard an admitted trusted-room request.
+            response = "I could not produce a safe answer. This request remains unresolved and needs operator review."
+            response_outcome = "held_unknown"
+
+    if response:
+        result = _chat_send(
+            chat_id, response, thread_id=topic_id,
+            reply_to=msg["message_id"],
+        )
+        sent_msg_id = (result.get("result") or {}).get("message_id")
+        _responded.add(msg["message_id"])
+        _last_reply_to[sender.get("id", 0)] = time.time()
+        if not is_direct:
+            _ambient_last_post_by_chat[chat_id] = time.time()
+        # Record nemesis-engagement time so the 5-min cooldown
+        # keeps the rivalry a running joke, not a flood.
+        if _is_nemesis_message(msg):
+            _nemesis_ambient_last_by_chat[chat_id] = time.time()
+            log.info("Engaged Nemesis in chat %s", chat_id)
+        save_chat_message(msg, our_reply=response)
+        if chat_id == AGENT_CHAT_GROUP_ID and sent_msg_id:
+            _post_relay_receipt(sent_msg_id, chat_id, topic_id, response)
+        job_ref = _CHAT_JOB_REF.get()
+        if job_ref is not None and _durable_chat_job_exists(*job_ref):
+            return {"outcome": "handed_off", "job_table": job_ref[0], "job_uuid": job_ref[1]}
+        return {
+            "outcome": "escalated" if response == CLAUDE_OUTAGE_REPLY else response_outcome,
+            "message_id": _telegram_message_id(result),
+        }
+    else:
+        if text:
+            save_chat_message(msg)
+
+
+
 # --- Main poll loop ---------------------------------------------------------
 
 
+def _chat_send(chat_id, text, thread_id=None, reply_to=None):
+    update_id = _CHAT_UPDATE_ID.get()
+    if update_id is None or _HELM_CONTROLLER is not None:
+        return send_message(chat_id, text, thread_id=thread_id, reply_to=reply_to)
+    result = send_message_with_wal(
+        "chat_intake", str(update_id), "chat_reply", chat_id, text,
+        thread_id=thread_id, reply_to=reply_to,
+    )
+    if _telegram_message_id(result) is None:
+        raise RuntimeError("chat delivery held for receipt reconciliation")
+    return result
+
+
+def _minimal_intake_message(msg, depth=0):
+    """Keep only routing/reply fields; never persist media blobs or profiles."""
+    result = {key: msg[key] for key in (
+        "message_id", "message_thread_id", "is_topic_message", "text", "caption",
+        "migrate_to_chat_id", "migrate_from_chat_id",
+    ) if key in msg}
+    result["chat"] = {key: (msg.get("chat") or {})[key]
+                      for key in ("id", "type", "title") if key in (msg.get("chat") or {})}
+    result["from"] = {key: (msg.get("from") or {})[key]
+                      for key in ("id", "username", "first_name", "is_bot") if key in (msg.get("from") or {})}
+    for key in ("entities", "caption_entities"):
+        if key in msg:
+            result[key] = [{field: entity[field] for field in (
+                "type", "offset", "length", "url", "user",
+            ) if field in entity} for entity in msg[key]]
+            for entity in result[key]:
+                if isinstance(entity.get("user"), dict):
+                    entity["user"] = {field: entity["user"][field] for field in (
+                        "id", "username", "is_bot",
+                    ) if field in entity["user"]}
+    document = msg.get("document")
+    # Preserve the reviewed image-context repair across durable admission
+    # without storing photo identifiers, sizes, or pixels. Never copy a
+    # supplied marker: derive this one static signal from Telegram metadata.
+    if msg.get("photo") or (
+        isinstance(document, dict)
+        and str(document.get("mime_type", "")).startswith("image/")
+    ):
+        result["_intake_image_present"] = True
+    if isinstance(document, dict):
+        result["document"] = {key: document[key] for key in (
+            "file_id", "file_name", "mime_type", "file_size",
+        ) if key in document}
+    if isinstance(msg.get("quote"), dict):
+        result["quote"] = {key: msg["quote"][key] for key in (
+            "text", "position", "is_manual",
+        ) if key in msg["quote"]}
+    if depth < 3 and isinstance(msg.get("reply_to_message"), dict):
+        result["reply_to_message"] = _minimal_intake_message(msg["reply_to_message"], depth + 1)
+    return result
+
+
+def _admit_chat_update(update):
+    """Room authorization precedes body persistence, not merely model dispatch."""
+    minimal = {"update_id": update["update_id"]}
+    if update.get("my_chat_member"):
+        member = update["my_chat_member"]
+        minimal["my_chat_member"] = {
+            "chat": {"id": (member.get("chat") or {}).get("id")},
+            "old_chat_member": {"status": (member.get("old_chat_member") or {}).get("status")},
+            "new_chat_member": {"status": (member.get("new_chat_member") or {}).get("status")},
+        }
+        return minimal
+    msg = update.get("message")
+    if not isinstance(msg, dict):
+        return minimal
+    capability = _room_capability((msg.get("chat") or {}).get("id"))
+    if capability["trust_class"] == "trusted":
+        minimal["message"] = _minimal_intake_message(msg)
+    elif capability["trust_class"] == "public_untrusted" and _is_fixed_public_hail(msg):
+        # Preserve only a yes/no hail signal, not attacker-controlled prose,
+        # entities, document IDs, quoted bodies or profile metadata.
+        minimal["message"] = {
+            "message_id": msg.get("message_id"),
+            "message_thread_id": msg.get("message_thread_id"),
+            "chat": {"id": (msg.get("chat") or {}).get("id")},
+            "from": {"username": (msg.get("from") or {}).get("username", "")},
+            "text": "@" + BOT_USERNAME,
+        }
+    elif msg.get("migrate_to_chat_id"):
+        minimal["message"] = {
+            "message_id": msg.get("message_id"),
+            "chat": {"id": (msg.get("chat") or {}).get("id")},
+            "migrate_to_chat_id": msg["migrate_to_chat_id"],
+        }
+    return minimal
+
+
+_CHAT_JOB_COLUMNS = {"qa_job": "job_uuid", "build_job": "job_uuid", "pr_review": "review_uuid"}
+
+
+def _durable_chat_job_exists(table, job_uuid):
+    column = _CHAT_JOB_COLUMNS.get(table)
+    if column is None:
+        return False
+    with closing(sqlite3.connect(str(DB_FILE), timeout=5)) as conn:
+        return conn.execute(f"SELECT 1 FROM {table} WHERE {column}=?", (job_uuid,)).fetchone() is not None
+
+
+def _reconcile_chat_handoffs(intake):
+    """A queued acknowledgement never substitutes for the job's final receipt."""
+    with closing(sqlite3.connect(str(DB_FILE), timeout=5)) as conn:
+        for event in intake.handoffs():
+            table, job_uuid = event["job_table"], event["job_uuid"]
+            column = _CHAT_JOB_COLUMNS.get(table)
+            if column is None:
+                continue
+            row = conn.execute(f"SELECT status FROM {table} WHERE {column}=?", (job_uuid,)).fetchone()
+            if row is None or row[0] not in {"answered", "declined", "succeeded", "posted", "failed", "orphaned"}:
+                continue
+            receipt = conn.execute(
+                "SELECT telegram_message_id FROM outgoing_msg WHERE job_table=? AND job_uuid=? "
+                "AND telegram_message_id>0 ORDER BY id DESC LIMIT 1", (table, job_uuid),
+            ).fetchone()
+            if receipt is not None:
+                outcome = "resolved" if row[0] in {"answered", "succeeded", "posted"} else "escalated"
+                intake.complete_handoff(event["update_id"], table, job_uuid, outcome, receipt[0])
+
+
+def _chat_maintenance(intake=None):
+    if len(_responded) > _MAX_STATE_SIZE:
+        _responded.clear()
+    if len(_msg_root) > _MAX_STATE_SIZE:
+        _msg_root.clear()
+        _thread_depth.clear()
+    stale = [key for key, value in _last_reply_to.items() if time.time() - value > 3600]
+    for key in stale:
+        del _last_reply_to[key]
+    _prune_chat_history()
+    sweep_benthic_pending()
+    if intake is not None:
+        intake.prune_terminal()
+
+
 def poll():
+    # The OS owns release of this lock after process death. Never use a stale
+    # file's existence as ownership proof or delete it to force a second poller.
+    with PollOwner(DB_FILE.parent / "poll-owner.lock"):
+        _poll_owned()
+
+
+def _poll_owned():
+    intake = ChatIntake(DB_FILE.parent / "chat-intake.db") if _HELM_CONTROLLER is None else None
+    if intake is not None and not intake.legacy_capture_complete():
+        # The legacy listener kept its offset only in memory. A fresh zero
+        # cursor is not proof that pending updates are safe to route again.
+        raise RuntimeError("legacy intake capture required before ordinary polling")
     offset = (
         _HELM_CONTROLLER.durable_offset()
         if _HELM_CONTROLLER is not None
-        else 0
+        else intake.offset()
     )
     recent_by_chat = {}
 
@@ -5340,6 +5840,17 @@ def poll():
     except Exception as exc:
         log.exception("recovery on boot failed (non-fatal): %s", exc)
     _start_workers()
+    dispatcher = None
+    if intake is not None:
+        held = intake.hold_interrupted()
+        if held:
+            log.warning("interrupted chat claims held=%s", held)
+        dispatcher = ChatDispatcher(
+            intake, lambda update: _route_update(update, recent_by_chat) or {"outcome": "no_reply"},
+            maintenance=lambda: _chat_maintenance(intake),
+        )
+        dispatcher.start()
+    last_status_at = 0
 
     while True:
         try:
@@ -5348,12 +5859,26 @@ def poll():
                 "timeout": POLL_TIMEOUT,
                 "allowed_updates": ["message", "my_chat_member"],
             })
+            if not isinstance(updates, dict) or updates.get("ok") is not True or not isinstance(updates.get("result"), list):
+                raise RuntimeError("Telegram intake lacks a confirmed update batch")
             if _HELM_CONTROLLER is not None:
                 # Successful long-poll completion is the watcher health signal.
                 # A timer cannot renew this lease without proving Telegram
                 # intake actually returned.
                 _HELM_CONTROLLER.heartbeat_watcher(HELM_WATCHER_TTL_SECONDS)
-            for update in updates.get("result", []):
+            batch = updates.get("result", [])
+            if intake is not None:
+                # One commit admits the whole minimized batch and advances its
+                # cursor. A failed commit leaves Telegram offset unchanged.
+                intake.ingest_batch([_admit_chat_update(update) for update in batch])
+                offset = intake.offset()
+                intake.note_poll(router_alive=dispatcher.alive())
+                _reconcile_chat_handoffs(intake)
+                if time.time() - last_status_at >= 60:
+                    log.info("chat intake outcomes=%s router_alive=%s", intake.snapshot(), dispatcher.alive())
+                    last_status_at = time.time()
+                continue
+            for update in batch:
                 if _HELM_CONTROLLER is not None:
                     queued = _HELM_CONTROLLER.enqueue_update(update)
                     event_id = queued["event_id"]
@@ -5364,296 +5889,7 @@ def poll():
                     # route or answer.  Sol claims the already-queued event.
                     if not _HELM_CONTROLLER.route_allowed(HELM_ACTOR, event_id):
                         continue
-                else:
-                    offset = update["update_id"] + 1
-                if update.get("my_chat_member"):
-                    _record_membership_update(update)
-                    continue
-                msg = update.get("message")
-                if not msg:
-                    continue
-
-                chat = msg.get("chat", {})
-                chat_id = chat.get("id", 0)
-                topic_id = msg.get("message_thread_id")
-                _record_chat_migration(msg)
-                capability = _room_capability(chat_id)
-
-                # This gate comes before text normalization, logging, history,
-                # mention/context parsing, attachment inspection, and every
-                # model/worker route. Squid Cave gets only its fixed decline;
-                # unknown rooms get no response at all.
-                if capability["trust_class"] == "public_untrusted":
-                    _handle_public_untrusted_message(msg)
-                    continue
-                if capability["trust_class"] != "trusted":
-                    continue
-
-                text = _message_text(msg)
-                if text and not msg.get("text"):
-                    # The rest of the mature routing stack reads `text`.
-                    # Normalize Telegram media captions once, while retaining
-                    # caption_entities and document metadata on the message.
-                    msg = dict(msg)
-                    msg["text"] = text
-                sender = msg.get("from", {})
-
-                log.info(
-                    "[%s/%s] @%s bot=%s: %s",
-                    chat.get("title") or chat_id, topic_id,
-                    sender.get("username", "?"),
-                    sender.get("is_bot", False),
-                    text[:120],
-                )
-
-                # Forum topics share a numeric chat id but are separate
-                # conversations. Keep their recent context apart; otherwise
-                # a PR in one topic can become a referent in another.
-                context_key = (chat_id, topic_id)
-                buf = recent_by_chat.setdefault(context_key, [])
-                if text:
-                    buf.append(msg)
-                    recent_by_chat[context_key] = buf[-20:]
-
-                # Benthic backup: if Benthic himself just spoke in a chat where
-                # we're covering for him, clear any pending stand-in rows so
-                # the sweeper doesn't post on top of his reply.
-                if benthic_backup_chat_eligible(chat_id, topic_id):
-                    clear_benthic_pending_if_benthic_replied(msg)
-
-                policy = _policy_for(chat_id, topic_id)
-                if policy["speak"] == "never":
-                    continue
-
-                text_lower = text.lower()
-                reply_msg = msg.get("reply_to_message") or {}
-                reply_to_us = (
-                    reply_msg.get("from", {}).get("username", "").lower() == BOT_USERNAME
-                )
-                is_mention = _is_mention_of_commodore(msg, text_lower)
-                # If this user has an active plan_draft in this (chat, thread)
-                # they are mid-conversation with us — treat any of their next
-                # messages as implicitly directed at the Commodore. Without
-                # this, a follow-up like "Ship it!" with no @mention slips
-                # past should_respond() and the operator wonders why we
-                # ignored them. Scoped to the same (chat_id, thread_id,
-                # requester_id) tuple that owns the draft.
-                #
-                # 2026-05-15: bounded to 15 min of inactivity. Stale drafts
-                # (operator wandered off mid-plan) were causing the bot to
-                # treat every subsequent Lev Dev message from that user as
-                # "direct," bypassing mention_only. Two May 12 / April 26
-                # rows had been silently bypassing the policy for days.
-                has_active_plan = False
-                try:
-                    _conn = sqlite3.connect(str(DB_FILE), timeout=5)
-                    _conn.row_factory = sqlite3.Row
-                    has_active_plan = _active_draft_for(
-                        _conn, chat_id, topic_id, sender.get("id", 0),
-                        max_age_minutes=15,
-                    ) is not None
-                    _conn.close()
-                except sqlite3.Error:
-                    pass
-                # DMs from admins are always direct — there's nobody else
-                # in the room to address. Without this, a DM like "Status"
-                # with no @mention falls through mention_only and the bot
-                # silently ignores its own operator (2026-06-13 incident).
-                # Non-admin DMs are NOT auto-direct — random strangers
-                # discovering @leviathan_commodore_bot don't get to spend
-                # the Admiralty's LLM credits by saying "hi".
-                is_admin_dm = (
-                    msg.get("chat", {}).get("type") == "private"
-                    and _is_admin(msg)
-                )
-                # Lev Sec status is deliberately reply-bound. A reply to an
-                # alert message is direct enough to ask for that one alert's
-                # ledger state, even without an @mention; the lookup below
-                # still rejects unbound/foreign messages and never re-triages.
-                is_levsec_alert_reply = _is_levsec_alert_reply(msg)
-                is_direct = (
-                    is_admin_dm or reply_to_us or is_mention or has_active_plan
-                    or is_levsec_alert_reply
-                )
-
-                # Benthic backup enqueue: someone hailed @Benthic_Bot and the
-                # Commodore is covering. Record the mention; the sweeper will
-                # step in if Benthic doesn't reply within the delay window.
-                # We still fall through to should_respond — if the same
-                # message also @mentions the Commodore, he answers immediately
-                # in his own voice (no need to wait the delay).
-                if (
-                    benthic_backup_chat_eligible(chat_id, topic_id)
-                    and not is_mention
-                    and not sender.get("is_bot", False)
-                    and _is_mention_of_benthic(msg, text_lower)
-                ):
-                    enqueue_benthic_pending(msg)
-
-                if not should_respond(msg, policy, is_direct):
-                    if text:
-                        save_chat_message(msg)
-                    continue
-
-                # Wager refusal - hard bot-side first line, no LLM invocation.
-                if _WAGER_REFUSAL_RE.match(text.strip()):
-                    send_message(
-                        chat_id, _WAGER_REFUSAL_TEXT,
-                        thread_id=topic_id, reply_to=msg["message_id"],
-                    )
-                    _responded.add(msg["message_id"])
-                    _last_reply_to[sender.get("id", 0)] = time.time()
-                    save_chat_message(msg, our_reply=_WAGER_REFUSAL_TEXT)
-                    continue
-
-                response = (
-                    _levsec_alert_status_reply(msg)
-                    if is_direct and _should_handle_levsec_alert_status(msg, text)
-                    else None
-                )
-                attachment = None
-                document = _message_document(msg)
-                if response is None and is_direct and document:
-                    if not _can_review_attachment(msg):
-                        response = _document_intake_failure(
-                            document,
-                            "document review is not authorized in this room; "
-                            "the attachment itself did arrive.",
-                        )
-                    elif not QA_ENABLED:
-                        response = _document_intake_failure(
-                            document,
-                            "document review is temporarily disabled with the "
-                            "Q&A worker; the attachment itself did arrive.",
-                        )
-                    else:
-                        try:
-                            attachment = download_telegram_text_document(msg)
-                        except TelegramDocumentIntakeError as exc:
-                            log.warning(
-                                "Telegram document rejected chat=%s msg=%s name=%r: %s",
-                                chat_id, msg.get("message_id"),
-                                _safe_document_name(document), str(exc),
-                            )
-                            response = _document_intake_failure(document, str(exc))
-                # PR review flow takes priority over PR filing flow (narrower
-                # intent first): /review 253, "review PR 253", etc. Must be
-                # direct (@mention or reply to Commodore), from a trusted
-                # room with ship authority, and pass preflight + claim.
-                if response is None and is_direct and _can_ship(msg):
-                    review_intent = _detect_pr_review(text)
-                    if review_intent is not None:
-                        pr_number, repo = review_intent
-                        if repo is None:
-                            # Intent detected but repo not on allowlist.
-                            response = (
-                                f"The Admiralty does not review dispatches "
-                                f"outside its commissioned fleet. Pray specify "
-                                f"a repository under the Leviathan flag."
-                            )
-                        else:
-                            preflight_decline = _review_preflight()
-                            if preflight_decline is not None:
-                                response = preflight_decline
-                            else:
-                                response = _claim_review(msg, pr_number, repo)
-
-                # GitHub issue/PR comment — checked BEFORE _detect_pr_request
-                # so "comment on .../pull/N" doesn't get mis-routed to the
-                # PR-filing pipeline. The URL match is the anchor; the verb
-                # disambiguates from passive references.
-                if (
-                    response is None and is_direct
-                    and _GITHUB_ISSUE_URL_RE.search(text or "")
-                    and _COMMENT_REQUEST_RE.search(text or "")
-                ):
-                    response = handle_comment_request(msg, text)
-
-                # "file a PR / open a PR / draft a PR" routes into the v6
-                # plan-refinement flow. The old v1 stub (handle_pr_request)
-                # is retained for grep purposes but no longer reachable from
-                # poll() — it announced a branch and did nothing.
-                if response is None and is_direct and _detect_pr_request(text):
-                    if _can_plan(msg):
-                        stripped = text.strip()
-                        stripped_no_mention = re.sub(
-                            r"^@\S+\s*[,:]?\s*", "", stripped, count=1,
-                        )
-                        response = handle_plan_message(msg, stripped_no_mention)
-                    else:
-                        response = (
-                            "The Fleet does not entertain pull-request orders "
-                            "from this quarter. Pray use a registered trusted "
-                            "Fleet room."
-                        )
-
-                # v6 conversational pipelines. Each handler enforces its own
-                # auth gate (_can_ship / _can_plan / _can_qa) so wrong-channel
-                # callers receive an in-character decline rather than silence.
-                #
-                # Order matters: ship/abandon/plan are slash-command-y and
-                # narrow; Q&A is broad and goes last so it catches anything
-                # ending in `?` that wasn't claimed by the other paths.
-                if response is None and is_direct:
-                    stripped = text.strip()
-                    # Strip leading mention so regexes anchor cleanly.
-                    stripped_no_mention = re.sub(
-                        r"^@\S+\s*[,:]?\s*", "", stripped, count=1,
-                    )
-
-                    if _SHIP_RE.search(stripped_no_mention):
-                        response = handle_ship(msg)
-                    elif _ABANDON_RE.search(stripped_no_mention):
-                        response = handle_abandon(msg)
-                    elif _PLAN_REFINE_RE.match(stripped_no_mention):
-                        response = handle_plan_message(msg, stripped_no_mention)
-                    elif QA_ENABLED:
-                        # Q&A: slash form takes the captured group as the
-                        # question; natural form passes the whole post-mention
-                        # text. Q&A is gated to registered trusted rooms ∪
-                        # admin DM by _can_qa inside handle_qa.
-                        # Kill switch: QA_ENABLED=0 short-circuits this branch
-                        # so text-only messages fall through to normal chat;
-                        # documents receive an explicit unavailable diagnostic.
-                        question = _qa_question_for_text(
-                            stripped_no_mention,
-                            has_attachment=attachment is not None,
-                        )
-                        if question is not None:
-                            response = handle_qa(
-                                msg, question, attachment=attachment,
-                            )
-
-                if response is None:
-                    response = generate_response(
-                        msg, is_direct=is_direct, policy=policy,
-                        recent_messages=recent_by_chat.get(context_key, []),
-                    )
-                    if response and response.strip().upper() == "SKIP":
-                        response = None
-
-                if response:
-                    result = send_message(
-                        chat_id, response, thread_id=topic_id,
-                        reply_to=msg["message_id"],
-                    )
-                    sent_msg_id = (result.get("result") or {}).get("message_id")
-                    _responded.add(msg["message_id"])
-                    _last_reply_to[sender.get("id", 0)] = time.time()
-                    if not is_direct:
-                        _ambient_last_post_by_chat[chat_id] = time.time()
-                    # Record nemesis-engagement time so the 5-min cooldown
-                    # keeps the rivalry a running joke, not a flood.
-                    if _is_nemesis_message(msg):
-                        _nemesis_ambient_last_by_chat[chat_id] = time.time()
-                        log.info("Engaged Nemesis in chat %s", chat_id)
-                    save_chat_message(msg, our_reply=response)
-                    if chat_id == AGENT_CHAT_GROUP_ID and sent_msg_id:
-                        _post_relay_receipt(sent_msg_id, chat_id, topic_id, response)
-                else:
-                    if text:
-                        save_chat_message(msg)
-
+                _route_update(update, recent_by_chat)
             if len(_responded) > _MAX_STATE_SIZE:
                 _responded.clear()
             if len(_msg_root) > _MAX_STATE_SIZE:
@@ -5669,21 +5905,23 @@ def poll():
             log.info("Shutting down")
             break
         except Exception as exc:
-            # 409 Conflict = another getUpdates poller is active (or Telegram's
-            # server still holds a stale session). deleteWebhook is idempotent
-            # and harmless; call it to drop any lingering state and let the
-            # next iteration re-poll cleanly.
+            # A 409 is competing intake, not permission to interfere with the
+            # other actor or erase its pending updates. Back off for inspection.
             exc_msg = str(exc)
             if "409" in exc_msg or "Conflict" in exc_msg:
-                log.warning("Poll 409 — dropping stale poller state and retrying")
-                try:
-                    tg_request("deleteWebhook", {"drop_pending_updates": False})
-                except Exception:
-                    pass
+                log.warning("Poll conflict — competing intake requires ownership inspection")
                 time.sleep(10)
             else:
-                log.error("Poll error: %s", exc)
+                log.error("Poll error class=%s", type(exc).__name__)
                 time.sleep(5)
+    if dispatcher is not None:
+        if not dispatcher.stop(1):
+            log.warning("waiting for owned chat router before releasing poll ownership")
+            # Never release the singleton while this process still has a
+            # thread capable of sending. A truly stuck thread requires a
+            # process-level supervisor kill, not a second routing thread.
+            while not dispatcher.stop(1):
+                pass
 
 
 if __name__ == "__main__":

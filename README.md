@@ -25,6 +25,14 @@ triage fences, and logs survive artifact replacement. Set
 `FLEET_COMMODORE_PYTHON` to the versioned service-owned interpreter snapshot;
 do not copy a virtual environment into the Git worktree.
 
+The registered watchdog checks the actual sole process, release and tmux pane,
+not window existence alone. Restarts are bounded and fail closed around live
+shells, foreign/duplicate actors and takeover ownership. Its `--inspect` option
+is read-only; see [the supervision contract](docs/CHAT_DELIVERY.md#ordinary-process-supervision).
+The QA-readiness wrapper also inspects stored outcomes without a model. Its
+explicit `--page` mode adds receipt-fenced operator alerts; register that changed
+mode before enabling it on the Mini. See [outcome paging](docs/CHAT_DELIVERY.md#independent-outcome-paging).
+
 ## Build + run
 
 Conversation and read-only Q&A default to **Codex / Luna**, using the service
@@ -131,6 +139,10 @@ See [Reply context contract](docs/REPLY_CONTEXT.md) for bounds, migrations,
 failure behavior, and release acceptance.
 
 ## Tests
+
+For send uncertainty, ordinary nonblocking intake, held-request inspection and
+remaining cutover gates, see [Chat delivery certainty](docs/CHAT_DELIVERY.md).
+Do not mistake source tests for live readiness or activate helm as a workaround.
 
 For authentication outages, heartbeat semantics and live recovery verification,
 see [Provider outage recovery](docs/CLAUDE_RECOVERY.md).
