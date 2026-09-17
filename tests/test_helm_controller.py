@@ -240,6 +240,21 @@ def test_bridge_loss_restores_exact_fleet_and_preserves_queue(tmp_path):
     assert ctrl.status()["queue"] == {"queued": 1}
 
 
+def test_reconcile_process_observation_failure_holds_all_controlled_replies(tmp_path):
+    ctrl, runtime, sup = supervisor(tmp_path, Clock())
+
+    def unavailable():
+        raise RuntimeErrorSafe("more than one Fleet Telegram actor is running")
+
+    runtime.actor_release = unavailable
+    with pytest.raises(RuntimeErrorSafe, match="reply coverage is held"):
+        sup.reconcile()
+
+    assert ctrl.status()["holder"] == "coverage_lost"
+    assert runtime.start_fleet_count == 0
+    assert runtime.start_successor_count == 0
+
+
 def test_second_atomic_takeover_after_failback(tmp_path):
     clock = Clock()
     ctrl, runtime, sup = supervisor(tmp_path, clock)

@@ -374,7 +374,25 @@ class HelmSupervisor:
         """Enforce process outcome from durable reply ownership."""
         with self.process_lock():
             status = self.controller.status()
-            observed = self.runtime.actor_release()
+            try:
+                observed = self.runtime.actor_release()
+            except RuntimeErrorSafe:
+                # An ambiguous or unavailable process census is never proof
+                # that it is safe to start, stop, or replace an actor.  Make
+                # that loss of authority durable so every controlled sender is
+                # fenced before this cron invocation returns non-zero.
+                #
+                # Do not send a Telegram alert here: actor ownership is the
+                # thing that is ambiguous, so this identity is not a safe
+                # emergency transport.  A separately registered pager can
+                # consume the fixed failure below without creating a second
+                # Telegram actor.
+                self.controller.coverage_lost(
+                    "Fleet actor observation unavailable; controlled replies held"
+                )
+                raise RuntimeErrorSafe(
+                    "Fleet actor observation unavailable; reply coverage is held"
+                ) from None
             if status["holder"] == "sol":
                 needs, reason = self.controller.needs_failback()
                 if needs:
