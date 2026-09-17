@@ -67,8 +67,11 @@ refusal prefix. No citation requirement for substantive answers is relaxed.
 The model chooses between current observations and reference documents.
 `github_pulls` reads the five newest-created or recently-updated PRs for an
 allowlisted Fleet repository; `github_pull` reads one numbered PR. Both are
-host-side GETs to the fixed public GitHub API, without credentials, redirects,
-shell execution or new model tools. Responses are size/time bounded and include
+host-side GETs to the fixed GitHub API. Private repositories use the existing
+Fleet `GH_PAT_FILE` credential (default `~/.config/commodore/gh_pat`) only in the
+host HTTP header. No credential enters a model prompt/environment or result;
+redirects, shell execution and native model tools remain unavailable.
+Responses are size/time bounded and include
 canonical source URLs, observation time, title/body excerpts and merge state.
 Closed does not imply merged, and neither state proves deployment. A listing
 is a bounded sample, not exhaustive repository history or a merge-time ranking.
@@ -83,6 +86,10 @@ choice still belongs to the LLM; this provenance check is not a keyword filter
 or proof that every factual assertion is correct. If live retrieval fails,
 the model must explain that limitation, not substitute old documented activity.
 Attachment review cannot request GitHub evidence.
+
+Malformed model JSON is returned to the model for correction within the same
+four-step budget. No requested operation executes until its JSON and operation
+parameters are valid; transport failures retain the existing failure handling.
 
 The host formats retrieved PR sources as labelled GitHub links and repository
 document paths as `blob/main` links through the existing Markdown-to-Telegram-

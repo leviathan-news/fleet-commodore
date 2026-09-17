@@ -57,6 +57,7 @@ def test_error_has_no_current_source(monkeypatch):
                                            (302, b"redirect"), (403, b"denied"), (200, b"bad json")])
 def test_transport_bounded_get_no_credentials_or_redirects(monkeypatch, status, payload):
     events = []
+    monkeypatch.setattr(qa_github, "_host_token", lambda: "")
 
     class Response(io.BytesIO):
         pass
@@ -80,6 +81,36 @@ def test_transport_bounded_get_no_credentials_or_redirects(monkeypatch, status, 
     monkeypatch.setattr(qa_github.http.client, "HTTPSConnection", Connection)
     assert "error" in qa_github._get("/repos/leviathan-news/squid-bot/pulls")
     assert events == ["GET", "closed"]
+
+
+def test_private_repo_credential_stays_in_fixed_host_header(monkeypatch, tmp_path):
+    token = "test-host-only-token"
+    path = tmp_path / "gh_pat"
+    path.write_text(token)
+    monkeypatch.setenv("GH_PAT_FILE", str(path))
+    seen = []
+
+    class Connection:
+        def __init__(self, host, timeout):
+            assert host == "api.github.com"
+
+        def request(self, method, path, headers):
+            assert method == "GET" and path.startswith("/repos/leviathan-news/squid-bot/pulls")
+            seen.append(headers["Authorization"])
+
+        def getresponse(self):
+            response = io.BytesIO(b"[]")
+            response.status = 200
+            return response
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(qa_github.http.client, "HTTPSConnection", Connection)
+    result = qa_github.retrieve({"request": "github_pulls", "repository": REPO})
+    assert seen == ["Bearer " + token]
+    assert token not in str(result)
+    assert result["results"] == [] and result["observed_at"]
 
 
 def test_specific_pull_number_must_match(monkeypatch):

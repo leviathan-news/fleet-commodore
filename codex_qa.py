@@ -156,7 +156,8 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
         try:
             decision = json.loads(raw)
         except (ValueError, TypeError):
-            break
+            evidence.append({"broker_error": "Your previous response was not valid JSON. Return exactly one valid JSON object using the documented request or answer schema. No action was executed for that response."})
+            continue
         if not isinstance(decision, dict):
             break
         status = decision.get("status")

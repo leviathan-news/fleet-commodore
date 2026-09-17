@@ -1,9 +1,11 @@
-"""Bounded public GitHub observations for the model's read-only evidence broker."""
+"""Bounded GitHub observations for the model's read-only evidence broker."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import http.client
 import json
+import os
+from pathlib import Path
 from urllib.parse import urlencode
 
 
@@ -16,15 +18,31 @@ DEFAULT_REPOSITORY = "leviathan-news/squid-bot"
 MAX_RESPONSE_BYTES = 512 * 1024
 
 
+def _host_token() -> str:
+    """Reuse the existing Fleet host credential, never expose it to the model."""
+    path = Path(os.environ.get("GH_PAT_FILE", "~/.config/commodore/gh_pat")).expanduser()
+    try:
+        with path.open() as handle:
+            value = handle.read(4097).strip()
+        return value if value and len(value) <= 4096 and not any(c.isspace() for c in value) else ""
+    except OSError:
+        return ""
+
+
 def _get(path: str):
-    # Fixed host, GET only, no redirects, shell, proxy config or credentials.
+    # Fixed host and GET path; never redirect an authenticated request or
+    # pass the host token to subprocesses, tool results, or model prompts.
     connection = http.client.HTTPSConnection("api.github.com", timeout=10)
     try:
-        connection.request("GET", path, headers={
+        headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "Fleet-Commodore-read-only-evidence",
-        })
+        }
+        token = _host_token()
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        connection.request("GET", path, headers=headers)
         response = connection.getresponse()
         if response.status != 200:
             return {"error": "github_unavailable", "http_status": response.status}

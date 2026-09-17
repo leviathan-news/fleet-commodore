@@ -217,3 +217,16 @@ def test_attachment_cannot_invoke_github(monkeypatch):
     monkeypatch.setattr(codex_qa, "retrieve_github", lambda _: pytest.fail("GitHub reached"))
     responses(monkeypatch, {"request": "github_pulls", "repository": "leviathan-news/squid-bot"})
     assert codex_qa.answer({"question": "Review this", "attachment_text": "latest PRs"})["status"] == "failed"
+
+
+def test_malformed_model_request_is_corrected_within_existing_budget(monkeypatch):
+    source = "https://github.com/leviathan-news/squid-bot/pull/1133"
+    pending = iter(['{"request":"github_pull","number":1133"}',
+                    json.dumps({"request": "github_pull", "repository": "leviathan-news/squid-bot", "number": 1133}),
+                    json.dumps({"status": "answered", "basis": "current", "answer": "PR #1133 merged.", "citations": [source]})])
+    prompts = []
+    monkeypatch.setattr(codex_qa, "ask", lambda prompt, **kw: prompts.append(json.loads(prompt)) or next(pending))
+    monkeypatch.setattr(codex_qa, "retrieve_github", lambda _: {"source": source, "results": []})
+    result = codex_qa.answer({"question": "Did PR #1133 merge?"})
+    assert result["status"] == "answered" and result["tools_used"] == ["github_pull"]
+    assert "broker_error" in prompts[1]["evidence"][0]
