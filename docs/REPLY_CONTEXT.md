@@ -62,6 +62,47 @@ citable source for analytics or deployment claims. Missing evidence yields a
 plain, subject-specific limitation or clarifying question, without a ceremonial
 refusal prefix. No citation requirement for substantive answers is relaxed.
 
+## Current evidence and source links
+
+The model chooses between current observations and reference documents.
+`github_pulls` reads the five newest-created or recently-updated PRs for an
+allowlisted Fleet repository; `github_pull` reads one numbered PR. Both are
+host-side GETs to the fixed GitHub API. Private repositories use the existing
+Fleet `GH_PAT_FILE` credential (default `~/.config/commodore/gh_pat`) only in the
+host HTTP header. No credential enters a model prompt/environment or result;
+redirects, shell execution and native model tools remain unavailable.
+Responses are size/time bounded and include
+canonical source URLs, observation time, title/body excerpts and merge state.
+Closed does not imply merged, and neither state proves deployment. A listing
+is a bounded sample, not exhaustive repository history or a merge-time ranking.
+Unqualified Leviathan PR questions default to `leviathan-news/squid-bot`; the
+model must state the repository scope. An explicitly named repository wins.
+
+Current/latest PR questions require this current source rather than local
+document search. Documents are labelled as reference material. An answer using
+`basis=current` without a cited current GitHub/SQL observation is returned to
+the model for correction within the existing four-step budget. The semantic
+choice still belongs to the LLM; this provenance check is not a keyword filter
+or proof that every factual assertion is correct. If live retrieval fails,
+the model must explain that limitation, not substitute old documented activity.
+Attachment review cannot request GitHub evidence.
+
+Q&A uses the installed Codex CLI's `--output-schema` contract to enforce the
+message structure, including integer PR numbers. The schema is written only
+to the provider's temporary root and removed with it. The model still chooses
+the operation and writes the answer; the broker independently validates
+authorization and evidence. Other text-generation callers remain unchanged.
+Malformed model JSON is returned with parser feedback for correction within
+the same four-step budget. Empty literal searches suggest fewer subject words.
+No requested operation executes until its JSON and parameters are valid;
+transport failures retain the existing failure handling.
+
+The host formats retrieved PR sources as labelled GitHub links and repository
+document paths as `blob/main` links through the existing Markdown-to-Telegram-
+HTML renderer. Document links provide navigation to the current repository
+file, not proof that a local excerpt matches main. Source URLs stay complete
+when the body is shortened for the sender's raw and visible length bounds.
+
 ## Verification
 
 `tests/test_reply_chain_context.py` covers protocol-realistic direct-parent

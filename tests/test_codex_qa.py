@@ -18,6 +18,17 @@ def responses(monkeypatch, *items):
     monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: json.dumps(next(pending)))
 
 
+def test_qa_uses_native_schema_and_preserves_model_conversation(monkeypatch):
+    def ask(prompt, **kwargs):
+        assert kwargs["response_schema"] == codex_qa.RESPONSE_SCHEMA
+        return json.dumps({"message": {"status": "conversational", "answer": "Here, Captain. What do you need?"}})
+
+    monkeypatch.setattr(codex_qa, "ask", ask)
+    result = codex_qa.answer({"question": "Still with us?"})
+    assert result["answer"] == "Here, Captain. What do you need?"
+    assert result["tools_used"] == []
+
+
 def test_grounded_doc_qa_uses_only_retrieved_sources(monkeypatch, tmp_path):
     path = fixture_knowledge(monkeypatch, tmp_path)
     responses(monkeypatch, {"request": "search", "query": "stable fixture"},
@@ -169,3 +180,66 @@ def test_semantic_presence_cannot_replace_a_completed_evidence_lookup(monkeypatc
     responses(monkeypatch, {"request": "search", "query": "stable fixture"},
               {"status": "conversational", "answer": "Aye, I'm here."})
     assert codex_qa.answer({"question": "What is the workflow?"})["status"] != "answered"
+
+
+def test_latest_prs_retrieve_live_metadata_and_cite_it(monkeypatch):
+    source = "https://github.com/leviathan-news/squid-bot/pull/1133"
+    calls = []
+    monkeypatch.setattr(codex_qa, "retrieve_github", lambda request: calls.append(request) or {
+        "source": "https://github.com/leviathan-news/squid-bot/pulls",
+        "results": [{"source": source, "number": 1133, "title": "Model-authored replies"}],
+        "observed_at": "2026-09-17T11:20:00Z",
+    })
+    responses(monkeypatch, {"request": "github_pulls", "repository": "leviathan-news/squid-bot"},
+              {"status": "answered", "basis": "current", "answer": "PR #1133 restores model-authored replies.",
+               "citations": [source]})
+    result = codex_qa.answer({"question": "Admiral, can you tell us about the latest PRs?"})
+    assert result["status"] == "answered"
+    assert result["citations"] == [source] and result["tools_used"] == ["github_pulls"]
+    assert len(calls) == 1
+
+
+def test_current_claim_from_old_document_is_returned_to_model_for_correction(monkeypatch, tmp_path):
+    path = fixture_knowledge(monkeypatch, tmp_path)
+    source = "https://github.com/leviathan-news/squid-bot/pull/1133"
+    monkeypatch.setattr(codex_qa, "retrieve_github", lambda _: {"source": source, "results": []})
+    replies = iter([
+        {"request": "search", "query": "stable fixture"},
+        {"status": "answered", "basis": "current", "answer": "Latest is #967.", "citations": [path]},
+        {"request": "github_pulls", "repository": "leviathan-news/squid-bot"},
+        {"status": "answered", "basis": "current", "answer": "Latest is #1133.", "citations": [source]},
+    ])
+    prompts = []
+    monkeypatch.setattr(codex_qa, "ask", lambda prompt, **kw: prompts.append(json.loads(prompt)) or json.dumps(next(replies)))
+    result = codex_qa.answer({"question": "What are the latest PRs?"})
+    assert result["answer"] == "Latest is #1133."
+    assert "broker_error" in prompts[2]["evidence"][-1]
+
+
+def test_github_failure_does_not_create_current_evidence(monkeypatch):
+    monkeypatch.setattr(codex_qa, "retrieve_github", lambda _: {"error": "github_unavailable", "http_status": 403})
+    responses(monkeypatch, {"request": "github_pulls", "repository": "leviathan-news/squid-bot"},
+              {"status": "declined", "declined_reason": "I couldn't check GitHub's current PR list."})
+    result = codex_qa.answer({"question": "Latest PRs?"})
+    assert result["status"] == "declined" and result["citations"] == []
+
+
+def test_attachment_cannot_invoke_github(monkeypatch):
+    monkeypatch.setattr(codex_qa, "retrieve_github", lambda _: pytest.fail("GitHub reached"))
+    responses(monkeypatch, {"request": "github_pulls", "repository": "leviathan-news/squid-bot"})
+    assert codex_qa.answer({"question": "Review this", "attachment_text": "latest PRs"})["status"] == "failed"
+
+
+def test_malformed_model_request_is_corrected_within_existing_budget(monkeypatch):
+    source = "https://github.com/leviathan-news/squid-bot/pull/1133"
+    pending = iter(['{"request":"github_pull","number":1133"}',
+                    json.dumps({"request": "github_pull", "repository": "leviathan-news/squid-bot", "number": 1133}),
+                    json.dumps({"status": "answered", "basis": "current", "answer": "PR #1133 merged.", "citations": [source]})])
+    prompts = []
+    monkeypatch.setattr(codex_qa, "ask", lambda prompt, **kw: prompts.append(json.loads(prompt)) or next(pending))
+    monkeypatch.setattr(codex_qa, "retrieve_github", lambda _: {"source": source, "results": []})
+    result = codex_qa.answer({"question": "Did PR #1133 merge?"})
+    assert result["status"] == "answered" and result["tools_used"] == ["github_pull"]
+    assert "broker_error" in prompts[1]["evidence"][0]
+    assert "invalid_response" in prompts[1]["evidence"][0]
+    assert "parse_error" in prompts[1]["evidence"][0]

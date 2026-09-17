@@ -22,7 +22,8 @@ def _connect():
 
 
 def ask(prompt: str, *, model: str = "gpt-5.6-luna", timeout: int = 60,
-        instruction: str = "Return the requested final text.", failure_context=None):
+        instruction: str = "Return the requested final text.", failure_context=None,
+        response_schema=None):
     context = failure_context if failure_context is not None else {}
     try:
         with closing(_connect()) as conn, conn:
@@ -37,6 +38,7 @@ def ask(prompt: str, *, model: str = "gpt-5.6-luna", timeout: int = 60,
         prompt, "Answer accurately using only supplied evidence. Never invent tool use or live facts.",
         model=model, timeout_seconds=timeout, response_instruction=instruction,
         failure_context=context,
+        **({"response_schema": response_schema} if response_schema is not None else {}),
     )
     reason = context.get("failure_class", "provider_unavailable") if response is None else "ok"
     cooldown = 600 if reason in {"provider_auth_failed", "provider_rate_limited"} else 60

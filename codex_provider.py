@@ -273,6 +273,7 @@ def generate_via_codex(
     timeout_seconds: int,
     response_instruction: str,
     failure_context: dict[str, Any] | None = None,
+    response_schema: dict[str, Any] | None = None,
 ) -> str | None:
     """Generate text through cached ChatGPT-subscription Codex auth only."""
     if model not in ALLOWED_MODELS:
@@ -316,6 +317,10 @@ def generate_via_codex(
             "-c", "features.hooks=false",
             "-",
         ]
+        if response_schema is not None:
+            schema_path = root / "response-schema.json"
+            schema_path.write_text(json.dumps(response_schema), encoding="utf-8")
+            arguments[-1:-1] = ["--output-schema", str(schema_path)]
         try:
             with (
                 prompt_path.open("rb") as stdin,
