@@ -12,10 +12,14 @@ from codex_runtime import ask
 from qa_knowledge import KnowledgeReader
 from qa_sql import execute_sql
 from qa_github import DEFAULT_REPOSITORY, REPOSITORIES, retrieve as retrieve_github
+from qa_schema import RESPONSE_SCHEMA
 from qa_worker import MISSING_REPLY_CONTEXT, matches_hostile
 
 
 INSTRUCTION = """Return exactly one JSON object, without code fences.
+The provider enforces the response schema. Wrap every message described below
+in a top-level object with the single key "message". For example:
+{"message":{"status":"conversational","answer":"your own reply"}}.
 You are Fleet Commodore, the Telegram bot being addressed, not an outside
 observer asked to establish whether that bot exists. Host runtime_context
 identifies you and confirms only receipt of this request, not fleet health.
@@ -149,7 +153,7 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
             "current_question": question,
         }, ensure_ascii=False)
         raw = ask(prompt, model=model, timeout=min(55, remaining), instruction=INSTRUCTION,
-                  failure_context=context)
+                  failure_context=context, response_schema=RESPONSE_SCHEMA)
         if not raw:
             return {**base, "status": "failed", "failure_reason": "provider unavailable",
                     "provider_failure": context.get("failure_class", "provider_unavailable")}
@@ -164,6 +168,10 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
             continue
         if not isinstance(decision, dict):
             break
+        if set(decision) == {"message"}:
+            decision = decision["message"]
+            if not isinstance(decision, dict):
+                break
         status = decision.get("status")
         if status is not None and not isinstance(status, str):
             break

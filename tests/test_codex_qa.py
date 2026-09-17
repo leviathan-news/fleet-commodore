@@ -18,6 +18,17 @@ def responses(monkeypatch, *items):
     monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: json.dumps(next(pending)))
 
 
+def test_qa_uses_native_schema_and_preserves_model_conversation(monkeypatch):
+    def ask(prompt, **kwargs):
+        assert kwargs["response_schema"] == codex_qa.RESPONSE_SCHEMA
+        return json.dumps({"message": {"status": "conversational", "answer": "Here, Captain. What do you need?"}})
+
+    monkeypatch.setattr(codex_qa, "ask", ask)
+    result = codex_qa.answer({"question": "Still with us?"})
+    assert result["answer"] == "Here, Captain. What do you need?"
+    assert result["tools_used"] == []
+
+
 def test_grounded_doc_qa_uses_only_retrieved_sources(monkeypatch, tmp_path):
     path = fixture_knowledge(monkeypatch, tmp_path)
     responses(monkeypatch, {"request": "search", "query": "stable fixture"},

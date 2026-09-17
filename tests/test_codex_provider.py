@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +22,27 @@ def _successful_events(text="Generated article."):
         {"type": "item.completed", "item": {"type": "agent_message", "text": text}},
         {"type": "turn.completed"},
     )
+
+
+def test_structured_response_schema_reaches_cli_and_is_removed(monkeypatch):
+    from qa_schema import RESPONSE_SCHEMA
+
+    captured = {}
+
+    def fake_popen(arguments, **kwargs):
+        path = Path(arguments[arguments.index("--output-schema") + 1])
+        captured.update(path=path, schema=json.loads(path.read_text()))
+        return _FakeProcess(kwargs["stdout"], kwargs["stderr"],
+                            output=_successful_events('{"message":{"status":"conversational","answer":"Here."}}'))
+
+    monkeypatch.setattr(codex_provider.subprocess, "Popen", fake_popen)
+    answer = codex_provider.generate_via_codex(
+        "hail", "system", model="gpt-5.6-luna", timeout_seconds=9,
+        response_instruction="Return JSON.", response_schema=RESPONSE_SCHEMA,
+    )
+    assert json.loads(answer)["message"]["answer"] == "Here."
+    assert captured["schema"] == RESPONSE_SCHEMA
+    assert not captured["path"].exists()
 
 
 class _FakeProcess:

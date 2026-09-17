@@ -87,9 +87,15 @@ or proof that every factual assertion is correct. If live retrieval fails,
 the model must explain that limitation, not substitute old documented activity.
 Attachment review cannot request GitHub evidence.
 
-Malformed model JSON is returned to the model for correction within the same
-four-step budget. No requested operation executes until its JSON and operation
-parameters are valid; transport failures retain the existing failure handling.
+Q&A uses the installed Codex CLI's `--output-schema` contract to enforce the
+message structure, including integer PR numbers. The schema is written only
+to the provider's temporary root and removed with it. The model still chooses
+the operation and writes the answer; the broker independently validates
+authorization and evidence. Other text-generation callers remain unchanged.
+Malformed model JSON is returned with parser feedback for correction within
+the same four-step budget. Empty literal searches suggest fewer subject words.
+No requested operation executes until its JSON and parameters are valid;
+transport failures retain the existing failure handling.
 
 The host formats retrieved PR sources as labelled GitHub links and repository
 document paths as `blob/main` links through the existing Markdown-to-Telegram-

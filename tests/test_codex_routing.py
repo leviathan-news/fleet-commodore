@@ -38,3 +38,15 @@ def test_codex_cooldown_survives_calls_and_success_clears(monkeypatch, tmp_path)
     monkeypatch.setattr(codex_runtime, "generate_via_codex", lambda *a, **kw: "Recovered")
     assert codex_runtime.ask("c") == "Recovered"
     assert codex_runtime.ask("d") == "Recovered"
+
+
+def test_runtime_forwards_structured_schema(monkeypatch, tmp_path):
+    from qa_schema import RESPONSE_SCHEMA
+
+    monkeypatch.setenv("FLEET_COMMODORE_STATE_DIR", str(tmp_path))
+    def generate(*args, **kwargs):
+        assert kwargs["response_schema"] == RESPONSE_SCHEMA
+        return '{"message":{"status":"conversational","answer":"Here."}}'
+
+    monkeypatch.setattr(codex_runtime, "generate_via_codex", generate)
+    assert json.loads(codex_runtime.ask("hail", response_schema=RESPONSE_SCHEMA))["message"]["answer"] == "Here."
