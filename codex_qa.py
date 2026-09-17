@@ -37,6 +37,11 @@ not identify it. Do not ask the user to supply information you can retrieve.
 To request evidence return {"request":"search","query":"literal keywords"},
 {"request":"read","path":"a source path returned by search"}, or
 {"request":"sql","query":"one read-only SQL query"}.
+Search is literal AND matching: every query word must occur in a document.
+Start with 1-3 distinctive subject words, not a full question; if empty, use
+fewer words. Search excerpts are usable evidence; read only if more is needed.
+When steps_remaining is 1, you MUST finish with answered or declined, not
+request another lookup. Use the evidence already returned.
 SQL runs through the existing reader-role wrapper; identity/credential tables,
 writes, and shell access are unavailable. Use information_schema only to find
 safe table/column names when needed. Never request personal or authentication data.
@@ -123,7 +128,11 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
             return {**base, "status": status, "answer": text[:3500],
                     "citations": [] if attachment_mode else citations[:3], "tools_used": used_tools}
         tool = decision.get("request")
-        if attachment_mode or tool not in {"search", "read", "sql"} or step == 3:
+        if not attachment_mode and tool in {"search", "read", "sql"} and step == 3:
+            return {**base, "status": "declined", "declined_reason":
+                    "I couldn't verify that within this lookup. Could you share the relevant source or page?",
+                    "citations": [], "tools_used": used_tools}
+        if attachment_mode or tool not in {"search", "read", "sql"}:
             break
         if time.monotonic() + 20 > deadline:
             break

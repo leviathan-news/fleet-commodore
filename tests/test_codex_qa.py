@@ -94,3 +94,13 @@ def test_mixed_hail_preserves_parent_subject_and_requires_evidence(monkeypatch, 
     assert captured["reply_chain_context"][0]["message_id"] == 22
     assert "that" in captured["instruction"]
     assert "parent" in captured["instruction"]
+
+
+def test_exhausted_lookup_is_a_bounded_limitation_not_provider_failure(monkeypatch, tmp_path):
+    fixture_knowledge(monkeypatch, tmp_path)
+    responses(monkeypatch, *[{"request": "search", "query": "missing"}] * 4)
+    result = codex_qa.answer({"question": "Which report proves that?"})
+    assert result["status"] == "declined"
+    assert "provider_failure" not in result
+    assert result["tools_used"] == ["search"] * 3
+    assert "source or page" in result["declined_reason"]
