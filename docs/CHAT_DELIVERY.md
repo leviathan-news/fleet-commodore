@@ -99,9 +99,35 @@ dependency readiness validates provider transport. Missing intake state is
 reported as not installed, not silently created. This diagnostic does not yet
 page the operator or supervise a stuck router.
 
+## Ordinary process supervision
+
+The existing five-minute `cron/watchdog.sh` delegates to `fleet_watchdog.py`.
+It checks process PID/ancestry, exact script source plus working directory, and
+tmux pane state. A sole actor from the expected release in its live pane is
+process-healthy, not necessarily answering questions. A dead pane with no actor
+may be respawned without `-k`; a missing window/session may be created. A live
+shell without an actor is held for inspection, never killed or overwritten.
+Foreign, detached or duplicate actors and failed/ambiguous probes fail closed.
+The launcher now uses absolute script argv; the dormant helm observer recognizes
+both that form and the legacy relative form without activating the controller.
+
+An OS-held watchdog lock serializes cooperating invocations. A durable private
+SQLite restart budget allows at most three start attempts per fifteen minutes,
+at least five minutes apart. Failed/uncertain starts consume budget; a provider
+auth/quota failure never causes a live process restart. The watchdog rechecks
+its observation and ownership before starting. It cannot prevent an unrelated
+token holder from starting after that snapshot; cutover still needs independent
+sole-actor verification and the ordinary poll-owner lock.
+
+The controller ledger is read with SQLite `mode=ro`, never initialized by this
+watchdog. Any non-Fleet lease (including an expired one) suppresses ordinary
+restart: only controller reconciliation may fail it back. Unreadable ownership
+also holds. `--inspect` observes without acquiring a lock, writing restart state
+or starting a process. A reported start action is not a readiness receipt.
+
 Remaining gates include receipt reconciliation for held/legacy requests, bounded
 end-to-end deadlines and prompt acknowledgement under backlog, an active outcome
-watchdog/escalation path, dead-process supervision and rehearsal of controller
+watchdog/escalation path, live process-supervision rehearsal and controller
 ownership. The generic storage API is not a license to admit public-room models
 or persist arbitrary private updates. This source is not live readiness proof.
 

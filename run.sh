@@ -33,4 +33,4 @@ if ! "$PYTHON_BIN" "$REPO_DIR/bin/qa-healthcheck.py" --quick \
 fi
 # PYTHONUNBUFFERED=1 so logs flush immediately without a tee buffer.
 # Redirect stderr to stdout so tmux pane + file both capture everything.
-exec "$PYTHON_BIN" -u commodore.py >> "$FLEET_COMMODORE_LOG_DIR/commodore.log" 2>&1
+exec "$PYTHON_BIN" -u "$REPO_DIR/commodore.py" >> "$FLEET_COMMODORE_LOG_DIR/commodore.log" 2>&1

@@ -25,6 +25,11 @@ triage fences, and logs survive artifact replacement. Set
 `FLEET_COMMODORE_PYTHON` to the versioned service-owned interpreter snapshot;
 do not copy a virtual environment into the Git worktree.
 
+The registered watchdog checks the actual sole process, release and tmux pane,
+not window existence alone. Restarts are bounded and fail closed around live
+shells, foreign/duplicate actors and takeover ownership. Its `--inspect` option
+is read-only; see [the supervision contract](docs/CHAT_DELIVERY.md#ordinary-process-supervision).
+
 ## Build + run
 
 Conversation and read-only Q&A default to **Codex / Luna**, using the service

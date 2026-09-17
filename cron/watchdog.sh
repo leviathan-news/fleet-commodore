@@ -1,9 +1,6 @@
 #!/bin/bash
-# Cron watchdog — respawns commodore tmux window if it dies.
+# Registered cron: inspect process ownership, never merely pane existence.
 set -euo pipefail
-TMUX=/opt/homebrew/bin/tmux
-SESSION=leviathan
-WINDOW=commodore
 DEFAULT_DIR=$(cd "$(dirname "$0")/.." && pwd)
 : "${FLEET_COMMODORE_RELEASE_DIR:=$DEFAULT_DIR}"
 : "${FLEET_COMMODORE_CONFIG:=$FLEET_COMMODORE_RELEASE_DIR/.env}"
@@ -14,16 +11,9 @@ if [[ ! -x "$DIR/run.sh" || ! -r "$FLEET_COMMODORE_CONFIG" ]]; then
   exit 1
 fi
 
-START_COMMAND="FLEET_COMMODORE_CONFIG=$FLEET_COMMODORE_CONFIG FLEET_COMMODORE_RELEASE_DIR=$DIR $DIR/run.sh"
-
-if $TMUX has-session -t "$SESSION" 2>/dev/null && \
-   $TMUX list-windows -t "$SESSION" -F "#W" 2>/dev/null | grep -qx "$WINDOW"; then
-  exit 0
-fi
-
-if ! $TMUX has-session -t "$SESSION" 2>/dev/null; then
-  $TMUX new-session -d -s "$SESSION" -n "$WINDOW" "$START_COMMAND"
-else
-  $TMUX new-window -t "$SESSION" -n "$WINDOW" "$START_COMMAND"
-fi
-echo "$(date -u +%FT%TZ) respawned commodore tmux window from $DIR"
+set -a
+# shellcheck disable=SC1090
+source "$FLEET_COMMODORE_CONFIG"
+set +a
+PYTHON_BIN=${FLEET_COMMODORE_PYTHON:-"$DIR/.venv/bin/python3"}
+exec "$PYTHON_BIN" "$DIR/fleet_watchdog.py" "$@"
