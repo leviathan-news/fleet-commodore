@@ -69,12 +69,12 @@ def test_sensitive_question_is_declined_before_model(monkeypatch):
     assert codex_qa.answer({"question": "What is the bot token?"})["status"] == "declined"
 
 
-def test_simple_self_hail_is_answered_without_model_or_citations(monkeypatch):
-    monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("model reached")))
-    result = codex_qa.answer({"question": "@commodore_lev_bot are you online?"})
-    assert result["status"] == "answered"
-    assert "I'm here" in result["answer"]
-    assert result["citations"] == []
+def test_presence_check_cannot_hide_provider_failure(monkeypatch):
+    calls = []
+    monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: calls.append(a) or None)
+    result = codex_qa.answer({"question": "Are you online?"})
+    assert calls
+    assert result["status"] == "failed"
 
 
 def test_mixed_hail_preserves_parent_subject_and_requires_evidence(monkeypatch, tmp_path):
@@ -108,43 +108,48 @@ def test_exhausted_lookup_is_a_bounded_limitation_not_provider_failure(monkeypat
     assert "source or page" in result["declined_reason"]
 
 
-@pytest.mark.parametrize("question", [
-    "Are you still with us?", "@commodore_lev_bot Are you still with us?",
-    "Are you still there?", "You there?", "Still awake?", "Anyone home?",
+@pytest.mark.parametrize("question, model_text", [
+    ("@commodore_lev_bot Are you still with us?", "Aye, still at my post. Your hail reached me."),
+    ("Are you online?", "Aye, I have your message."),
+    ("Anyone home?", "The wardroom is occupied. What's on your mind?"),
+    ("Hello, old sea dog!", "Morning. What brings you aboard?"),
+    ("Who are you?", "Fleet Commodore, at your service."),
+    ("That last reply was embarrassing.", "Fair criticism. What did I miss?"),
 ])
-def test_presence_paraphrases_need_no_research(monkeypatch, question):
-    monkeypatch.setattr(codex_qa, "ask", lambda *_a, **_kw: pytest.fail("presence needs no research"))
+def test_conversational_responses_are_model_authored(monkeypatch, question, model_text):
+    calls = []
+
+    def ask(prompt, **kwargs):
+        calls.append(json.loads(prompt))
+        return json.dumps({"status": "conversational", "answer": model_text})
+
+    monkeypatch.setattr(codex_qa, "ask", ask)
     result = codex_qa.answer({"question": question})
+    assert len(calls) == 1
+    assert calls[0]["current_question"] == question
     assert result["status"] == "answered"
-    assert "I'm here" in result["answer"]
-    assert result["citations"] == []
-
-
-def test_semantic_presence_response_is_rendered_from_host_facts(monkeypatch, tmp_path):
-    fixture_knowledge(monkeypatch, tmp_path)
-    responses(monkeypatch, {"status": "acknowledged", "kind": "presence"})
-    result = codex_qa.answer({"question": "Hello Commodore, did that ping reach you?"})
-    assert result["status"] == "answered"
-    assert "I'm here" in result["answer"]
+    assert result["answer"] == model_text
     assert result["citations"] == []
     assert result["tools_used"] == []
 
 
 @pytest.mark.parametrize("decision", [
-    {"status": "acknowledged", "kind": "presence", "answer": "All bots were excluded."},
-    {"status": "acknowledged", "kind": "deployment"},
-    {"status": "acknowledged", "kind": []},
-    {"status": "acknowledged", "kind": "presence", "citations": ["made-up"]},
+    {"status": "acknowledged", "kind": "presence"},
+    {"status": "conversational", "answer": ""},
+    {"status": "conversational", "answer": []},
+    {"status": "conversational", "answer": "Hello", "citations": ["made-up"]},
+    {"status": "conversational", "answer": "Hello", "kind": "presence"},
+    {"status": [], "answer": "Hello"},
 ])
-def test_conversation_contract_cannot_deliver_model_authored_facts(monkeypatch, tmp_path, decision):
+def test_conversation_requires_model_text_without_a_canned_intent_or_citation(monkeypatch, tmp_path, decision):
     fixture_knowledge(monkeypatch, tmp_path)
     responses(monkeypatch, decision)
     result = codex_qa.answer({"question": "Can you confirm the numbers?"})
     assert result["status"] != "answered"
 
 
-def test_attachment_review_cannot_be_replaced_by_presence(monkeypatch):
-    responses(monkeypatch, {"status": "acknowledged", "kind": "presence"})
+def test_attachment_review_uses_its_own_answer_contract(monkeypatch):
+    responses(monkeypatch, {"status": "conversational", "answer": "Aye, I'm here."})
     result = codex_qa.answer({"question": "Review this", "attachment_text": "Are you still with us?"})
     assert result["status"] != "answered"
 
@@ -162,5 +167,5 @@ def test_mixed_presence_and_factual_question_still_retrieves_evidence(monkeypatc
 def test_semantic_presence_cannot_replace_a_completed_evidence_lookup(monkeypatch, tmp_path):
     fixture_knowledge(monkeypatch, tmp_path)
     responses(monkeypatch, {"request": "search", "query": "stable fixture"},
-              {"status": "acknowledged", "kind": "presence"})
+              {"status": "conversational", "answer": "Aye, I'm here."})
     assert codex_qa.answer({"question": "What is the workflow?"})["status"] != "answered"

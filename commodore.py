@@ -1489,10 +1489,6 @@ def sweep_benthic_pending():
 
 _MAX_REPLY_CONTEXT_PARENTS = 4
 _MAX_REPLY_CONTEXT_TEXT = 500
-_REPLY_CONTEXT_UNAVAILABLE_REPLY = (
-    "I don't have the quoted message's contents. Could you paste the relevant "
-    "text or page URL here?"
-)
 
 
 def _reply_message_text(msg: dict) -> str:
@@ -1651,6 +1647,9 @@ def _reply_context_from_json(raw: object) -> list[dict]:
 
 def _reply_context_prompt(context: list[dict]) -> str:
     """Frame quoted parents as data; the current message remains authoritative."""
+    from qa_worker import MISSING_REPLY_CONTEXT, format_reply_context
+    if MISSING_REPLY_CONTEXT in context:
+        return format_reply_context(context)
     if not context:
         return ""
     return (
@@ -3021,10 +3020,8 @@ def generate_response(msg, is_direct, policy, recent_messages):
     # an invalid cross-chat parent suppresses those ambient sources.
     has_reply_parent = isinstance(msg.get("reply_to_message"), dict)
     if _reply_context_unavailable(msg, reply_context):
-        # A deleted/withheld parent is not a licence to guess from unrelated
-        # history. This is deliberately deterministic so the model cannot
-        # revive the last PR it happened to see.
-        return _REPLY_CONTEXT_UNAVAILABLE_REPLY
+        from qa_worker import MISSING_REPLY_CONTEXT
+        reply_context = [MISSING_REPLY_CONTEXT]
     history = "" if has_reply_parent else get_chat_history(
         chat_id, msg.get("message_thread_id"), limit=20
     )
@@ -3880,7 +3877,11 @@ def _claim_qa_job(msg, question: str,
     chat_id = msg.get("chat", {}).get("id", 0)
     topic_id = msg.get("message_thread_id")
     request_msg_id = msg.get("message_id")
-    reply_context_json = json.dumps(_reply_chain_context(msg), ensure_ascii=False)
+    reply_context = _reply_chain_context(msg)
+    if _reply_context_unavailable(msg, reply_context):
+        from qa_worker import MISSING_REPLY_CONTEXT
+        reply_context = [MISSING_REPLY_CONTEXT]
+    reply_context_json = json.dumps(reply_context, ensure_ascii=False)
 
     # Per-user cooldown.
     last = _qa_cooldown_by_user.get(requester_id, 0.0)
@@ -4228,17 +4229,6 @@ def handle_qa(msg, question: str, attachment: "dict | None" = None):
         )
     if not question or not question.strip():
         return None  # let the normal chat handler deal with empty
-    if attachment is None:
-        from qa_worker import self_hail_reply
-        hail = self_hail_reply(question, BOT_USERNAME)
-        if hail:
-            return hail
-    # A reply normally supplies the referent for terse questions. Do not queue
-    # a model job that could guess from unrelated evidence when Telegram no
-    # longer supplies that parent. A successfully retrieved document remains
-    # an explicit review subject and therefore does not take this branch.
-    if attachment is None and _reply_context_unavailable(msg):
-        return _REPLY_CONTEXT_UNAVAILABLE_REPLY
     _job_uuid, ack = _claim_qa_job(msg, question.strip(), attachment=attachment)
     return ack
 
