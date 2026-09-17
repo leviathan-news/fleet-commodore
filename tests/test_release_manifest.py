@@ -29,6 +29,7 @@ def test_manifest_binds_release_files_without_reading_secret_env(monkeypatch):
     assert len(manifest["artifact_sha256"]) == 64
     assert set(module.ARTIFACT_FILES) == set(manifest["files"])
     assert {
+        "chat_intake.py",
         "bin/qa-healthcheck.py",
         "cron/qa-healthcheck.sh",
         "cron/claude-oauth-heartbeat.sh",

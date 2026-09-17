@@ -366,7 +366,7 @@ def test_controlled_send_retries_after_explicit_html_rejection(tmp_path, monkeyp
     def reject_then_accept(method, data=None):
         calls.append((method, data))
         if len(calls) == 1:
-            raise ValueError("known parse rejection")
+            return {"ok": False, "error_code": 400}
         return {"ok": True, "result": {"message_id": 700}}
 
     monkeypatch.setattr(commodore, "tg_request", reject_then_accept)

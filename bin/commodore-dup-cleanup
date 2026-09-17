@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """commodore-dup-cleanup — operator helper for resolving Telegram duplicates.
 
-The QA/review pipelines have a documented residual: a daemon crash between
-the outgoing_msg intent insert and the Telegram response being recorded can
-result in a single duplicate post. Detection is automatic via SQL; this
-script is the cleanup recipe.
+Older releases replayed unconfirmed QA/review intents and could duplicate
+answers. New send-certainty releases hold those intents for reconciliation.
+This script remains the cleanup recipe for already confirmed duplicates;
+it does not establish whether an unconfirmed intent was delivered.
 
 For each (job_table, job_uuid, action_type) group with multiple confirmed
 posts:

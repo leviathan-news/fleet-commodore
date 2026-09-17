@@ -566,7 +566,7 @@ The DB URL is a read-only Postgres role with two tables denylisted.
 ---
 
 
-## Per-pipeline durability contract (v6)
+## Per-pipeline durability contract
 
 Operators and reviewers MUST use this exact split in all comms (Bot HQ pin,
 deploy-time announcements, post-incident write-ups). Do NOT describe the
@@ -578,16 +578,17 @@ the design delivers.
   `gh pr list --head leviathan-agent:<branch>`, `outgoing_msg` log. The
   GitHub side effect (the PR itself) is its own external oracle.
 
-- **Q&A pipeline: best-effort with a documented narrow window.** No silent
-  skip. **A single duplicate Telegram answer is possible** if the daemon
-  crashes between `outgoing_msg` intent insert and Telegram's response
-  being recorded. We surface duplicates rather than swallow them — operators
-  resolve via `bin/commodore-dup-cleanup`.
+- **Q&A/review sends: receipt-backed deduplication, uncertain delivery held.**
+  Unconfirmed intents are not automatically replayed. Jobs enter
+  `delivery_held` before provider relaunch and retain their scratch results.
+  This is not proof of eventual delivery; receipt reconciliation is required.
 
-- **Review pipeline: same contract as Q&A.** Same primitives, same residual
-  duplicate window, same cleanup recipe.
+- **Build acknowledgements follow the same Telegram send contract.** The PR
+  oracle does not prove acknowledgement delivery. Cleanup remains available
+  for already confirmed duplicates from older releases.
 
-This is the limit achievable without Telegram-side idempotency tokens.
+The older v6 replay window is superseded. See
+[Chat delivery certainty](CHAT_DELIVERY.md) for exact limits and held inspection.
 
 
 ## Q&A egress: separate network
@@ -710,9 +711,13 @@ find ~/.local/state/commodore/results/ -mtime +7 -name '*.json'
 
 The dedup oracle for QA/review. Every Telegram send issued on behalf of a
 job goes through `send_message_with_wal`, which:
-1. INSERT OR IGNORE intent row keyed by `(job_table, job_uuid, intent_id)`.
-2. Telegram POST.
-3. UPDATE row with `telegram_message_id` + `sent_at` (or `error`).
+1. Returns an existing positive receipt, or holds an unconfirmed prior intent.
+2. Atomically claims and commits one new prepared intent before Telegram POST.
+3. Records a positive receipt, definitive refusal or uncertain outcome.
+
+Never erase an intent to retry an unknown send. See
+[Chat delivery certainty](CHAT_DELIVERY.md); historical cleanup does not
+reconcile unconfirmed sends.
 
 Operator queries:
 ```sql
