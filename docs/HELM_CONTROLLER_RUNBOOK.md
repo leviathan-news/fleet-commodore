@@ -104,8 +104,12 @@ queued events, claims, imported task state, and failed-handoff receipts remain
 available for investigation and a second takeover.
 
 If Fleet cannot be verified, the controller enters `coverage_lost`. Send one
-truthful coverage alert through the approved emergency path and do not claim
-that the helm remains active.
+truthful coverage alert through a separately registered emergency path and do
+not claim that the helm remains active. The controller deliberately does not
+use the Fleet Telegram identity for that page: when actor observation is
+ambiguous, a second send through that identity could create the duplicate it is
+trying to contain. Reconciliation records the fixed, redacted coverage-loss
+reason and exits non-zero for the registered pager to consume.
 
 ## Stand-down
 
