@@ -68,7 +68,11 @@ rejected. Connections close after each operation.
 
 Room authorization now precedes persistence. Unknown messages retain only an
 update ID, public hails retain a static yes/no signal, and trusted messages keep
-only routing/document metadata and a bounded reply chain. A single routing
+only routing/document metadata and a bounded reply chain. A static
+image-presence signal survives trusted admission without photo file IDs or
+pixels, so exact image-parent replies retain their caption and honest visual
+limitation after SQLite reopen. Public and unknown rooms retain no such metadata.
+A single routing
 worker preserves FIFO ordering without unlimited concurrency. The queue caps
 unresolved events at 4096; overflow leaves the durable offset unchanged.
 

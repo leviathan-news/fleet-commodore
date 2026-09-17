@@ -3,6 +3,8 @@ import json
 import sqlite3
 import threading
 
+import pytest
+
 import commodore
 from chat_intake import ChatIntake
 
@@ -40,6 +42,43 @@ def test_trusted_admission_preserves_exact_referent_without_unneeded_profiles():
     assert payload["message"]["quote"]["text"] == "selected parent"
     assert "last_name" not in payload["message"]["from"]
     assert "photo" not in payload["message"]
+
+
+@pytest.mark.parametrize("media", [
+    {"photo": [{"file_id": "private-photo-id"}]},
+    {"document": {"file_id": "private-image-id", "mime_type": "image/png"}},
+])
+def test_durable_admission_retains_image_presence_for_exact_reply_context(monkeypatch, tmp_path, media):
+    monkeypatch.setattr(commodore, "DB_FILE", tmp_path / "commodore.db")
+    commodore._ensure_tables()
+    parent = message(commodore.LEV_DEV_GROUP_ID, "")
+    parent.update(media)
+    parent["message_id"] = 77
+    parent["caption"] = "Missing sponsor images on this page"
+    msg = message(commodore.LEV_DEV_GROUP_ID, "@commodore_lev_bot can you look into this?")
+    msg["message_thread_id"] = 77
+    msg["reply_to_message"] = parent
+    intake = ChatIntake(tmp_path / "intake.db")
+    intake.ingest_batch([commodore._admit_chat_update({"update_id": 1, "message": msg})])
+    claimed = ChatIntake(intake.path).claim_next()
+    admitted = claimed["payload"]["message"]
+    context = commodore._reply_chain_context(admitted)
+    assert len(context) == 1
+    assert "image pixels are unavailable" in context[0]["text"]
+    assert "Missing sponsor images" in context[0]["text"]
+    assert "private-photo-id" not in json.dumps(admitted)
+    assert "private-image-id" not in json.dumps(context)
+    commodore.save_chat_message(admitted["reply_to_message"])
+    with sqlite3.connect(commodore.DB_FILE) as conn:
+        stored = conn.execute("SELECT text FROM chat_history WHERE msg_id=77").fetchone()[0]
+    assert "image pixels are unavailable" in stored
+
+
+def test_untrusted_room_image_metadata_does_not_enter_durable_payload():
+    msg = message(commodore.SQUID_CAVE_GROUP_ID, "@commodore_lev_bot private-image-caption")
+    msg["photo"] = [{"file_id": "private-photo-id"}]
+    payload = commodore._admit_chat_update({"update_id": 1, "message": msg})
+    assert "image" not in json.dumps(payload)
 
 
 def test_actual_poll_advances_durable_cursor_while_routing_is_blocked(monkeypatch, tmp_path):

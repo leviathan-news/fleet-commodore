@@ -1509,7 +1509,7 @@ def _reply_message_text(msg: dict) -> str:
     text = _message_text(msg)
     document = msg.get("document") or {}
     image_document = isinstance(document, dict) and str(document.get("mime_type", "")).startswith("image/")
-    if msg.get("photo") or image_document:
+    if msg.get("photo") or image_document or msg.get("_intake_image_present") is True:
         return "[Telegram image attached; image pixels are unavailable.] " + text
     return text
 
@@ -5687,6 +5687,14 @@ def _minimal_intake_message(msg, depth=0):
                         "id", "username", "is_bot",
                     ) if field in entity["user"]}
     document = msg.get("document")
+    # Preserve the reviewed image-context repair across durable admission
+    # without storing photo identifiers, sizes, or pixels. Never copy a
+    # supplied marker: derive this one static signal from Telegram metadata.
+    if msg.get("photo") or (
+        isinstance(document, dict)
+        and str(document.get("mime_type", "")).startswith("image/")
+    ):
+        result["_intake_image_present"] = True
     if isinstance(document, dict):
         result["document"] = {key: document[key] for key in (
             "file_id", "file_name", "mime_type", "file_size",
