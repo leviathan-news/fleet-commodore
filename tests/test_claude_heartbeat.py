@@ -136,6 +136,10 @@ def test_advisory_lock_blocks_overlap_and_releases_after_owner_exit(tmp_path):
 def test_codex_route_never_invokes_claude_and_resets_on_success(tmp_path):
     result = run_heartbeat(tmp_path, "ok", provider="codex")
     assert result.returncode == 0
+    assert result.stdout.startswith("20")
+    assert "state=ok" in result.stdout
+    assert "pong" not in result.stdout
+    assert "test-token" not in result.stdout
     assert (tmp_path / "state/claude-heartbeat-consecutive").read_text().strip() == "0"
     assert not (tmp_path / "curl.log").exists()
 
