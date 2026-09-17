@@ -10,24 +10,31 @@ import time
 from codex_runtime import ask
 from qa_knowledge import KnowledgeReader
 from qa_sql import execute_sql
-from qa_worker import current_message_reply, matches_hostile, self_hail_reply
+from qa_worker import MISSING_REPLY_CONTEXT, matches_hostile
 
 
 INSTRUCTION = """Return exactly one JSON object, without code fences.
 You are Fleet Commodore, the Telegram bot being addressed, not an outside
 observer asked to establish whether that bot exists. Host runtime_context
 identifies you and confirms only receipt of this request, not fleet health.
-FIRST distinguish ordinary conversation from a request for external facts.
-If the ENTIRE current request is a greeting, receipt/presence check, or identity
-question (however phrased), return exactly {"status":"acknowledged",
-"kind":"presence"} or {"status":"acknowledged","kind":"identity"}.
-The host renders this from facts it knows. Do not add answer, citations, or any
-other fields; do not search for evidence of your presence. For example, 'Are
-you still with us?' and 'Did my ping reach you?' are presence checks.
-This acknowledgement form is forbidden for an attachment review, substantive
-question, report/deployment/provider health, or a contextual request to answer
-something. An unrelated quoted parent does not turn a standalone presence
-check into a factual question. A mixed request must address its real subject.
+Use your judgment to distinguish ordinary conversation from requests for
+external facts. Write conversational replies yourself, naturally and in your
+own words, in a concise Fleet Commodore voice: direct, warm, lightly naval,
+without ceremonial refusal language. Greetings, banter, thanks, criticism,
+and questions about your identity or receipt of this message do not require
+external research or citations. Respond to what the person actually said,
+rather than repeating a stock acknowledgement. For ordinary conversation,
+return {"status":"conversational","answer":"your own reply"}.
+This form is not evidence for analytics, deployment/provider/fleet health,
+an attachment review, or the substantive part of a mixed question. Those use
+the grounded answer contract below. An unrelated quoted parent does not turn
+a self-contained conversational request into a factual question. Do not
+search for proof of your own presence; runtime_context establishes identity
+and receipt only. Never infer other services are healthy from your reply.
+If runtime_context.reply_context_unavailable is true, no safe quoted referent
+was recovered. Respond normally to a self-contained current request. If its
+subject depends on the missing parent, ask for that subject in your own words;
+never guess it from unrelated sources or remembered facts.
 If a self-hail accompanies a substantive question, briefly acknowledge it and
 answer the substantive question. Resolve 'that', 'this', and 'it' from the
 quoted parent chain. A correction overrides the referent; a pronoun uses it.
@@ -81,14 +88,13 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
     if not isinstance(reply_context, list):
         reply_context = []
     reply_context = [item for item in reply_context[:4] if isinstance(item, dict)]
+    reply_context_unavailable = MISSING_REPLY_CONTEXT in reply_context
+    reply_context = [item for item in reply_context if item != MISSING_REPLY_CONTEXT]
     attachment_mode = bool(attachment or job.get("attachment_name"))
     base = {"qa_uuid": str(job.get("qa_uuid") or ""), "provider": "codex"}
     if matches_hostile(question):
         return {**base, "status": "declined", "declined_reason": "I cannot retrieve credentials or personal information.", "citations": []}
     username = os.environ.get("BOT_USERNAME", "leviathan_commodore_bot")
-    hail = None if attachment_mode else self_hail_reply(question, username)
-    if hail:
-        return {**base, "status": "answered", "answer": hail, "citations": [], "tools_used": []}
     reader = None if attachment_mode else KnowledgeReader(Path(os.environ.get(
         "COMMODORE_KNOWLEDGE_ROOT", "~/dev/leviathan"
     )).expanduser())
@@ -106,6 +112,7 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
         prompt = json.dumps({
             "runtime_context": {"identity": "Fleet Commodore", "username": username,
                                 "observation": "This worker received the current request.",
+                                "reply_context_unavailable": reply_context_unavailable,
                                 "image_pixels_available": False},
             "reply_chain_context": reply_context,
             "attachment_mode": attachment_mode,
@@ -125,28 +132,25 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
         if not isinstance(decision, dict):
             break
         status = decision.get("status")
-        if status == "acknowledged":
-            # The model selects intent, not response prose. This finite
-            # contract cannot carry invented quantities/actions or waive
-            # grounding for an ordinary answered result.
-            kind = decision.get("kind")
-            if (attachment_mode or used_tools or set(decision) != {"status", "kind"}
-                    or not isinstance(kind, str) or kind not in {"presence", "identity"}):
-                break
-            return {**base, "status": "answered", "answer": current_message_reply(username, kind),
-                    "citations": [], "tools_used": []}
+        if status is not None and not isinstance(status, str):
+            break
         if status == "declined":
             return {**base, "status": status,
                     "declined_reason": str(decision.get("declined_reason") or "Evidence unavailable.")[:500],
                     "citations": [], "tools_used": used_tools}
-        if status == "answered":
+        if status in {"answered", "conversational"}:
             text = decision.get("answer")
-            citations = decision.get("citations") or []
+            citations = decision.get("citations", [])
             if not isinstance(text, str) or not text.strip() or not isinstance(citations, list):
                 break
-            if not attachment_mode and (not sources or not citations or any(not isinstance(c, str) or c not in sources for c in citations)):
+            conversational = status == "conversational"
+            if conversational and (attachment_mode or used_tools
+                    or set(decision) - {"status", "answer", "citations"}
+                    or ("citations" in decision and decision["citations"] != [])):
+                break
+            if not conversational and not attachment_mode and (not sources or not citations or any(not isinstance(c, str) or c not in sources for c in citations)):
                 return {**base, "status": "declined", "declined_reason": "I could not substantiate an answer from the available sources.", "citations": []}
-            return {**base, "status": status, "answer": text[:3500],
+            return {**base, "status": "answered", "answer": text[:3500],
                     "citations": [] if attachment_mode else citations[:3], "tools_used": used_tools}
         tool = decision.get("request")
         if not attachment_mode and tool in {"search", "read", "sql"} and step == 3:

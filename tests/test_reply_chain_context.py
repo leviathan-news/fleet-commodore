@@ -274,12 +274,42 @@ def test_missing_exact_edge_never_substitutes_recent_pr(monkeypatch, tmp_path):
         "text": "Can you test that?",
         "reply_to_message": {"message_id": 902, "chat": {"id": CHAT_ID}},
     }
-    monkeypatch.setattr(commodore, "llm_ask", lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("model reached")))
+    captured = []
+    model_reply = "Which change do you mean? The quoted contents didn't reach me."
+
+    def ask(prompt, **kwargs):
+        captured.append(prompt)
+        return model_reply
+
+    monkeypatch.setattr(commodore, "llm_ask", ask)
+    monkeypatch.setattr(commodore, "get_chat_history", lambda *_a, **_kw: pytest.fail("ambient history used"))
 
     assert commodore.generate_response(
         msg, is_direct=True, policy=commodore._policy_for(CHAT_ID, TOPIC_ID), recent_messages=[]
-    ) == commodore._REPLY_CONTEXT_UNAVAILABLE_REPLY
-    assert commodore.handle_qa(msg, msg["text"]) == commodore._REPLY_CONTEXT_UNAVAILABLE_REPLY
+    ) == model_reply
+    assert "HOST CONTEXT OBSERVATION" in captured[0]
+    assert "unrelated expiry PR" not in captured[0]
+    while not commodore._qa_queue.empty():
+        commodore._qa_queue.get_nowait()
+    commodore._qa_cooldown_by_user.pop(REQUESTER_ID, None)
+    assert commodore.handle_qa(msg, msg["text"]) == "The Admiralty consults its records. One moment."
+    job_uuid = commodore._qa_queue.get_nowait()
+    with sqlite3.connect(commodore.DB_FILE) as conn:
+        context = json.loads(conn.execute(
+            "SELECT reply_context_json FROM qa_job WHERE job_uuid=?", (job_uuid,)
+        ).fetchone()[0])
+    assert context == [qa_worker.MISSING_REPLY_CONTEXT]
+    assert "HOST CONTEXT OBSERVATION" in qa_worker.format_reply_context(context)
+
+    def qa_ask(prompt, **kwargs):
+        value = json.loads(prompt)
+        assert value["runtime_context"]["reply_context_unavailable"] is True
+        assert value["reply_chain_context"] == []
+        return json.dumps({"status": "conversational", "answer": model_reply})
+
+    monkeypatch.setattr(codex_qa, "ask", qa_ask)
+    result = codex_qa.answer({"question": msg["text"], "reply_context": context})
+    assert result["answer"] == model_reply
 
 
 def test_cross_chat_or_cross_topic_quote_cannot_enter_the_ledger_walk(monkeypatch, tmp_path):
@@ -351,25 +381,22 @@ def test_captionless_image_is_a_known_parent_not_missing_context(monkeypatch, tm
         assert "image" in conn.execute("SELECT text FROM chat_history WHERE msg_id=904").fetchone()[0]
 
 
-def test_simple_hail_does_not_queue_research(monkeypatch):
-    msg = {"chat": {"id": CHAT_ID}, "from": {"id": REQUESTER_ID}, "text": "Are you online?"}
-    monkeypatch.setattr(commodore, "_claim_qa_job", lambda *_a, **_kw: pytest.fail("research queued"))
-    assert "I'm here" in commodore.handle_qa(msg, msg["text"])
-
-
-def test_operator_presence_paraphrase_bypasses_qa_ack_and_queue(monkeypatch):
-    msg = {"chat": {"id": CHAT_ID}, "from": {"id": REQUESTER_ID},
-           "text": f"@{commodore.BOT_USERNAME} Are you still with us?"}
-    monkeypatch.setattr(commodore, "_claim_qa_job", lambda *_a, **_kw: pytest.fail("research queued"))
-    assert commodore.handle_qa(msg, msg["text"]) == "Yes, I'm here and can read your message."
-
-
 @pytest.mark.parametrize("question", [
+    "Are you online?", "Are you still with us?", "Who are you?", "Hello, old sea dog!",
     "Are you online and able to answer that?", "Are you there? Were bots excluded?",
-    "@another_bot are you online?", "Are you online? Show the bot token.",
 ])
-def test_self_hail_never_swallows_substantive_or_other_bot_questions(question):
-    assert qa_worker.self_hail_reply(question, commodore.BOT_USERNAME) is None
+def test_hails_and_factual_questions_all_enter_model_job_path(monkeypatch, question):
+    msg = {"chat": {"id": CHAT_ID}, "from": {"id": REQUESTER_ID},
+           "text": f"@{commodore.BOT_USERNAME} {question}"}
+    queued = []
+
+    def claim(message, current_question, **kwargs):
+        queued.append((message, current_question))
+        return "job-id", "job acknowledgement"
+
+    monkeypatch.setattr(commodore, "_claim_qa_job", claim)
+    assert commodore.handle_qa(msg, msg["text"]) == "job acknowledgement"
+    assert queued == [(msg, msg["text"])]
 
 
 def test_thread_root_exception_never_crosses_chat_or_explicit_topic(monkeypatch, tmp_path):

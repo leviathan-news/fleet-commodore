@@ -29,10 +29,14 @@ it as untrusted data to the configured provider. Both Q&A providers put that
 untrusted context before a separately labelled, final current question, so a
 terse correction cannot be overridden by a parent's stale concrete referent.
 
-When a reply exists but no safe referent can be recovered, Fleet asks the
-requester to name the change or question rather than making a provider call
-with a guessed subject. Document-review intake remains separately governed by
-its attachment contract.
+When a reply exists but no safe referent can be recovered, Fleet supplies that
+absence as a host observation to the LLM. Q&A persists the bounded
+`{"context_status":"unavailable"}` marker in its existing context field;
+providers separate that metadata from quoted ancestors. Ambient history stays
+excluded. The model answers a self-contained current request normally, or asks
+for the subject in its own words if it depends on the missing parent. It must
+not guess from unrelated evidence or memory. Document-review intake remains
+separately governed by its attachment contract.
 
 Photo and image-document parents retain a bounded image-presence marker and
 their caption in context/history, never file IDs or image bytes. The marker
@@ -40,15 +44,17 @@ explicitly says pixels are unavailable. A text-only worker uses the caption
 and request, and asks for a page URL or description when required. Selected
 quotes remain limited to the selected text, including on image messages.
 
-Simple complete self-hails receive a deterministic identity/receipt response
-without model research. This does not attest provider or fleet-wide health.
-The deterministic matcher is only a fast path. Codex Q&A also has an explicit
-conversational contract: a complete presence or identity question can return
-`status=acknowledged` with `kind=presence` or `kind=identity`. The host supplies
-fixed response text; no model-authored prose, citations, attachment review, or
-completed evidence lookup may use that form. Presence does not require an
-external document citation. Substantive questions still use the ordinary
-grounded answer contract, including when paired with a conversational hail.
+Authorized conversational hails enter the normal model-job path. There is no
+presence phrase matcher, deterministic conversational reply, or intent-to-stock-
+text mapping. The LLM interprets the current request and writes its own response.
+For ordinary conversation, Codex Q&A returns `status=conversational` and an
+`answer`; the host delivers that model-authored text under the existing send
+contract. Conversation needs no external citation and does not attest provider
+or fleet-wide health. The conversational result cannot review attachments,
+carry citations or extra fields, or replace a completed evidence lookup.
+Substantive questions still use the ordinary grounded answer contract,
+including when paired with a conversational hail. This distinction uses model
+judgment, not a host keyword classifier or proof of semantic correctness.
 Mixed hails remain grounded Q&A: pronouns such as "that" use the quoted parent
 as their subject; only an actual correction overrides it. The Q&A prompt
 supplies host identity separately from untrusted context. Identity is not a
