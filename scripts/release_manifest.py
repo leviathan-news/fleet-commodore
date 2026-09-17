@@ -29,6 +29,8 @@ ARTIFACT_FILES = (
     "codex_runtime.py",
     "codex_qa.py",
     "qa_knowledge.py",
+    "qa_github.py",
+    "qa_sources.py",
     "qa_sql.py",
     "bin/provider-probe.py",
     "bin/launch-qa-container",

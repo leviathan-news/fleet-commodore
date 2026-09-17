@@ -4928,11 +4928,8 @@ def _process_qa(job_uuid: str) -> None:
 
         status = (result or {}).get("status", "")
         if status == "answered":
-            answer = (result.get("answer") or "")[:3800]
-            citations = result.get("citations") or []
-            if citations:
-                cite_block = "\n\nSources: " + ", ".join(str(c)[:200] for c in citations[:3])
-                answer = (answer + cite_block)[:4000]
+            from qa_sources import format_qa_answer
+            answer = format_qa_answer(result.get("answer") or "", result.get("citations") or [])
             wal = send_message_with_wal(
                 "qa_job", job_uuid, OutgoingAction.QA_ANSWER,
                 chat_id, answer,
