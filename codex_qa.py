@@ -155,8 +155,12 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
                     "provider_failure": context.get("failure_class", "provider_unavailable")}
         try:
             decision = json.loads(raw)
-        except (ValueError, TypeError):
-            evidence.append({"broker_error": "Your previous response was not valid JSON. Return exactly one valid JSON object using the documented request or answer schema. No action was executed for that response."})
+        except (ValueError, TypeError) as exc:
+            evidence.append({
+                "broker_error": "Your previous response was not valid JSON. Correct the syntax error below and return exactly one valid JSON object. No action was executed for that response.",
+                "invalid_response": str(raw)[:2000],
+                "parse_error": str(exc)[:300],
+            })
             continue
         if not isinstance(decision, dict):
             break
@@ -201,6 +205,8 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
                 if not isinstance(query, str):
                     break
                 result = reader.search(query)
+                if not result.get("results") and "error" not in result:
+                    result["guidance"] = "No literal AND match. Retry with fewer distinctive subject words before concluding the document is unavailable; dates and wording may differ."
             elif tool == "read":
                 path = decision.get("path")
                 if not isinstance(path, str) or path not in sources:

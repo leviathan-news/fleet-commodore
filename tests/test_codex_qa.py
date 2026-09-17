@@ -230,3 +230,5 @@ def test_malformed_model_request_is_corrected_within_existing_budget(monkeypatch
     result = codex_qa.answer({"question": "Did PR #1133 merge?"})
     assert result["status"] == "answered" and result["tools_used"] == ["github_pull"]
     assert "broker_error" in prompts[1]["evidence"][0]
+    assert "invalid_response" in prompts[1]["evidence"][0]
+    assert "parse_error" in prompts[1]["evidence"][0]
