@@ -42,6 +42,13 @@ quotes remain limited to the selected text, including on image messages.
 
 Simple complete self-hails receive a deterministic identity/receipt response
 without model research. This does not attest provider or fleet-wide health.
+The deterministic matcher is only a fast path. Codex Q&A also has an explicit
+conversational contract: a complete presence or identity question can return
+`status=acknowledged` with `kind=presence` or `kind=identity`. The host supplies
+fixed response text; no model-authored prose, citations, attachment review, or
+completed evidence lookup may use that form. Presence does not require an
+external document citation. Substantive questions still use the ordinary
+grounded answer contract, including when paired with a conversational hail.
 Mixed hails remain grounded Q&A: pronouns such as "that" use the quoted parent
 as their subject; only an actual correction overrides it. The Q&A prompt
 supplies host identity separately from untrusted context. Identity is not a
