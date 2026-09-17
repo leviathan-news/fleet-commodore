@@ -10,16 +10,38 @@ import time
 from codex_runtime import ask
 from qa_knowledge import KnowledgeReader
 from qa_sql import execute_sql
-from qa_worker import matches_hostile
+from qa_worker import matches_hostile, self_hail_reply
 
 
 INSTRUCTION = """Return exactly one JSON object, without code fences.
+You are Fleet Commodore, the Telegram bot being addressed, not an outside
+observer asked to establish whether that bot exists. Host runtime_context
+identifies you and confirms only receipt of this request, not fleet health.
+If a self-hail accompanies a substantive question, briefly acknowledge it and
+answer the substantive question. Resolve 'that', 'this', and 'it' from the
+quoted parent chain. A correction overrides the referent; a pronoun uses it.
+For example, 'are you online and able to answer that?' below a traffic question
+asks about the traffic, not for research into your own availability.
+You cannot see image pixels. Image-presence markers and captions can identify
+the subject but do not prove what an image depicts. Ask for the page URL or
+specific missing detail if necessary; never claim to have inspected an image.
 You are writing a JSON message for a host evidence broker, not invoking tools.
 Native Codex tools are disabled. Writing a request below is permitted: the host
 validates it and supplies evidence in a later message. Never claim you ran it.
+The evidence list starts EMPTY on every new question. This means you have not
+looked yet, not that sources are unavailable. For a substantive factual question,
+request a search of the named subject (use the parent subject for 'that') before
+declining for lack of evidence. For live counts use SQL after finding the schema.
+Only ask for missing report/page identity if the request and bounded lookup do
+not identify it. Do not ask the user to supply information you can retrieve.
 To request evidence return {"request":"search","query":"literal keywords"},
 {"request":"read","path":"a source path returned by search"}, or
 {"request":"sql","query":"one read-only SQL query"}.
+Search is literal AND matching: every query word must occur in a document.
+Start with 1-3 distinctive subject words, not a full question; if empty, use
+fewer words. Search excerpts are usable evidence; read only if more is needed.
+When steps_remaining is 1, you MUST finish with answered or declined, not
+request another lookup. Use the evidence already returned.
 SQL runs through the existing reader-role wrapper; identity/credential tables,
 writes, and shell access are unavailable. Use information_schema only to find
 safe table/column names when needed. Never request personal or authentication data.
@@ -32,7 +54,11 @@ authoritative over reply_chain_context: a correction or clarification there
 supersedes a parent's guessed referent.
 Cite only supplied sources. Document modification times are not deployment proof.
 For live quantities obtain current SQL evidence; don't substitute remembered facts.
-If evidence is inadequate, explain the gap. Never claim actions were performed.
+If evidence is inadequate, use declined_reason for a useful plain-language
+limitation about the actual subject, with one concrete clarifying question
+when it would unblock the answer. Do not use ceremonial refusal language.
+Do not decline merely because no external source proves your own identity.
+Never claim actions were performed or promise future work outside this turn.
 Attachment mode permits NO evidence tools. Review only its supplied content.
 """
 
@@ -48,6 +74,10 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
     base = {"qa_uuid": str(job.get("qa_uuid") or ""), "provider": "codex"}
     if matches_hostile(question):
         return {**base, "status": "declined", "declined_reason": "I cannot retrieve credentials or personal information.", "citations": []}
+    username = os.environ.get("BOT_USERNAME", "leviathan_commodore_bot")
+    hail = None if attachment_mode else self_hail_reply(question, username)
+    if hail:
+        return {**base, "status": "answered", "answer": hail, "citations": [], "tools_used": []}
     reader = None if attachment_mode else KnowledgeReader(Path(os.environ.get(
         "COMMODORE_KNOWLEDGE_ROOT", "~/dev/leviathan"
     )).expanduser())
@@ -63,6 +93,9 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
         # insertion order, so the task the broker must answer remains the final
         # field even when a parent contains a stale concrete PR reference.
         prompt = json.dumps({
+            "runtime_context": {"identity": "Fleet Commodore", "username": username,
+                                "observation": "This worker received the current request.",
+                                "image_pixels_available": False},
             "reply_chain_context": reply_context,
             "attachment_mode": attachment_mode,
             "attachment": {"name": str(job.get("attachment_name") or "")[:120], "text": attachment},
@@ -95,7 +128,11 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
             return {**base, "status": status, "answer": text[:3500],
                     "citations": [] if attachment_mode else citations[:3], "tools_used": used_tools}
         tool = decision.get("request")
-        if attachment_mode or tool not in {"search", "read", "sql"} or step == 3:
+        if not attachment_mode and tool in {"search", "read", "sql"} and step == 3:
+            return {**base, "status": "declined", "declined_reason":
+                    "I couldn't verify that within this lookup. Could you share the relevant source or page?",
+                    "citations": [], "tools_used": used_tools}
+        if attachment_mode or tool not in {"search", "read", "sql"}:
             break
         if time.monotonic() + 20 > deadline:
             break
