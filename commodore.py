@@ -5768,6 +5768,10 @@ def poll():
 
 def _poll_owned():
     intake = ChatIntake(DB_FILE.parent / "chat-intake.db") if _HELM_CONTROLLER is None else None
+    if intake is not None and not intake.legacy_capture_complete():
+        # The legacy listener kept its offset only in memory. A fresh zero
+        # cursor is not proof that pending updates are safe to route again.
+        raise RuntimeError("legacy intake capture required before ordinary polling")
     offset = (
         _HELM_CONTROLLER.durable_offset()
         if _HELM_CONTROLLER is not None

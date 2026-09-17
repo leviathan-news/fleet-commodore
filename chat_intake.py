@@ -122,6 +122,19 @@ class ChatIntake:
         return result
 
     def ingest_batch(self, updates: list[dict[str, Any]]) -> None:
+        self._ingest_batch(updates, status="queued", finished_at=None)
+
+    def ingest_legacy_batch(self, updates: list[dict[str, Any]]) -> None:
+        """Capture legacy updates as retained, non-routable unknown events."""
+        self._ingest_batch(updates, status="held_unknown", finished_at=self.clock())
+
+    def _ingest_batch(
+        self,
+        updates: list[dict[str, Any]],
+        *,
+        status: str,
+        finished_at: float | None,
+    ) -> None:
         entries = self._validate_updates(updates)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -145,14 +158,52 @@ class ChatIntake:
                 for update_id, payload in entries:
                     if update_id < cursor and update_id not in ids:
                         continue
-                    conn.execute(
-                        "INSERT OR IGNORE INTO chat_intake_event "
-                        "(update_id,payload,status,created_at) VALUES (?,?, 'queued', ?)",
-                        (update_id, payload, now),
-                    )
+                    if status == "queued":
+                        conn.execute(
+                            "INSERT OR IGNORE INTO chat_intake_event "
+                            "(update_id,payload,status,created_at) VALUES (?,?, 'queued', ?)",
+                            (update_id, payload, now),
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO chat_intake_event "
+                            "(update_id,payload,status,created_at,finished_at) VALUES (?,?,?, ?, ?)",
+                            (update_id, payload, status, now, finished_at),
+                        )
                 if entries:
                     cursor = max(cursor, max(update_id for update_id, _ in entries) + 1)
                 conn.execute("UPDATE chat_intake_meta SET value=? WHERE name='cursor'", (cursor,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def legacy_capture_complete(self) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM chat_intake_meta WHERE name='legacy_capture_complete'"
+            ).fetchone()
+        return row is not None and int(row[0]) == 1
+
+    def mark_legacy_capture_complete(self) -> None:
+        """Mark capture complete only with the offline poll lock held.
+
+        The caller must independently prove that no legacy actor remains; this
+        marker is not a send receipt or evidence of delivery.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM chat_intake_event "
+                    "WHERE status IN ('queued','running')"
+                ).fetchone()[0]
+                if active:
+                    raise IntakeError("cannot complete legacy capture while events are queued or running")
+                conn.execute(
+                    "INSERT INTO chat_intake_meta(name,value) VALUES ('legacy_capture_complete',1) "
+                    "ON CONFLICT(name) DO UPDATE SET value=1"
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()

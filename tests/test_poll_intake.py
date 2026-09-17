@@ -49,6 +49,7 @@ def test_actual_poll_advances_durable_cursor_while_routing_is_blocked(monkeypatc
     monkeypatch.setattr(commodore, "_start_workers", lambda: None)
     monkeypatch.setattr(commodore, "_chat_maintenance", lambda *_args: None)
     monkeypatch.setattr(commodore, "BOT_USER_ID", None)
+    ChatIntake(tmp_path / "chat-intake.db").mark_legacy_capture_complete()
     entered, release = threading.Event(), threading.Event()
     offsets = []
 

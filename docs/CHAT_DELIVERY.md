@@ -83,6 +83,34 @@ with another poller. The old release has no ordinary durable cursor: first
 cutover must explicitly reconcile pending Telegram updates and existing
 positive reply receipts, not assume starting a new ledger at zero is replay-safe.
 
+### First legacy cutover
+
+Ordinary startup now refuses a ledger without `legacy_capture_complete=1`,
+before contacting Telegram or starting workers. During the authorized offline
+transition, pause the legacy watchdog, independently verify that the sole old
+actor and any sending worker have stopped, and retain atomic state backups.
+Do not activate helm or discard pending updates to bypass this boundary.
+
+With the service configuration sourced on the designated Mini, set the reviewed
+`FLEET_COMMODORE_RELEASE_DIR`, config and state paths, then run its service-owned
+Python with `intake_cutover.py --capture-legacy`. The tool holds ordinary poll
+and new-watchdog locks, verifies actor absence and ordinary controller ownership
+before and after each bounded, zero-timeout `getUpdates`, and atomically stores
+minimized pending updates as `held_unknown` before advancing the cursor. It
+never invokes a provider, starts a worker, sends a reply, deletes a webhook,
+or labels a legacy question answered. An empty confirmed batch completes the
+capture marker; failure or the forty-batch cap leaves the marker unset and all
+committed bodies/cursor retained. Resume from that ledger, never reset it.
+
+The old watchdog does not obey these new locks: its explicit offline pause and
+independent sole-actor/worker verification are still required. Unrelated token
+holders can likewise race the snapshots; no stronger exclusivity is claimed.
+Held legacy requests need separate read-only inspection and independent exact
+reply-target/positive-receipt reconciliation. Newly arriving work after capture
+uses ordinary queued intake. Capture completion is not request completion or
+permission to replay an old question. Restore only the registered new watchdog
+after the immutable source/config switch and startup verification.
+
 Q&A, review and build acknowledgements link to their durable job identity and
 remain `handed_off`. Final job status alone is insufficient: reconciliation
 requires its positive outgoing receipt before resolving or escalating intake.

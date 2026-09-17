@@ -23,6 +23,7 @@ ARTIFACT_FILES = (
     "commodore.py",
     "chat_intake.py",
     "chat_dispatch.py",
+    "intake_cutover.py",
     "fleet_watchdog.py",
     "outcome_watch.py",
     "helm_controller.py",
