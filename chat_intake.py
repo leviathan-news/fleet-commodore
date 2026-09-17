@@ -72,6 +72,11 @@ class ChatIntake:
                 );
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(chat_intake_event)")}
+            for name, column_type in (("job_table", "TEXT"), ("job_uuid", "TEXT"), ("message_id", "INTEGER")):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE chat_intake_event ADD COLUMN {name} {column_type}")
+            conn.commit()
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.path, timeout=5.0)
@@ -129,11 +134,15 @@ class ChatIntake:
                 pending = conn.execute(
                     "SELECT COUNT(*) FROM chat_intake_event WHERE status IN ('queued','running','handed_off','held_unknown')"
                 ).fetchone()[0]
-                new_ids = {update_id for update_id, _ in entries if update_id not in ids}
+                # A pruned terminal row below the committed cursor must not
+                # become fresh work if an old batch is presented again.
+                new_ids = {update_id for update_id, _ in entries if update_id not in ids and update_id >= cursor}
                 if pending + len(new_ids) > self.max_pending:
                     raise IntakeFull("chat intake pending limit reached")
                 now = self.clock()
                 for update_id, payload in entries:
+                    if update_id < cursor and update_id not in ids:
+                        continue
                     conn.execute(
                         "INSERT OR IGNORE INTO chat_intake_event "
                         "(update_id,payload,status,created_at) VALUES (?,?, 'queued', ?)",
@@ -178,7 +187,8 @@ class ChatIntake:
                 conn.rollback()
                 raise
 
-    def finish(self, update_id: int, token: str, outcome: str) -> None:
+    def finish(self, update_id: int, token: str, outcome: str, *,
+               job_table=None, job_uuid=None, message_id=None) -> None:
         if outcome not in self._OUTCOMES:
             raise ValueError(f"invalid intake outcome: {outcome}")
         now = self.clock()
@@ -191,6 +201,10 @@ class ChatIntake:
                 ).fetchone()
                 if row is None or row["status"] != "running":
                     raise IntakeError("event claim is no longer current")
+                conn.execute(
+                    "UPDATE chat_intake_event SET job_table=?, job_uuid=?, message_id=? WHERE update_id=?",
+                    (job_table, job_uuid, message_id, update_id),
+                )
                 payload = "{}" if outcome in {"resolved", "escalated", "no_reply"} else None
                 if payload is None:
                     conn.execute(
@@ -206,6 +220,53 @@ class ChatIntake:
             except Exception:
                 conn.rollback()
                 raise
+
+    def hold_interrupted(self) -> int:
+        """Call only after acquiring sole process ownership, never on a timer."""
+        with self._connect() as conn:
+            changed = conn.execute(
+                "UPDATE chat_intake_event SET status='held_unknown', claim_token=NULL, finished_at=? "
+                "WHERE status='running'", (self.clock(),),
+            ).rowcount
+            conn.commit()
+            return changed
+
+    def prune_terminal(self, retention_seconds=30 * 86400, limit=1000) -> int:
+        """Bound metadata retention without ever removing unresolved work."""
+        if retention_seconds < 86400 or not 1 <= limit <= 1000:
+            raise ValueError("terminal retention must be bounded and at least one day")
+        with self._connect() as conn:
+            changed = conn.execute(
+                "DELETE FROM chat_intake_event WHERE update_id IN ("
+                "SELECT update_id FROM chat_intake_event "
+                "WHERE status IN ('resolved','escalated','no_reply') AND finished_at<? "
+                "ORDER BY update_id LIMIT ?)", (self.clock() - retention_seconds, limit),
+            ).rowcount
+            conn.commit()
+            return changed
+
+    def handoffs(self, limit=100) -> list[dict[str, Any]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("handoff limit must be between 1 and 100")
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT update_id, job_table, job_uuid FROM chat_intake_event "
+                "WHERE status='handed_off' ORDER BY update_id LIMIT ?", (limit,),
+            )]
+
+    def complete_handoff(self, update_id, job_table, job_uuid, outcome, message_id) -> bool:
+        if outcome not in {"resolved", "escalated"}:
+            raise ValueError("handoff completion must be receipt-backed")
+        if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+            raise ValueError("handoff completion requires a positive receipt")
+        with self._connect() as conn:
+            changed = conn.execute(
+                "UPDATE chat_intake_event SET status=?, message_id=?, payload='{}', finished_at=? "
+                "WHERE update_id=? AND status='handed_off' AND job_table=? AND job_uuid=?",
+                (outcome, message_id, self.clock(), update_id, job_table, job_uuid),
+            ).rowcount
+            conn.commit()
+            return changed == 1
 
     def snapshot(self) -> dict[str, Any]:
         now = self.clock()

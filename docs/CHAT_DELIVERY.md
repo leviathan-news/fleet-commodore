@@ -1,8 +1,11 @@
-# Chat delivery certainty and intake foundation
+# Chat delivery certainty and nonblocking intake
 
 This source changes send recovery; it is not proof of a deployed repair.
-`chat_intake.py` is a tested storage component, not yet connected to `poll()`.
-Polling remains synchronous until the asynchronous routing release is completed.
+Ordinary `poll()` now commits minimized updates and its cursor atomically, then
+routes them through one FIFO worker. Provider work, document retrieval, history
+cleanup and Benthic backup generation cannot block that polling path. The
+optional helm path remains unchanged and separately gated; do not activate it
+as a substitute for this release's ordinary intake.
 
 ## Send contract
 
@@ -13,6 +16,11 @@ Timeouts, decode errors and server failures never trigger a second POST. A
 confirmed receipt remains valid even if local reply-history persistence fails.
 
 Job sends commit one content-independent intent before contacting Telegram.
+Ordinary routed replies (including queued-job acknowledgements and fixed
+declines) use that same WAL keyed by the Telegram update ID. Their wording
+cannot create another send intent. Direct helper calls without an intake ID
+remain outside this ordinary routing contract and require the separate
+operator/helm boundary; they are not an authorized replay interface.
 The claim is serialized with `BEGIN IMMEDIATE` and persisted with SQLite WAL
 and `synchronous=FULL`; concurrent calls cannot both send the same intent.
 `delivery_status` distinguishes `prepared`, `accepted`, `failed` and
@@ -58,11 +66,44 @@ automatically recycled. New database files are created privately before SQLite
 opens them; existing file modes are preserved and symlink database paths are
 rejected. Connections close after each operation.
 
-Integration must still enforce room authorization and payload minimization
-before persistence, per-thread ordering, explicit durable job handoff, receipt-
-backed completion, bounded worker deadlines, retention, ownership reconciliation
-and model-free oldest-unresolved monitoring. The generic component is not a
-license to store arbitrary private updates or admit public-room model work.
+Room authorization now precedes persistence. Unknown messages retain only an
+update ID, public hails retain a static yes/no signal, and trusted messages keep
+only routing/document metadata and a bounded reply chain. A single routing
+worker preserves FIFO ordering without unlimited concurrency. The queue caps
+unresolved events at 4096; overflow leaves the durable offset unchanged.
+
+An OS-held service lock excludes other cooperating ordinary pollers. Only after
+acquiring it does boot mark interrupted routing claims `held_unknown`, never
+requeue them. An ambiguous send or routing exception remains held. Shutdown
+does not release polling ownership while the routing thread can still send;
+a permanently stuck thread needs process-level supervision. This lock cannot
+exclude older releases or unrelated token holders, so cutover still requires
+independent sole-actor verification. A 409 backs off instead of interfering
+with another poller. The old release has no ordinary durable cursor: first
+cutover must explicitly reconcile pending Telegram updates and existing
+positive reply receipts, not assume starting a new ledger at zero is replay-safe.
+
+Q&A, review and build acknowledgements link to their durable job identity and
+remain `handed_off`. Final job status alone is insufficient: reconciliation
+requires its positive outgoing receipt before resolving or escalating intake.
+New build rows also retain the exact ship message ID. No receipt means the
+request remains unresolved. Intake outcome logs expose counts, oldest unresolved
+age and router liveness without payloads or model calls. Terminal payloads clear
+immediately; terminal metadata prunes after 30 days in bounded batches. Cursor
+fencing prevents pruned old IDs from becoming new work.
+
+The local `bin/qa-healthcheck.py` also reads intake counts, oldest unresolved
+age and the latest receipt-backed terminal time with SQLite `mode=ro`. It warns
+about held requests or an oldest age over 120 seconds without claiming that
+dependency readiness validates provider transport. Missing intake state is
+reported as not installed, not silently created. This diagnostic does not yet
+page the operator or supervise a stuck router.
+
+Remaining gates include receipt reconciliation for held/legacy requests, bounded
+end-to-end deadlines and prompt acknowledgement under backlog, an active outcome
+watchdog/escalation path, dead-process supervision and rehearsal of controller
+ownership. The generic storage API is not a license to admit public-room models
+or persist arbitrary private updates. This source is not live readiness proof.
 
 ## Verification boundary
 

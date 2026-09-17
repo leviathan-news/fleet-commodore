@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ARTIFACT_FILES = (
     "commodore.py",
     "chat_intake.py",
+    "chat_dispatch.py",
     "helm_controller.py",
     "helm_sol_bridge.py",
     "helm_supervisor.py",

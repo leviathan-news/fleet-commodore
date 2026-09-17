@@ -157,3 +157,31 @@ def test_update_id_upper_bound_is_rejected_atomically(tmp_path):
         intake.ingest_batch([update(ChatIntake._MAX_UPDATE_ID + 1)])
     assert intake.offset() == 0
     assert intake.snapshot()["queued"] == 0
+
+
+def test_terminal_retention_never_removes_unresolved_or_rearms_old_ids(tmp_path):
+    now = [0]
+    intake = ChatIntake(tmp_path / "intake.db", clock=lambda: now[0])
+    intake.ingest_batch([update(1), update(2)])
+    first = intake.claim_next()
+    intake.finish(1, first["claim_token"], "resolved")
+    second = intake.claim_next()
+    intake.finish(2, second["claim_token"], "held_unknown")
+    now[0] = 31 * 86400
+    assert intake.prune_terminal() == 1
+    intake.ingest_batch([update(1, "must not replay")])
+    assert intake.offset() == 3
+    assert intake.snapshot()["held_unknown"] == 1
+    assert intake.claim_next() is None
+
+
+def test_handoff_receipt_completion_is_identity_fenced_and_idempotent(tmp_path):
+    intake = ChatIntake(tmp_path / "intake.db")
+    intake.ingest_batch([update(1)])
+    claim = intake.claim_next()
+    intake.finish(1, claim["claim_token"], "handed_off", job_table="qa_job", job_uuid="fixture")
+    with pytest.raises(ValueError, match="positive receipt"):
+        intake.complete_handoff(1, "qa_job", "fixture", "resolved", 0)
+    assert not intake.complete_handoff(1, "qa_job", "foreign", "resolved", 42)
+    assert intake.complete_handoff(1, "qa_job", "fixture", "resolved", 42)
+    assert not intake.complete_handoff(1, "qa_job", "fixture", "resolved", 42)

@@ -75,3 +75,17 @@ def test_trusted_qa_retains_question_context_and_reply_target(monkeypatch):
                      {"thread_id": 7, "reply_to": 9001})]
     assert recent == {(commodore.LEV_DEV_GROUP_ID, 7): [message]}
     assert saved == [(message, {"our_reply": "Queued for review."})]
+
+
+def test_empty_direct_generation_is_visible_and_retained_not_no_reply(monkeypatch):
+    message = _message(commodore.LEV_DEV_GROUP_ID, "@commodore_lev_bot please explain")
+    monkeypatch.setattr(commodore, "should_respond", lambda *_args: True)
+    monkeypatch.setattr(commodore, "QA_ENABLED", False)
+    monkeypatch.setattr(commodore, "generate_response", lambda *_args, **_kwargs: "SKIP")
+    monkeypatch.setattr(commodore, "save_chat_message", lambda *_args, **_kwargs: None)
+    sent = []
+    monkeypatch.setattr(commodore, "send_message", lambda _chat, text, **_kwargs:
+                        sent.append(text) or {"ok": True, "result": {"message_id": 42}})
+    outcome = commodore._route_update({"message": message}, {})
+    assert outcome == {"outcome": "held_unknown", "message_id": 42}
+    assert "remains unresolved" in sent[0]

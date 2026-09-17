@@ -34,9 +34,12 @@ import unicodedata
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from chat_dispatch import ChatDispatcher, PollOwner
+from chat_intake import ChatIntake
 from helm_controller import (
     DuplicateSendHeld,
     HelmController,
@@ -597,7 +600,7 @@ def _is_fixed_public_hail(msg: dict) -> bool:
     return _is_mention_of_commodore(msg, text[:500].lower())
 
 
-def _handle_public_untrusted_message(msg: dict) -> None:
+def _handle_public_untrusted_message(msg: dict) -> dict | None:
     """Issue a fixed, rate-limited Squid Cave decline and do nothing else."""
     chat_id = int((msg.get("chat") or {}).get("id") or 0)
     sender = msg.get("from") or {}
@@ -609,7 +612,7 @@ def _handle_public_untrusted_message(msg: dict) -> None:
     if now - _public_decline_last_by_chat.get(chat_id, 0.0) < PUBLIC_ROOM_DECLINE_COOLDOWN_S:
         return
     try:
-        send_message(
+        result = _chat_send(
             chat_id,
             PUBLIC_ROOM_DECLINE,
             thread_id=msg.get("message_thread_id"),
@@ -618,8 +621,9 @@ def _handle_public_untrusted_message(msg: dict) -> None:
     except Exception as exc:
         # Do not reflect any attacker-controlled text or metadata in this log.
         log.warning("public-room decline send failed for chat %s: %s", chat_id, type(exc).__name__)
-        return
+        return {"outcome": "held_unknown"}
     _public_decline_last_by_chat[chat_id] = now
+    return {"outcome": "escalated", "message_id": _telegram_message_id(result)}
 
 
 def _nemesis_recently_present(recent_messages, lookback=5):
@@ -854,6 +858,8 @@ _HELM_CONTROLLER = (
     HelmController(HELM_CONTROLLER_DB_FILE) if HELM_CONTROLLER_ENABLED else None
 )
 _HELM_EVENT_ID = contextvars.ContextVar("helm_event_id", default=None)
+_CHAT_JOB_REF = contextvars.ContextVar("chat_job_ref", default=None)
+_CHAT_UPDATE_ID = contextvars.ContextVar("chat_update_id", default=None)
 
 
 _TOKEN_LEAK_RE = re.compile(r"x-access-token:[^@\s]+@", re.IGNORECASE)
@@ -3611,6 +3617,7 @@ def _claim_review(msg, pr_number, repo):
 
     # Record the cooldown AFTER the claim is definitively queued.
     _review_cooldown_by_user[requester_id] = time.time()
+    _CHAT_JOB_REF.set(("pr_review", review_uuid))
 
     return (
         f"Very well, @{requester_username} — the Admiralty takes up dispatch "
@@ -3770,7 +3777,7 @@ def _active_draft_for(conn, chat_id, thread_id, requester_id,
     return conn.execute(sql, params).fetchone()
 
 
-def _claim_build_job(draft_row) -> "tuple[str, str]":
+def _claim_build_job(draft_row, request_msg_id=None) -> "tuple[str, str]":
     """Persist a build_job row and enqueue. Returns (job_uuid, ack_string).
 
     Mirrors _claim_review's persist-then-enqueue pattern. The full job_payload
@@ -3811,7 +3818,7 @@ def _claim_build_job(draft_row) -> "tuple[str, str]":
                 (
                     job_uuid, draft_row["draft_uuid"], draft_row["chat_id"],
                     draft_row["thread_id"], draft_row["requester_id"],
-                    draft_row["requester_username"], None,
+                    draft_row["requester_username"], request_msg_id,
                     draft_row["target_repo"], draft_row["target_branch"],
                     json.dumps(job_payload), idem, _now_iso(),
                 ),
@@ -4181,7 +4188,8 @@ def handle_ship(msg):
     finally:
         conn.close()
 
-    _job_uuid, ack = _claim_build_job(draft_row)
+    _job_uuid, ack = _claim_build_job(draft_row, request_msg_id=msg.get("message_id"))
+    _CHAT_JOB_REF.set(("build_job", _job_uuid))
     return ack
 
 
@@ -4231,6 +4239,7 @@ def handle_qa(msg, question: str, attachment: "dict | None" = None):
     if attachment is None and _reply_context_unavailable(msg):
         return _REPLY_CONTEXT_UNAVAILABLE_REPLY
     _job_uuid, ack = _claim_qa_job(msg, question.strip(), attachment=attachment)
+    _CHAT_JOB_REF.set(("qa_job", _job_uuid))
     return ack
 
 
@@ -5311,8 +5320,11 @@ def _start_workers():
     log.info("workers started: build, qa, review")
 
 
-def _route_update(update: dict, recent_by_chat: dict) -> None:
+def _route_update(update: dict, recent_by_chat: dict) -> dict | None:
     """Route one update; callers own intake/cursor and worker supervision."""
+    _CHAT_JOB_REF.set(None)
+    update_id = update.get("update_id")
+    _CHAT_UPDATE_ID.set(update_id if type(update_id) is int and update_id >= 0 else None)
     if update.get("my_chat_member"):
         _record_membership_update(update)
         return
@@ -5331,8 +5343,7 @@ def _route_update(update: dict, recent_by_chat: dict) -> None:
     # model/worker route. Squid Cave gets only its fixed decline;
     # unknown rooms get no response at all.
     if capability["trust_class"] == "public_untrusted":
-        _handle_public_untrusted_message(msg)
-        return
+        return _handle_public_untrusted_message(msg)
     if capability["trust_class"] != "trusted":
         return
 
@@ -5444,14 +5455,14 @@ def _route_update(update: dict, recent_by_chat: dict) -> None:
 
     # Wager refusal - hard bot-side first line, no LLM invocation.
     if _WAGER_REFUSAL_RE.match(text.strip()):
-        send_message(
+        result = _chat_send(
             chat_id, _WAGER_REFUSAL_TEXT,
             thread_id=topic_id, reply_to=msg["message_id"],
         )
         _responded.add(msg["message_id"])
         _last_reply_to[sender.get("id", 0)] = time.time()
         save_chat_message(msg, our_reply=_WAGER_REFUSAL_TEXT)
-        return
+        return {"outcome": "escalated", "message_id": _telegram_message_id(result)}
 
     response = (
         _levsec_alert_status_reply(msg)
@@ -5571,6 +5582,7 @@ def _route_update(update: dict, recent_by_chat: dict) -> None:
                     msg, question, attachment=attachment,
                 )
 
+    response_outcome = "resolved"
     if response is None:
         response = generate_response(
             msg, is_direct=is_direct, policy=policy,
@@ -5578,9 +5590,14 @@ def _route_update(update: dict, recent_by_chat: dict) -> None:
         )
         if response and response.strip().upper() == "SKIP":
             response = None
+        if not response and is_direct:
+            # Filtering, empty provider output or an inappropriate SKIP must
+            # not silently discard an admitted trusted-room request.
+            response = "I could not produce a safe answer. This request remains unresolved and needs operator review."
+            response_outcome = "held_unknown"
 
     if response:
-        result = send_message(
+        result = _chat_send(
             chat_id, response, thread_id=topic_id,
             reply_to=msg["message_id"],
         )
@@ -5597,6 +5614,13 @@ def _route_update(update: dict, recent_by_chat: dict) -> None:
         save_chat_message(msg, our_reply=response)
         if chat_id == AGENT_CHAT_GROUP_ID and sent_msg_id:
             _post_relay_receipt(sent_msg_id, chat_id, topic_id, response)
+        job_ref = _CHAT_JOB_REF.get()
+        if job_ref is not None and _durable_chat_job_exists(*job_ref):
+            return {"outcome": "handed_off", "job_table": job_ref[0], "job_uuid": job_ref[1]}
+        return {
+            "outcome": "escalated" if response == CLAUDE_OUTAGE_REPLY else response_outcome,
+            "message_id": _telegram_message_id(result),
+        }
     else:
         if text:
             save_chat_message(msg)
@@ -5606,11 +5630,148 @@ def _route_update(update: dict, recent_by_chat: dict) -> None:
 # --- Main poll loop ---------------------------------------------------------
 
 
+def _chat_send(chat_id, text, thread_id=None, reply_to=None):
+    update_id = _CHAT_UPDATE_ID.get()
+    if update_id is None or _HELM_CONTROLLER is not None:
+        return send_message(chat_id, text, thread_id=thread_id, reply_to=reply_to)
+    result = send_message_with_wal(
+        "chat_intake", str(update_id), "chat_reply", chat_id, text,
+        thread_id=thread_id, reply_to=reply_to,
+    )
+    if _telegram_message_id(result) is None:
+        raise RuntimeError("chat delivery held for receipt reconciliation")
+    return result
+
+
+def _minimal_intake_message(msg, depth=0):
+    """Keep only routing/reply fields; never persist media blobs or profiles."""
+    result = {key: msg[key] for key in (
+        "message_id", "message_thread_id", "is_topic_message", "text", "caption",
+        "migrate_to_chat_id", "migrate_from_chat_id",
+    ) if key in msg}
+    result["chat"] = {key: (msg.get("chat") or {})[key]
+                      for key in ("id", "type", "title") if key in (msg.get("chat") or {})}
+    result["from"] = {key: (msg.get("from") or {})[key]
+                      for key in ("id", "username", "first_name", "is_bot") if key in (msg.get("from") or {})}
+    for key in ("entities", "caption_entities"):
+        if key in msg:
+            result[key] = [{field: entity[field] for field in (
+                "type", "offset", "length", "url", "user",
+            ) if field in entity} for entity in msg[key]]
+            for entity in result[key]:
+                if isinstance(entity.get("user"), dict):
+                    entity["user"] = {field: entity["user"][field] for field in (
+                        "id", "username", "is_bot",
+                    ) if field in entity["user"]}
+    document = msg.get("document")
+    if isinstance(document, dict):
+        result["document"] = {key: document[key] for key in (
+            "file_id", "file_name", "mime_type", "file_size",
+        ) if key in document}
+    if isinstance(msg.get("quote"), dict):
+        result["quote"] = {key: msg["quote"][key] for key in (
+            "text", "position", "is_manual",
+        ) if key in msg["quote"]}
+    if depth < 3 and isinstance(msg.get("reply_to_message"), dict):
+        result["reply_to_message"] = _minimal_intake_message(msg["reply_to_message"], depth + 1)
+    return result
+
+
+def _admit_chat_update(update):
+    """Room authorization precedes body persistence, not merely model dispatch."""
+    minimal = {"update_id": update["update_id"]}
+    if update.get("my_chat_member"):
+        member = update["my_chat_member"]
+        minimal["my_chat_member"] = {
+            "chat": {"id": (member.get("chat") or {}).get("id")},
+            "old_chat_member": {"status": (member.get("old_chat_member") or {}).get("status")},
+            "new_chat_member": {"status": (member.get("new_chat_member") or {}).get("status")},
+        }
+        return minimal
+    msg = update.get("message")
+    if not isinstance(msg, dict):
+        return minimal
+    capability = _room_capability((msg.get("chat") or {}).get("id"))
+    if capability["trust_class"] == "trusted":
+        minimal["message"] = _minimal_intake_message(msg)
+    elif capability["trust_class"] == "public_untrusted" and _is_fixed_public_hail(msg):
+        # Preserve only a yes/no hail signal, not attacker-controlled prose,
+        # entities, document IDs, quoted bodies or profile metadata.
+        minimal["message"] = {
+            "message_id": msg.get("message_id"),
+            "message_thread_id": msg.get("message_thread_id"),
+            "chat": {"id": (msg.get("chat") or {}).get("id")},
+            "from": {"username": (msg.get("from") or {}).get("username", "")},
+            "text": "@" + BOT_USERNAME,
+        }
+    elif msg.get("migrate_to_chat_id"):
+        minimal["message"] = {
+            "message_id": msg.get("message_id"),
+            "chat": {"id": (msg.get("chat") or {}).get("id")},
+            "migrate_to_chat_id": msg["migrate_to_chat_id"],
+        }
+    return minimal
+
+
+_CHAT_JOB_COLUMNS = {"qa_job": "job_uuid", "build_job": "job_uuid", "pr_review": "review_uuid"}
+
+
+def _durable_chat_job_exists(table, job_uuid):
+    column = _CHAT_JOB_COLUMNS.get(table)
+    if column is None:
+        return False
+    with closing(sqlite3.connect(str(DB_FILE), timeout=5)) as conn:
+        return conn.execute(f"SELECT 1 FROM {table} WHERE {column}=?", (job_uuid,)).fetchone() is not None
+
+
+def _reconcile_chat_handoffs(intake):
+    """A queued acknowledgement never substitutes for the job's final receipt."""
+    with closing(sqlite3.connect(str(DB_FILE), timeout=5)) as conn:
+        for event in intake.handoffs():
+            table, job_uuid = event["job_table"], event["job_uuid"]
+            column = _CHAT_JOB_COLUMNS.get(table)
+            if column is None:
+                continue
+            row = conn.execute(f"SELECT status FROM {table} WHERE {column}=?", (job_uuid,)).fetchone()
+            if row is None or row[0] not in {"answered", "declined", "succeeded", "posted", "failed", "orphaned"}:
+                continue
+            receipt = conn.execute(
+                "SELECT telegram_message_id FROM outgoing_msg WHERE job_table=? AND job_uuid=? "
+                "AND telegram_message_id>0 ORDER BY id DESC LIMIT 1", (table, job_uuid),
+            ).fetchone()
+            if receipt is not None:
+                outcome = "resolved" if row[0] in {"answered", "succeeded", "posted"} else "escalated"
+                intake.complete_handoff(event["update_id"], table, job_uuid, outcome, receipt[0])
+
+
+def _chat_maintenance(intake=None):
+    if len(_responded) > _MAX_STATE_SIZE:
+        _responded.clear()
+    if len(_msg_root) > _MAX_STATE_SIZE:
+        _msg_root.clear()
+        _thread_depth.clear()
+    stale = [key for key, value in _last_reply_to.items() if time.time() - value > 3600]
+    for key in stale:
+        del _last_reply_to[key]
+    _prune_chat_history()
+    sweep_benthic_pending()
+    if intake is not None:
+        intake.prune_terminal()
+
+
 def poll():
+    # The OS owns release of this lock after process death. Never use a stale
+    # file's existence as ownership proof or delete it to force a second poller.
+    with PollOwner(DB_FILE.parent / "poll-owner.lock"):
+        _poll_owned()
+
+
+def _poll_owned():
+    intake = ChatIntake(DB_FILE.parent / "chat-intake.db") if _HELM_CONTROLLER is None else None
     offset = (
         _HELM_CONTROLLER.durable_offset()
         if _HELM_CONTROLLER is not None
-        else 0
+        else intake.offset()
     )
     recent_by_chat = {}
 
@@ -5644,6 +5805,17 @@ def poll():
     except Exception as exc:
         log.exception("recovery on boot failed (non-fatal): %s", exc)
     _start_workers()
+    dispatcher = None
+    if intake is not None:
+        held = intake.hold_interrupted()
+        if held:
+            log.warning("interrupted chat claims held=%s", held)
+        dispatcher = ChatDispatcher(
+            intake, lambda update: _route_update(update, recent_by_chat) or {"outcome": "no_reply"},
+            maintenance=lambda: _chat_maintenance(intake),
+        )
+        dispatcher.start()
+    last_status_at = 0
 
     while True:
         try:
@@ -5652,12 +5824,25 @@ def poll():
                 "timeout": POLL_TIMEOUT,
                 "allowed_updates": ["message", "my_chat_member"],
             })
+            if not isinstance(updates, dict) or updates.get("ok") is not True or not isinstance(updates.get("result"), list):
+                raise RuntimeError("Telegram intake lacks a confirmed update batch")
             if _HELM_CONTROLLER is not None:
                 # Successful long-poll completion is the watcher health signal.
                 # A timer cannot renew this lease without proving Telegram
                 # intake actually returned.
                 _HELM_CONTROLLER.heartbeat_watcher(HELM_WATCHER_TTL_SECONDS)
-            for update in updates.get("result", []):
+            batch = updates.get("result", [])
+            if intake is not None:
+                # One commit admits the whole minimized batch and advances its
+                # cursor. A failed commit leaves Telegram offset unchanged.
+                intake.ingest_batch([_admit_chat_update(update) for update in batch])
+                offset = intake.offset()
+                _reconcile_chat_handoffs(intake)
+                if time.time() - last_status_at >= 60:
+                    log.info("chat intake outcomes=%s router_alive=%s", intake.snapshot(), dispatcher.alive())
+                    last_status_at = time.time()
+                continue
+            for update in batch:
                 if _HELM_CONTROLLER is not None:
                     queued = _HELM_CONTROLLER.enqueue_update(update)
                     event_id = queued["event_id"]
@@ -5668,8 +5853,6 @@ def poll():
                     # route or answer.  Sol claims the already-queued event.
                     if not _HELM_CONTROLLER.route_allowed(HELM_ACTOR, event_id):
                         continue
-                else:
-                    offset = update["update_id"] + 1
                 _route_update(update, recent_by_chat)
             if len(_responded) > _MAX_STATE_SIZE:
                 _responded.clear()
@@ -5686,21 +5869,23 @@ def poll():
             log.info("Shutting down")
             break
         except Exception as exc:
-            # 409 Conflict = another getUpdates poller is active (or Telegram's
-            # server still holds a stale session). deleteWebhook is idempotent
-            # and harmless; call it to drop any lingering state and let the
-            # next iteration re-poll cleanly.
+            # A 409 is competing intake, not permission to interfere with the
+            # other actor or erase its pending updates. Back off for inspection.
             exc_msg = str(exc)
             if "409" in exc_msg or "Conflict" in exc_msg:
-                log.warning("Poll 409 — dropping stale poller state and retrying")
-                try:
-                    tg_request("deleteWebhook", {"drop_pending_updates": False})
-                except Exception:
-                    pass
+                log.warning("Poll conflict — competing intake requires ownership inspection")
                 time.sleep(10)
             else:
-                log.error("Poll error: %s", exc)
+                log.error("Poll error class=%s", type(exc).__name__)
                 time.sleep(5)
+    if dispatcher is not None:
+        if not dispatcher.stop(1):
+            log.warning("waiting for owned chat router before releasing poll ownership")
+            # Never release the singleton while this process still has a
+            # thread capable of sending. A truly stuck thread requires a
+            # process-level supervisor kill, not a second routing thread.
+            while not dispatcher.stop(1):
+                pass
 
 
 if __name__ == "__main__":

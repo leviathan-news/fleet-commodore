@@ -132,9 +132,9 @@ failure behavior, and release acceptance.
 
 ## Tests
 
-For send uncertainty and the not-yet-wired durable intake component, see
-[Chat delivery certainty](docs/CHAT_DELIVERY.md). Do not mistake the storage
-component for nonblocking polling or activate helm as a workaround.
+For send uncertainty, ordinary nonblocking intake, held-request inspection and
+remaining cutover gates, see [Chat delivery certainty](docs/CHAT_DELIVERY.md).
+Do not mistake source tests for live readiness or activate helm as a workaround.
 
 For authentication outages, heartbeat semantics and live recovery verification,
 see [Provider outage recovery](docs/CLAUDE_RECOVERY.md).
