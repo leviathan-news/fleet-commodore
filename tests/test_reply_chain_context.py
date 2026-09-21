@@ -135,6 +135,7 @@ def test_qa_correction_follows_final_current_question_not_stale_parent(monkeypat
     worker_prompt = qa_worker.QA_PROMPT_TEMPLATE.format(
         source_policy="", requester="zero", channel="Lev Dev",
         question=current_question, reply_context=qa_worker.format_reply_context(context),
+        recent_context="",
         attachment_context="",
     )
     assert worker_prompt.index("PR #1119") < worker_prompt.index("CURRENT QUESTION — AUTHORITATIVE")
@@ -197,6 +198,84 @@ def test_qa_persists_realistic_direct_quote_and_durable_root(monkeypatch, tmp_pa
     result = codex_qa.answer({"qa_uuid": job_uuid, "question": msg["text"], "reply_context": context})
     assert result["status"] == "declined"
     assert captured["reply_chain_context"] == context
+
+
+def test_unquoted_qa_snapshots_recent_same_room_subject(monkeypatch, tmp_path):
+    monkeypatch.setattr(commodore, "DB_FILE", tmp_path / "commodore.db")
+    commodore._ensure_tables()
+    while not commodore._qa_queue.empty():
+        commodore._qa_queue.get_nowait()
+    commodore._qa_cooldown_by_user.pop(REQUESTER_ID, None)
+    now = 1_800_000_000
+    receipt = {
+        "message_id": 1171, "date": now - 60,
+        "chat": {"id": CHAT_ID}, "message_thread_id": TOPIC_ID,
+        "from": {"username": "lnn_headline_bot", "is_bot": True},
+        "text": "24h X test read for alex-zero-x-v3: receipt #80.",
+    }
+    current = {
+        "message_id": 1172, "date": now,
+        "chat": {"id": CHAT_ID}, "message_thread_id": TOPIC_ID,
+        "from": {"id": REQUESTER_ID, "username": "alex"},
+        "text": "How many more days or test reads until we conclude the A/B test?",
+    }
+    job_uuid, _ack = commodore._claim_qa_job(
+        current, current["text"], recent_messages=[receipt, current],
+    )
+    with sqlite3.connect(commodore.DB_FILE) as conn:
+        row = conn.execute(
+            "SELECT reply_context_json, recent_context_json FROM qa_job WHERE job_uuid=?",
+            (job_uuid,),
+        ).fetchone()
+    assert json.loads(row[0]) == []
+    recent = json.loads(row[1])
+    assert [entry["message_id"] for entry in recent] == [1171]
+    assert recent[0]["sender_is_bot"] is True
+    assert "alex-zero-x-v3" in recent[0]["text"]
+
+
+def test_recent_qa_context_excludes_foreign_old_future_and_current_messages():
+    now = 1_800_000_000
+    current = {
+        "message_id": 50, "date": now,
+        "chat": {"id": CHAT_ID}, "message_thread_id": TOPIC_ID,
+    }
+    def prior(message_id, *, chat=CHAT_ID, topic=TOPIC_ID, date=now - 1, text="candidate"):
+        return {"message_id": message_id, "date": date, "chat": {"id": chat},
+                "message_thread_id": topic, "from": {"username": "u"}, "text": text}
+    context = commodore._recent_qa_context(current, [
+        prior(1, chat=CHAT_ID + 1),
+        prior(2, topic=TOPIC_ID + 1),
+        prior(3, date=now - commodore._MAX_RECENT_QA_CONTEXT_AGE_S - 1),
+        prior(4, date=now + 1),
+        prior(50),
+        prior(5, text="the valid subject"),
+    ])
+    assert [entry["message_id"] for entry in context] == [5]
+
+
+def test_exact_reply_or_missing_exact_reply_suppresses_ambient_context(monkeypatch, tmp_path):
+    msg = _seed_cookie_thread(tmp_path, monkeypatch)
+    now = 1_800_000_000
+    msg["date"] = now
+    ambient = [{
+        "message_id": 1119, "date": now - 1, "chat": {"id": CHAT_ID},
+        "message_thread_id": TOPIC_ID, "from": {"username": "other"},
+        "text": "unrelated expiry PR",
+    }]
+    assert commodore._recent_qa_context(msg, ambient) == []
+
+    captured = {}
+    def ask(prompt, **_kwargs):
+        captured.update(json.loads(prompt))
+        return json.dumps({"status": "conversational", "answer": "Which subject?"})
+    monkeypatch.setattr(codex_qa, "ask", ask)
+    codex_qa.answer({
+        "question": "Can you check that?",
+        "reply_context": [qa_worker.MISSING_REPLY_CONTEXT],
+        "recent_context": ambient,
+    })
+    assert captured["recent_room_context"] == []
 
 
 def test_quote_text_is_the_direct_referent_not_a_stale_local_copy(monkeypatch, tmp_path):

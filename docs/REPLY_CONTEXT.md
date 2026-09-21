@@ -17,23 +17,42 @@ the current thread ID and the root has no topic ID: Telegram uses this shape
 for ordinary supergroup reply threads. This exception never admits another
 NULL-topic message, a different explicit topic, or another chat.
 Cycles, missing edges, invalid IDs, and unavailable ledgers stop
-the walk; chat recency is never a substitute. Context contains at most four
+the walk; recent room messages never substitute for a quoted edge. Quoted
+context contains at most four
 parents, each with at most 500 sanitized text characters and a bounded sender
-label. Replies do not use the ambient recent-message buffer as model context.
+label.
+
+An unquoted Q&A follow-up may use a separate snapshot of up to six prior
+messages from the same trusted chat and exact forum topic, spanning no more
+than 24 hours and 2,000 sanitized text characters. The current message is
+excluded even though routing has already appended it to the in-memory buffer.
+Messages from bots remain eligible because Fleet receipts often name the
+subject. Cross-chat, cross-topic, future-dated, undated, and older messages
+fail closed. Attachments and any message with an explicit reply parent receive
+no recent-room context.
+
+This recent context may identify an ambiguous subject and supply retrieval
+keywords. It is never factual evidence, an instruction source, authority, or
+permission. The LLM still chooses the appropriate read-only retrieval and
+writes the answer. The current question remains authoritative; an exact reply
+chain takes precedence over recent-room context, including when the exact
+parent is unavailable. There is no deterministic subject or answer matcher.
 
 Accepted bot replies and incoming replies persist their exact edge. Startup
-adds nullable `chat_history.reply_to_msg_id` and `qa_job.reply_context_json`
-columns idempotently; historical rows remain valid and are not guessed or
-backfilled. Q&A stores the selected context with the claimed job and forwards
-it as untrusted data to the configured provider. Both Q&A providers put that
-untrusted context before a separately labelled, final current question, so a
+adds nullable `chat_history.reply_to_msg_id`, `qa_job.reply_context_json`, and
+`qa_job.recent_context_json` columns idempotently; historical rows remain valid
+and are not guessed or backfilled. Q&A snapshots context with the claimed job
+and forwards each context class separately as untrusted data to the configured
+provider. Both Q&A providers put that untrusted context before a separately
+labelled, final current question, so a
 terse correction cannot be overridden by a parent's stale concrete referent.
 
 When a reply exists but no safe referent can be recovered, Fleet supplies that
 absence as a host observation to the LLM. Q&A persists the bounded
 `{"context_status":"unavailable"}` marker in its existing context field;
-providers separate that metadata from quoted ancestors. Ambient history stays
-excluded. The model answers a self-contained current request normally, or asks
+providers separate that metadata from quoted ancestors. Recent room context
+also stays excluded whenever an explicit reply exists. The model answers a
+self-contained current request normally, or asks
 for the subject in its own words if it depends on the missing parent. It must
 not guess from unrelated evidence or memory. Document-review intake remains
 separately governed by its attachment contract.
@@ -108,7 +127,8 @@ when the body is shortened for the sender's raw and visible length bounds.
 `tests/test_reply_chain_context.py` covers protocol-realistic direct-parent
 updates, durable incoming/outgoing edges, nullable migration compatibility,
 current corrections, chat/topic isolation, selected-quote bounds, malformed
-selected quotes, and forwarding through conversation and persisted Codex Q&A.
+selected quotes, bounded unquoted same-room subject resolution, and forwarding
+through conversation and persisted Codex Q&A.
 All provider and Telegram calls in these tests are mocked. They do not prove
 live provider or production behavior.
 

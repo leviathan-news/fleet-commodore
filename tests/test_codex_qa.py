@@ -75,6 +75,41 @@ def test_live_sql_result_is_provided_with_receipt(monkeypatch, tmp_path):
     assert result["tools_used"] == ["sql"]
 
 
+def test_recent_room_context_resolves_subject_but_requires_current_sql(monkeypatch):
+    calls = []
+    source = "postgresql://commodore-reader/current-observation"
+    monkeypatch.setattr(
+        codex_qa, "execute_sql",
+        lambda query: {"columns": ["experiment_key", "expires_at", "reads"],
+                       "rows": [["alex-zero-x-v3", "2026-09-23T16:00:00Z", 53]]},
+    )
+    def ask(prompt, **_kwargs):
+        value = json.loads(prompt)
+        calls.append(value)
+        if not value["evidence"]:
+            assert "alex-zero-x-v3" in value["recent_room_context"][0]["text"]
+            return json.dumps({"request": "sql", "query": "SELECT current experiment state"})
+        result = value["evidence"][0]["result"]
+        nonlocal source
+        source = result["source"]
+        return json.dumps({
+            "status": "answered", "basis": "current",
+            "answer": "alex-zero-x-v3 currently has 53 reads and ends September 23.",
+            "citations": [source],
+        })
+    monkeypatch.setattr(codex_qa, "ask", ask)
+    result = codex_qa.answer({
+        "question": "How many more days or test reads until we conclude the A/B test?",
+        "recent_context": [{"message_id": 1171, "sender": "@lnn_headline_bot",
+                            "sender_is_bot": True,
+                            "text": "24h X test read for alex-zero-x-v3: receipt #80."}],
+    })
+    assert result["status"] == "answered"
+    assert result["tools_used"] == ["sql"]
+    assert result["citations"] == [source]
+    assert calls[0]["evidence"] == []
+
+
 def test_sensitive_question_is_declined_before_model(monkeypatch):
     monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("model reached")))
     assert codex_qa.answer({"question": "What is the bot token?"})["status"] == "declined"
