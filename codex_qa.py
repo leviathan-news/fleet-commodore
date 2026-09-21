@@ -151,6 +151,7 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
     )).expanduser())
     evidence, sources, used_tools = [], set(), []
     current_sources = set()
+    successful_search = False
     deadline = time.monotonic() + timeout
     model = os.environ.get("CODEX_QA_MODEL", "gpt-5.6-luna")
     max_steps = 6 if recent_context and not attachment_mode else 4
@@ -201,9 +202,9 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
         if status is not None and not isinstance(status, str):
             break
         if status == "declined":
-            if recent_context and not used_tools and step < max_steps - 1:
+            if recent_context and step < max_steps - 1:
                 evidence.append({
-                    "broker_error": "Recent room context identified a concrete subject, but it is a lookup key rather than the answer. Attempt the appropriate available retrieval before asking the user for facts or declining."
+                    "broker_error": "Recent room context identified a concrete subject, but it is a lookup key rather than the answer. The bounded lookup is not yet exhausted. If search returned a path, read that source; use SQL for current counts, state, or timing. Do not ask the user for facts available through those sources."
                 })
                 continue
             return {**base, "status": status,
@@ -236,6 +237,11 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
                     "citations": [], "tools_used": used_tools}
         if attachment_mode or not isinstance(tool, str) or tool not in allowed_tools:
             break
+        if tool == "search" and successful_search:
+            evidence.append({
+                "broker_error": "A prior search already returned matching source paths. Do not repeat search wording. Read a returned path, or use SQL when the question asks for current counts, state, or timing. No new search was executed."
+            })
+            continue
         if time.monotonic() + 20 > deadline:
             break
         try:
@@ -246,6 +252,8 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
                 result = reader.search(query)
                 if not result.get("results") and "error" not in result:
                     result["guidance"] = "No literal AND match. Retry with fewer distinctive subject words before concluding the document is unavailable; dates and wording may differ."
+                elif result.get("results"):
+                    successful_search = True
             elif tool == "read":
                 path = decision.get("path")
                 if not isinstance(path, str) or path not in sources:

@@ -134,6 +134,29 @@ def test_recent_subject_retries_premature_decline_before_retrieval(monkeypatch, 
     assert prompts[0]["steps_remaining"] == 6
 
 
+def test_recent_subject_rejects_repeat_search_and_continues_from_found_path(monkeypatch, tmp_path):
+    path = fixture_knowledge(monkeypatch, tmp_path)
+    replies = iter([
+        {"request": "search", "query": "stable fixture"},
+        {"request": "search", "query": "fixture workflow"},
+        {"request": "read", "path": path},
+        {"status": "answered", "basis": "reference",
+         "answer": "The named workflow is documented.", "citations": [path]},
+    ])
+    prompts = []
+    monkeypatch.setattr(
+        codex_qa, "ask",
+        lambda prompt, **_kwargs: prompts.append(json.loads(prompt)) or json.dumps(next(replies)),
+    )
+    result = codex_qa.answer({
+        "question": "What does that workflow require?",
+        "recent_context": [{"message_id": 9, "text": "The stable fixture workflow"}],
+    })
+    assert result["status"] == "answered"
+    assert result["tools_used"] == ["search", "read"]
+    assert "prior search already returned" in prompts[2]["evidence"][-1]["broker_error"]
+
+
 def test_sensitive_question_is_declined_before_model(monkeypatch):
     monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("model reached")))
     assert codex_qa.answer({"question": "What is the bot token?"})["status"] == "declined"
