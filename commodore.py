@@ -1044,6 +1044,7 @@ def _ensure_tables():
                 attachment_name TEXT,
                 attachment_text TEXT,
                 reply_context_json TEXT,
+                recent_context_json TEXT,
                 status TEXT NOT NULL,
                 answer_summary TEXT,
                 declined_reason TEXT,
@@ -1163,6 +1164,11 @@ def _ensure_tables():
         # separate from the question so a correction can remain the actual
         # request rather than being buried in a chat-wide history scrape.
         _safe_column_add(conn, "qa_job", "reply_context_json", "TEXT")
+        # Natural follow-ups may name a subject only in the immediately
+        # preceding room messages. Snapshot a tightly bounded same-topic
+        # window at claim time; providers receive it as untrusted referent
+        # context, never as evidence or authority.
+        _safe_column_add(conn, "qa_job", "recent_context_json", "TEXT")
         # Telegram sends only the direct quoted parent in an update. Preserve
         # exact reply edges locally so a later reply can walk known parents
         # without guessing from recent chat history.
@@ -1498,6 +1504,10 @@ def sweep_benthic_pending():
 
 _MAX_REPLY_CONTEXT_PARENTS = 4
 _MAX_REPLY_CONTEXT_TEXT = 500
+_MAX_RECENT_QA_CONTEXT_MESSAGES = 6
+_MAX_RECENT_QA_CONTEXT_TEXT = 500
+_MAX_RECENT_QA_CONTEXT_TOTAL = 2000
+_MAX_RECENT_QA_CONTEXT_AGE_S = 24 * 60 * 60
 
 
 def _reply_message_text(msg: dict) -> str:
@@ -1652,6 +1662,91 @@ def _reply_context_from_json(raw: object) -> list[dict]:
     if not isinstance(value, list):
         return []
     return [entry for entry in value[:_MAX_REPLY_CONTEXT_PARENTS] if isinstance(entry, dict)]
+
+
+def _recent_qa_context(msg: dict, recent_messages: object) -> list[dict]:
+    """Snapshot prior same-chat/topic messages for unquoted referent resolution.
+
+    Telegram's update timestamp is required so malformed or hand-crafted input
+    fails closed. Exact reply chains are authoritative and suppress this
+    ambient window entirely.
+    """
+    if not isinstance(msg, dict) or isinstance(msg.get("reply_to_message"), dict):
+        return []
+    if not isinstance(recent_messages, list):
+        return []
+    chat = msg.get("chat") or {}
+    if not isinstance(chat, dict):
+        return []
+    chat_id = chat.get("id")
+    topic_id = msg.get("message_thread_id")
+    current_id = msg.get("message_id")
+    current_date = msg.get("date")
+    if type(current_date) is not int or current_date <= 0:
+        return []
+
+    selected: list[dict] = []
+    total = 0
+    for prior in reversed(recent_messages):
+        if not isinstance(prior, dict):
+            continue
+        prior_chat = prior.get("chat") or {}
+        if not isinstance(prior_chat, dict) or prior_chat.get("id") != chat_id:
+            continue
+        if prior.get("message_thread_id") != topic_id:
+            continue
+        if prior.get("message_id") == current_id:
+            continue
+        prior_date = prior.get("date")
+        if type(prior_date) is not int:
+            continue
+        age = current_date - prior_date
+        if age < 0 or age > _MAX_RECENT_QA_CONTEXT_AGE_S:
+            continue
+        text = sanitize_untrusted(
+            str(_reply_message_text(prior) or ""),
+            max_len=_MAX_RECENT_QA_CONTEXT_TEXT,
+        )
+        if not text.strip():
+            continue
+        remaining = _MAX_RECENT_QA_CONTEXT_TOTAL - total
+        if remaining <= 0:
+            break
+        text = text[:remaining]
+        sender = prior.get("from") or {}
+        if not isinstance(sender, dict):
+            sender = {}
+        name = sanitize_untrusted(
+            str(sender.get("username") or sender.get("first_name") or "?"),
+            max_len=30,
+        )
+        selected.append({
+            "message_id": prior.get("message_id"),
+            "sender": "@" + name,
+            "sender_is_bot": sender.get("is_bot") is True,
+            "text": text,
+        })
+        total += len(text)
+        if len(selected) >= _MAX_RECENT_QA_CONTEXT_MESSAGES:
+            break
+    selected.reverse()
+    return selected
+
+
+def _recent_context_from_json(raw: object) -> list[dict]:
+    """Decode persisted recent-room context defensively for worker payloads."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [
+        entry for entry in value[:_MAX_RECENT_QA_CONTEXT_MESSAGES]
+        if isinstance(entry, dict)
+    ]
 
 
 def _reply_context_prompt(context: list[dict]) -> str:
@@ -3889,7 +3984,8 @@ def _claim_build_job(draft_row, request_msg_id=None) -> "tuple[str, str]":
 
 
 def _claim_qa_job(msg, question: str,
-                  attachment: "dict | None" = None) -> "tuple[str, str]":
+                  attachment: "dict | None" = None,
+                  recent_messages: "list[dict] | None" = None) -> "tuple[str, str]":
     """Persist a qa_job row and enqueue. Returns (job_uuid, ack_string)."""
     job_uuid = str(_uuid_mod.uuid4())
     sender = msg.get("from", {}) or {}
@@ -3903,6 +3999,8 @@ def _claim_qa_job(msg, question: str,
         from qa_worker import MISSING_REPLY_CONTEXT
         reply_context = [MISSING_REPLY_CONTEXT]
     reply_context_json = json.dumps(reply_context, ensure_ascii=False)
+    recent_context = [] if attachment else _recent_qa_context(msg, recent_messages)
+    recent_context_json = json.dumps(recent_context, ensure_ascii=False)
 
     # Per-user cooldown.
     last = _qa_cooldown_by_user.get(requester_id, 0.0)
@@ -3933,14 +4031,15 @@ def _claim_qa_job(msg, question: str,
                 """INSERT INTO qa_job
                    (job_uuid, chat_id, topic_id, requester_id, requester_username,
                     request_msg_id, question, attachment_name, attachment_text,
-                    reply_context_json, status, idempotency_key, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                    reply_context_json, recent_context_json, status,
+                    idempotency_key, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
                 (
                     job_uuid, chat_id, topic_id, requester_id, requester_username,
                     request_msg_id, question[:4000],
                     (attachment or {}).get("name"),
                     (attachment or {}).get("text"),
-                    reply_context_json, idem, _now_iso(),
+                    reply_context_json, recent_context_json, idem, _now_iso(),
                 ),
             )
             conn.commit()
@@ -4242,7 +4341,8 @@ def handle_abandon(msg):
     return "The dispatch is struck from the orders book."
 
 
-def handle_qa(msg, question: str, attachment: "dict | None" = None):
+def handle_qa(msg, question: str, attachment: "dict | None" = None,
+              recent_messages: "list[dict] | None" = None):
     """Read-only Q&A: enqueues a qa_job and returns the immediate ack."""
     if not _can_qa(msg):
         return (
@@ -4251,7 +4351,10 @@ def handle_qa(msg, question: str, attachment: "dict | None" = None):
         )
     if not question or not question.strip():
         return None  # let the normal chat handler deal with empty
-    _job_uuid, ack = _claim_qa_job(msg, question.strip(), attachment=attachment)
+    _job_uuid, ack = _claim_qa_job(
+        msg, question.strip(), attachment=attachment,
+        recent_messages=recent_messages,
+    )
     _CHAT_JOB_REF.set(("qa_job", _job_uuid))
     return ack
 
@@ -4924,6 +5027,7 @@ def _process_qa(job_uuid: str) -> None:
                 "attachment_name": row["attachment_name"],
                 "attachment_text": row["attachment_text"],
                 "reply_context": _reply_context_from_json(row["reply_context_json"]),
+                "recent_context": _recent_context_from_json(row["recent_context_json"]),
                 "requester": row["requester_username"] or "unknown",
                 "channel": chat_id,
             })
@@ -5590,6 +5694,7 @@ def _route_update(update: dict, recent_by_chat: dict) -> dict | None:
             if question is not None:
                 response = handle_qa(
                     msg, question, attachment=attachment,
+                    recent_messages=recent_by_chat.get(context_key, []),
                 )
 
     response_outcome = "resolved"
