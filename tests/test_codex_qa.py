@@ -86,6 +86,7 @@ def test_recent_room_context_resolves_subject_but_requires_current_sql(monkeypat
     def ask(prompt, **_kwargs):
         value = json.loads(prompt)
         calls.append(value)
+        assert "Recent context is not expected to contain the requested answer" in _kwargs["instruction"]
         if not value["evidence"]:
             assert "alex-zero-x-v3" in value["recent_room_context"][0]["text"]
             return json.dumps({"request": "sql", "query": "SELECT current experiment state"})
