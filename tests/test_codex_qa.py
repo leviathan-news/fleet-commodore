@@ -111,6 +111,29 @@ def test_recent_room_context_resolves_subject_but_requires_current_sql(monkeypat
     assert calls[0]["evidence"] == []
 
 
+def test_recent_subject_retries_premature_decline_before_retrieval(monkeypatch, tmp_path):
+    path = fixture_knowledge(monkeypatch, tmp_path)
+    replies = iter([
+        {"status": "declined", "declined_reason": "The room excerpt lacks the answer."},
+        {"request": "search", "query": "stable fixture"},
+        {"status": "answered", "basis": "reference",
+         "answer": "The named workflow is documented.", "citations": [path]},
+    ])
+    prompts = []
+    monkeypatch.setattr(
+        codex_qa, "ask",
+        lambda prompt, **_kwargs: prompts.append(json.loads(prompt)) or json.dumps(next(replies)),
+    )
+    result = codex_qa.answer({
+        "question": "What does that workflow require?",
+        "recent_context": [{"message_id": 9, "text": "The stable fixture workflow"}],
+    })
+    assert result["status"] == "answered"
+    assert result["tools_used"] == ["search"]
+    assert "lookup key rather than the answer" in prompts[1]["evidence"][0]["broker_error"]
+    assert prompts[0]["steps_remaining"] == 6
+
+
 def test_sensitive_question_is_declined_before_model(monkeypatch):
     monkeypatch.setattr(codex_qa, "ask", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("model reached")))
     assert codex_qa.answer({"question": "What is the bot token?"})["status"] == "declined"
