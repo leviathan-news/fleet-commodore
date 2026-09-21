@@ -87,6 +87,7 @@ def test_recent_room_context_resolves_subject_but_requires_current_sql(monkeypat
         value = json.loads(prompt)
         calls.append(value)
         assert "Recent context is not expected to contain the requested answer" in _kwargs["instruction"]
+        assert "what remains, how much longer" in _kwargs["instruction"]
         if not value["evidence"]:
             assert "alex-zero-x-v3" in value["recent_room_context"][0]["text"]
             return json.dumps({"request": "sql", "query": "SELECT current experiment state"})
@@ -131,7 +132,7 @@ def test_recent_subject_retries_premature_decline_before_retrieval(monkeypatch, 
     assert result["status"] == "answered"
     assert result["tools_used"] == ["search"]
     assert "lookup key rather than the answer" in prompts[1]["evidence"][0]["broker_error"]
-    assert prompts[0]["steps_remaining"] == 6
+    assert prompts[0]["steps_remaining"] == 8
 
 
 def test_recent_subject_rejects_repeat_search_and_continues_from_found_path(monkeypatch, tmp_path):
