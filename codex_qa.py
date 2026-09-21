@@ -116,6 +116,12 @@ GitHub or SQL observations that support them. Use basis=reference for historical
 or documentation questions. The broker checks current-source provenance; a
 reference document is not a current observation even if recently modified.
 For live quantities obtain current SQL evidence; don't substitute remembered facts.
+Questions about what remains, how much longer, whether something is still
+active, or an end/due point relative to now are current-state questions even
+when the user does not say "current" or "latest". A reference document may
+explain the contract and schema, but its planned cutoff or recorded count does
+not establish the live state. Retrieve SQL (or the designated current source)
+before answering, use basis=current, and cite that current observation.
 If evidence is inadequate, use declined_reason for a useful plain-language
 limitation about the actual subject, with one concrete clarifying question
 when it would unblock the answer. Do not use ceremonial refusal language.
@@ -154,7 +160,10 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
     successful_search = False
     deadline = time.monotonic() + timeout
     model = os.environ.get("CODEX_QA_MODEL", "gpt-5.6-luna")
-    max_steps = 6 if recent_context and not attachment_mode else 4
+    # Context-resolved follow-ups may need a document search/read followed by
+    # SQL schema discovery and a live query. Keep that chain bounded while
+    # leaving ordinary self-contained questions at the existing four steps.
+    max_steps = 8 if recent_context and not attachment_mode else 4
     for step in range(max_steps):
         remaining = int(deadline - time.monotonic())
         if remaining < 5:
