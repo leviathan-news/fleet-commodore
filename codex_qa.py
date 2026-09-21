@@ -58,6 +58,10 @@ use that key with the appropriate available retrieval before asking the user
 for facts. For plans, experiment rules, or unfamiliar database entities, search
 reference documents for the named key and schema first, then use SQL when the
 question asks for current counts, state, or timing.
+Do not decline for missing facts in recent_room_context before attempting a
+lookup. After a successful search for the named identifier, use its returned
+paths and excerpts to choose the next source; do not spend the remaining steps
+on alternate search wording unless the prior search was empty.
 You cannot see image pixels. Image-presence markers and captions can identify
 the subject but do not prove what an image depicts. Ask for the page URL or
 specific missing detail if necessary; never claim to have inspected an image.
@@ -149,7 +153,8 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
     current_sources = set()
     deadline = time.monotonic() + timeout
     model = os.environ.get("CODEX_QA_MODEL", "gpt-5.6-luna")
-    for step in range(4):
+    max_steps = 6 if recent_context and not attachment_mode else 4
+    for step in range(max_steps):
         remaining = int(deadline - time.monotonic())
         if remaining < 5:
             break
@@ -169,7 +174,7 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
             "recent_room_context": recent_context,
             "attachment_mode": attachment_mode,
             "attachment": {"name": str(job.get("attachment_name") or "")[:120], "text": attachment},
-            "evidence": evidence, "steps_remaining": 4 - step,
+            "evidence": evidence, "steps_remaining": max_steps - step,
             "current_question": question,
         }, ensure_ascii=False)
         raw = ask(prompt, model=model, timeout=min(55, remaining), instruction=INSTRUCTION,
@@ -196,6 +201,11 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
         if status is not None and not isinstance(status, str):
             break
         if status == "declined":
+            if recent_context and not used_tools and step < max_steps - 1:
+                evidence.append({
+                    "broker_error": "Recent room context identified a concrete subject, but it is a lookup key rather than the answer. Attempt the appropriate available retrieval before asking the user for facts or declining."
+                })
+                continue
             return {**base, "status": status,
                     "declined_reason": str(decision.get("declined_reason") or "Evidence unavailable.")[:500],
                     "citations": [], "tools_used": used_tools}
@@ -219,7 +229,8 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
                     "citations": [] if attachment_mode else citations[:3], "tools_used": used_tools}
         tool = decision.get("request")
         allowed_tools = {"search", "read", "sql", "github_pulls", "github_pull"}
-        if not attachment_mode and isinstance(tool, str) and tool in allowed_tools and step == 3:
+        if (not attachment_mode and isinstance(tool, str)
+                and tool in allowed_tools and step == max_steps - 1):
             return {**base, "status": "declined", "declined_reason":
                     "I couldn't verify that within this lookup. Could you share the relevant source or page?",
                     "citations": [], "tools_used": used_tools}
