@@ -1,6 +1,8 @@
 """Telegram text-document intake and durable Q&A handoff regressions."""
 
+from io import BytesIO
 import sqlite3
+import zipfile
 
 import pytest
 
@@ -130,7 +132,6 @@ def test_downloads_40442_byte_markdown_without_truncation(monkeypatch):
     "overrides, expected",
     [
         ({"file_name": "review.pdf", "mime_type": "application/pdf"}, "not an accepted"),
-        ({"file_name": "review.md", "mime_type": "application/pdf"}, "MIME type"),
         (
             {"file_size": commodore.TELEGRAM_TEXT_DOCUMENT_MAX_BYTES + 1},
             "review limit",
@@ -147,6 +148,85 @@ def test_rejects_unsupported_or_oversized_metadata_without_network(
     )
     with pytest.raises(commodore.TelegramDocumentIntakeError, match=expected):
         commodore.download_telegram_text_document(_document_message(**overrides))
+
+
+def test_misleading_mime_is_advisory_when_markdown_decodes(monkeypatch):
+    body = b"# Readable despite Telegram metadata"
+    msg = _document_message(
+        body_size=len(body), file_name="review.md", mime_type="application/pdf"
+    )
+    monkeypatch.setattr(
+        commodore,
+        "tg_request",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "result": {"file_path": "documents/review.md", "file_size": len(body)},
+        },
+    )
+    monkeypatch.setattr(
+        commodore.urllib.request,
+        "urlopen",
+        lambda _request, timeout: _FakeHTTPResponse(body),
+    )
+
+    result = commodore.download_telegram_text_document(msg)
+
+    assert result["text"] == body.decode()
+    assert result["name"] == "review.md"
+
+
+def test_zip_download_combines_text_and_reports_unread_members_without_disk(
+    monkeypatch,
+):
+    archive_bytes = BytesIO()
+    with zipfile.ZipFile(
+        archive_bytes, "w", compression=zipfile.ZIP_DEFLATED
+    ) as archive:
+        archive.writestr("call/transcript.md", "# Call\nAgreed to repair intake.")
+        archive.writestr("call/actions.md", "# Actions\n- Verify current issues.")
+        archive.writestr("call/recording.mp3", b"binary audio")
+        archive.writestr("__MACOSX/._transcript.md", b"\x00\x05AppleDouble")
+    body = archive_bytes.getvalue()
+    msg = _document_message(
+        body_size=len(body), file_name="call-bundle.zip", mime_type="application/zip"
+    )
+    monkeypatch.setattr(
+        commodore,
+        "tg_request",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "result": {"file_path": "documents/call-bundle.zip", "file_size": len(body)},
+        },
+    )
+    monkeypatch.setattr(
+        commodore.urllib.request,
+        "urlopen",
+        lambda _request, timeout: _FakeHTTPResponse(body),
+    )
+    monkeypatch.setattr(
+        zipfile.ZipFile,
+        "extract",
+        lambda *_args, **_kwargs: pytest.fail("ZIP members must not be extracted"),
+    )
+    monkeypatch.setattr(
+        zipfile.ZipFile,
+        "extractall",
+        lambda *_args, **_kwargs: pytest.fail("ZIP members must not be extracted"),
+    )
+
+    result = commodore.download_telegram_text_document(msg)
+
+    assert result["members"] == ["call/transcript.md", "call/actions.md"]
+    assert "Agreed to repair intake" in result["text"]
+    assert "Verify current issues" in result["text"]
+    assert '"read_members": ["call/transcript.md", "call/actions.md"]' in result["text"]
+    assert result["skipped"] == [
+        {
+            "name": "call/recording.mp3",
+            "reason": "unsupported extension `.mp3`",
+        },
+        {"name": "__MACOSX/._transcript.md", "reason": "macOS metadata"},
+    ]
 
 
 def test_rejects_invalid_utf8(monkeypatch):
