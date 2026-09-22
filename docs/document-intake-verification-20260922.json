@@ -1,0 +1,77 @@
+{
+  "verification": "candidate no-send, not live acceptance",
+  "base": "59e7f10a93cb7097d9a62930df7786e03cd3b445",
+  "model": "gpt-5.6-luna",
+  "cases": [
+    {
+      "case": "failed_markdown_with_recovered_request",
+      "status": "answered",
+      "tools_used": [
+        "tracker_propose"
+      ],
+      "provider_failure": null,
+      "passed": true,
+      "no_telegram_send": true,
+      "no_tracker_application": true,
+      "proposed_item_count": 11
+    },
+    {
+      "case": "zip_fixture_with_actual_call_markdown",
+      "status": "answered",
+      "tools_used": [
+        "tracker_propose"
+      ],
+      "provider_failure": null,
+      "passed": true,
+      "no_telegram_send": true,
+      "no_tracker_application": true,
+      "proposed_item_count": 12
+    },
+    {
+      "case": "exact_failed_markdown_without_reconstructed_task",
+      "status": "answered",
+      "tools_used": [],
+      "provider_failure": null,
+      "passed": true,
+      "no_telegram_send": true,
+      "no_tracker_application": true,
+      "proposed_item_count": null
+    },
+    {
+      "case": "unrelated_conversation",
+      "status": "answered",
+      "tools_used": [],
+      "provider_failure": null,
+      "passed": true,
+      "no_telegram_send": true,
+      "no_tracker_application": true,
+      "proposed_item_count": null
+    },
+    {
+      "case": "current_pull_requests",
+      "status": "answered",
+      "tools_used": [
+        "github_pulls"
+      ],
+      "provider_failure": null,
+      "passed": true,
+      "no_telegram_send": true,
+      "no_tracker_application": true,
+      "proposed_item_count": null
+    }
+  ],
+  "source_sha256": {
+    "codex_qa.py": "242a80ce5ad670c9897193213bd30cdb73257605f51f41215730509a91268a97",
+    "qa_schema.py": "45ae0645ddf3c1aba7bbeec33745412da62402c643478d3f9223f9c56cf01618",
+    "qa_sources.py": "ad21eb5bae3b69e8fc6d175a5d320245ce661d16726c0ab1e1bad6f75985cbff",
+    "document_intake.py": "ce64a3367b29f05fe22cceab96169188dacba11b303f257054197d317642730b",
+    "tracker_proposals.py": "083ea8d20570eac3a3f84ff41b11d46f98fb97d436fe7d8f24c4265f4cff1889"
+  },
+  "limits": [
+    "Meeting Markdown came from the real failed job; ZIP container was a fixture, not the original uploaded ZIP.",
+    "Earlier request context was reconstructed from observed history; candidate context reconstruction has separate source tests.",
+    "No Beads or GitHub changes were applied.",
+    "No production daemon or Telegram delivery was exercised."
+  ],
+  "first_pass": "4/5; recovered task produced conversation only. Corrected conflicting latest-turn-only prompt contract before this passing run."
+}

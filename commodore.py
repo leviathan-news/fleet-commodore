@@ -37,6 +37,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from document_intake import DocumentIntakeError, decode_document
 
 from chat_dispatch import ChatDispatcher, PollOwner
 from chat_intake import ChatIntake
@@ -307,9 +308,9 @@ PUBLIC_ROOM_DECLINE_COOLDOWN_S = int(
     os.environ.get("PUBLIC_ROOM_DECLINE_COOLDOWN_S", "300")
 )
 
-# Telegram documents are user-controlled input.  Keep the accepted surface
-# deliberately narrow and bounded: enough for editorial Markdown packets such
-# as Maze's ~40 KiB review, nowhere near Telegram's general document limit.
+# Bound download and decoded text separately: ordinary ZIP bundles can include
+# binary assets without preventing review of their readable documents.
+TELEGRAM_ARCHIVE_MAX_BYTES = 4 * 1024 * 1024
 _TELEGRAM_TEXT_DOCUMENT_HARD_MAX_BYTES = 256 * 1024
 try:
     TELEGRAM_TEXT_DOCUMENT_MAX_BYTES = min(
@@ -320,7 +321,7 @@ except ValueError:
     TELEGRAM_TEXT_DOCUMENT_MAX_BYTES = 128 * 1024
 
 _TELEGRAM_TEXT_DOCUMENT_EXTENSIONS = frozenset({
-    ".md", ".markdown", ".txt", ".rst", ".json", ".csv", ".yaml", ".yml",
+    ".md", ".markdown", ".txt", ".rst", ".json", ".csv", ".yaml", ".yml", ".zip",
 })
 _TELEGRAM_TEXT_DOCUMENT_MIME_TYPES = frozenset({
     "text/markdown", "text/plain", "text/x-markdown", "text/csv",
@@ -899,11 +900,15 @@ def _ensure_tables():
                 msg_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
                 topic_id INTEGER,
+                sender_id INTEGER,
                 sender_username TEXT,
                 sender_is_bot INTEGER DEFAULT 0,
+                direct_to_bot INTEGER NOT NULL DEFAULT 0,
+                is_forum_topic INTEGER,
                 text TEXT,
                 our_reply TEXT,
                 reply_to_msg_id INTEGER,
+                document_ref_json TEXT,
                 timestamp TEXT NOT NULL,
                 UNIQUE(msg_id, chat_id)
             )"""
@@ -1037,6 +1042,7 @@ def _ensure_tables():
                 job_uuid TEXT UNIQUE NOT NULL,
                 chat_id INTEGER NOT NULL,
                 topic_id INTEGER,
+                is_forum_topic INTEGER,
                 requester_id INTEGER NOT NULL,
                 requester_username TEXT,
                 request_msg_id INTEGER,
@@ -1045,6 +1051,8 @@ def _ensure_tables():
                 attachment_text TEXT,
                 reply_context_json TEXT,
                 recent_context_json TEXT,
+                request_context_json TEXT,
+                known_documents_json TEXT,
                 status TEXT NOT NULL,
                 answer_summary TEXT,
                 declined_reason TEXT,
@@ -1169,10 +1177,24 @@ def _ensure_tables():
         # window at claim time; providers receive it as untrusted referent
         # context, never as evidence or authority.
         _safe_column_add(conn, "qa_job", "recent_context_json", "TEXT")
+        # Same-actor prior asks preserve the user's task through terse document
+        # follow-ups. Known documents are metadata-only candidates; a later
+        # broker step must select one exact message id before the host may
+        # resolve its private Telegram reference.
+        _safe_column_add(conn, "qa_job", "request_context_json", "TEXT")
+        _safe_column_add(conn, "qa_job", "known_documents_json", "TEXT")
+        _safe_column_add(conn, "qa_job", "is_forum_topic", "INTEGER")
         # Telegram sends only the direct quoted parent in an update. Preserve
         # exact reply edges locally so a later reply can walk known parents
         # without guessing from recent chat history.
         _safe_column_add(conn, "chat_history", "reply_to_msg_id", "INTEGER")
+        # Actor identity and direct-address provenance keep inferred task
+        # continuity scoped to the requesting user. The document reference is
+        # host-private and never forwarded to a model.
+        _safe_column_add(conn, "chat_history", "sender_id", "INTEGER")
+        _safe_column_add(conn, "chat_history", "direct_to_bot", "INTEGER NOT NULL DEFAULT 0")
+        _safe_column_add(conn, "chat_history", "is_forum_topic", "INTEGER")
+        _safe_column_add(conn, "chat_history", "document_ref_json", "TEXT")
         # Idempotency unique index for pr_review (excludes legacy '' rows).
         conn.execute(
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_pr_review_idempotency
@@ -1199,7 +1221,50 @@ def _reply_to_message_id(msg: dict) -> "int | None":
     return message_id if message_id > 0 else None
 
 
-def save_chat_message(msg, our_reply=None):
+def _telegram_sender_id(msg: dict) -> "int | None":
+    """Return one positive Telegram actor id, or None for malformed input."""
+    try:
+        sender_id = int((msg.get("from") or {}).get("id"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return sender_id if sender_id > 0 else None
+
+
+def _stored_document_reference(msg: dict) -> "dict | None":
+    """Return a bounded host-private document reference for the local ledger."""
+    document = msg.get("document")
+    if not isinstance(document, dict):
+        return None
+    file_id = document.get("file_id")
+    if not isinstance(file_id, str) or not file_id.strip():
+        return None
+    reference = {"file_id": file_id[:1024]}
+    for key, limit in (("file_unique_id", 256), ("file_name", 512), ("mime_type", 128)):
+        value = document.get(key)
+        if isinstance(value, str) and value:
+            reference[key] = value[:limit]
+    file_size = document.get("file_size")
+    if type(file_size) is int and 0 <= file_size <= 1_000_000_000:
+        reference["file_size"] = file_size
+    return reference
+
+
+def _structural_direct_request(msg: dict) -> bool:
+    """Identify direct address from Telegram structure, without intent phrases."""
+    explicit = msg.get("_fleet_direct_to_bot")
+    if type(explicit) is bool:
+        return explicit
+    sender = msg.get("from") or {}
+    if sender.get("is_bot") is True:
+        return False
+    parent_sender = (msg.get("reply_to_message") or {}).get("from") or {}
+    if str(parent_sender.get("username") or "").lower() == BOT_USERNAME:
+        return True
+    text = _message_text(msg)
+    return bool(text and _is_mention_of_commodore(msg, text[:1000].lower()))
+
+
+def save_chat_message(msg, our_reply=None, direct_to_bot=None):
     conn = None
     try:
         conn = sqlite3.connect(str(DB_FILE), timeout=10)
@@ -1207,18 +1272,24 @@ def save_chat_message(msg, our_reply=None):
         sender = msg.get("from", {})
         conn.execute(
             """INSERT OR IGNORE INTO chat_history
-               (msg_id, chat_id, topic_id, sender_username, sender_is_bot,
-                text, our_reply, reply_to_msg_id, timestamp)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (msg_id, chat_id, topic_id, sender_id, sender_username,
+                sender_is_bot, direct_to_bot, is_forum_topic, text, our_reply,
+                reply_to_msg_id, document_ref_json, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 msg["message_id"],
                 msg.get("chat", {}).get("id", 0),
                 msg.get("message_thread_id"),
+                _telegram_sender_id(msg),
                 sender.get("username", sender.get("first_name", "?")),
                 int(sender.get("is_bot", False)),
+                int(_structural_direct_request(msg) if direct_to_bot is None else bool(direct_to_bot)),
+                int(msg.get("is_topic_message") is True),
                 _reply_message_text(msg)[:500],
                 (our_reply or "")[:500],
                 _reply_to_message_id(msg),
+                json.dumps(_stored_document_reference(msg), ensure_ascii=False)
+                if _stored_document_reference(msg) else None,
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -1508,6 +1579,10 @@ _MAX_RECENT_QA_CONTEXT_MESSAGES = 6
 _MAX_RECENT_QA_CONTEXT_TEXT = 500
 _MAX_RECENT_QA_CONTEXT_TOTAL = 2000
 _MAX_RECENT_QA_CONTEXT_AGE_S = 24 * 60 * 60
+_MAX_REQUEST_CONTEXT_MESSAGES = 8
+_MAX_REQUEST_CONTEXT_TEXT = 1000
+_MAX_REQUEST_CONTEXT_TOTAL = 8000
+_MAX_KNOWN_DOCUMENTS = 6
 
 
 def _reply_message_text(msg: dict) -> str:
@@ -1582,7 +1657,11 @@ def _reply_chain_context(msg: dict) -> list[dict]:
         name = sanitize_untrusted(
             str(sender.get("username", sender.get("first_name", "?"))), max_len=30
         )
-        chain.append({"message_id": parent_id, "sender": f"@{name}", "text": quote_text})
+        entry = {"message_id": parent_id, "sender": f"@{name}", "text": quote_text}
+        parent_sender_id = _telegram_sender_id(current)
+        if parent_sender_id is not None:
+            entry["sender_id"] = parent_sender_id
+        chain.append(entry)
     elif row is not None and row["text"]:
         chain.append(_reply_context_entry(row))
     else:
@@ -1616,12 +1695,14 @@ def _chat_history_reply_edge(chat_id, topic_id, message_id):
         conn.row_factory = sqlite3.Row
         if topic_id is None:
             return conn.execute(
-                "SELECT msg_id, sender_username, text, reply_to_msg_id FROM chat_history "
+                "SELECT msg_id, sender_id, sender_username, text, reply_to_msg_id, "
+                "document_ref_json, timestamp FROM chat_history "
                 "WHERE chat_id=? AND topic_id IS NULL AND msg_id=? LIMIT 1",
                 (chat_id, message_id),
             ).fetchone()
         return conn.execute(
-            "SELECT msg_id, sender_username, text, reply_to_msg_id FROM chat_history "
+            "SELECT msg_id, sender_id, sender_username, text, reply_to_msg_id, "
+            "document_ref_json, timestamp FROM chat_history "
             "WHERE chat_id=? AND msg_id=? AND (topic_id=? OR "
             "(topic_id IS NULL AND msg_id=?)) LIMIT 1",
             (chat_id, message_id, topic_id, topic_id),
@@ -1635,11 +1716,14 @@ def _chat_history_reply_edge(chat_id, topic_id, message_id):
 
 
 def _reply_context_entry(row: sqlite3.Row) -> dict:
-    return {
+    entry = {
         "message_id": int(row["msg_id"]),
         "sender": "@" + sanitize_untrusted(str(row["sender_username"] or "?"), max_len=30),
         "text": sanitize_untrusted(str(row["text"] or ""), max_len=_MAX_REPLY_CONTEXT_TEXT),
     }
+    if type(row["sender_id"]) is int and row["sender_id"] > 0:
+        entry["sender_id"] = row["sender_id"]
+    return entry
 
 
 def _reply_context_unavailable(msg: dict, context: "list[dict] | None" = None) -> bool:
@@ -1747,6 +1831,319 @@ def _recent_context_from_json(raw: object) -> list[dict]:
         entry for entry in value[:_MAX_RECENT_QA_CONTEXT_MESSAGES]
         if isinstance(entry, dict)
     ]
+
+
+def _request_qa_context(msg: dict) -> list[dict]:
+    """Recover bounded prior direct asks by the same actor and conversation.
+
+    This is interpretation context only. A prior request cannot authorize a
+    write, and the broker must authenticate the current turn independently.
+    """
+    if not isinstance(msg, dict):
+        return []
+    chat_id = (msg.get("chat") or {}).get("id")
+    topic_id = msg.get("message_thread_id")
+    is_forum_topic = msg.get("is_topic_message") is True
+    sender_id = _telegram_sender_id(msg)
+    current_id = msg.get("message_id")
+    if chat_id is None or sender_id is None:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_MAX_RECENT_QA_CONTEXT_AGE_S)).isoformat()
+    conn = None
+    candidates: list[dict] = []
+    try:
+        conn = sqlite3.connect(str(DB_FILE), timeout=5)
+        conn.row_factory = sqlite3.Row
+        if is_forum_topic and type(topic_id) is int and topic_id > 0:
+            history_scope = "is_forum_topic=1 AND (topic_id=? OR (topic_id IS NULL AND msg_id=?))"
+            history_params = (topic_id, topic_id)
+            job_scope = "is_forum_topic=1 AND (topic_id=? OR (topic_id IS NULL AND request_msg_id=?))"
+            job_params = (topic_id, topic_id)
+        else:
+            # message_thread_id also denotes ordinary reply threads. In a
+            # non-forum chat those numeric roots must not partition the room.
+            history_scope = "is_forum_topic=0"
+            history_params = ()
+            job_scope = "is_forum_topic=0"
+            job_params = ()
+        history_rows = conn.execute(
+            "SELECT msg_id, sender_id, sender_username, text, timestamp "
+            "FROM chat_history WHERE chat_id=? AND sender_id=? "
+            "AND direct_to_bot=1 AND msg_id!=? AND " + history_scope +
+            " AND timestamp>=? ORDER BY id DESC LIMIT ?",
+            (chat_id, sender_id, current_id or 0, *history_params, cutoff,
+             _MAX_REQUEST_CONTEXT_MESSAGES * 2),
+        ).fetchall()
+        for row in history_rows:
+            candidates.append({
+                "message_id": row["msg_id"],
+                "sender_id": row["sender_id"],
+                "sender": "@" + sanitize_untrusted(str(row["sender_username"] or "?"), max_len=30),
+                "text": sanitize_untrusted(str(row["text"] or ""), max_len=_MAX_REQUEST_CONTEXT_TEXT),
+                "observed_at": row["timestamp"],
+                "source": "prior_direct_message",
+                "authorization": "none",
+            })
+        job_rows = conn.execute(
+            "SELECT request_msg_id, requester_id, requester_username, question, created_at "
+            "FROM qa_job WHERE chat_id=? AND requester_id=? AND request_msg_id!=? AND " +
+            job_scope + " AND created_at>=? ORDER BY id DESC LIMIT ?",
+            (chat_id, sender_id, current_id or 0, *job_params, cutoff,
+             _MAX_REQUEST_CONTEXT_MESSAGES * 2),
+        ).fetchall()
+        for row in job_rows:
+            candidates.append({
+                "message_id": row["request_msg_id"],
+                "sender_id": row["requester_id"],
+                "sender": "@" + sanitize_untrusted(str(row["requester_username"] or "?"), max_len=30),
+                "text": sanitize_untrusted(str(row["question"] or ""), max_len=_MAX_REQUEST_CONTEXT_TEXT),
+                "observed_at": row["created_at"],
+                "source": "prior_qa_request",
+                "authorization": "none",
+            })
+    except sqlite3.Error:
+        log.warning("Prior-request context lookup failed")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+    # Prefer the durable Q&A wording when both ledgers describe one Telegram
+    # message, then keep the newest bounded set and return it chronologically.
+    candidates.sort(
+        key=lambda item: (str(item.get("observed_at") or ""),
+                          item.get("source") == "prior_qa_request"),
+        reverse=True,
+    )
+    selected: list[dict] = []
+    seen_ids: set[int] = set()
+    total = 0
+    for candidate in candidates:
+        message_id = candidate.get("message_id")
+        if type(message_id) is not int or message_id <= 0 or message_id in seen_ids:
+            continue
+        text = candidate.get("text") or ""
+        if not text.strip():
+            continue
+        remaining = _MAX_REQUEST_CONTEXT_TOTAL - total
+        if remaining <= 0:
+            break
+        candidate["text"] = text[:remaining]
+        candidate.pop("observed_at", None)
+        selected.append(candidate)
+        seen_ids.add(message_id)
+        total += len(candidate["text"])
+        if len(selected) >= _MAX_REQUEST_CONTEXT_MESSAGES:
+            break
+    selected.reverse()
+    return selected
+
+
+def _request_context_from_json(raw: object) -> list[dict]:
+    """Decode persisted prior-request context defensively."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [entry for entry in value[:_MAX_REQUEST_CONTEXT_MESSAGES] if isinstance(entry, dict)]
+
+
+def _document_reference_from_json(raw: object) -> "dict | None":
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("file_id"), str):
+        return None
+    return value
+
+
+def _public_document_candidate(row: sqlite3.Row, relation: str) -> "dict | None":
+    reference = _document_reference_from_json(row["document_ref_json"])
+    if reference is None:
+        return None
+    name = Path(str(reference.get("file_name") or "unnamed document").replace("\\", "/")).name
+    candidate = {
+        "message_id": int(row["msg_id"]),
+        "sender": "@" + sanitize_untrusted(str(row["sender_username"] or "?"), max_len=30),
+        "file_name": sanitize_untrusted(name or "unnamed document", max_len=120),
+        "mime_type": sanitize_untrusted(str(reference.get("mime_type") or ""), max_len=100),
+        "relation": relation,
+        "read_only": True,
+    }
+    if type(row["sender_id"]) is int and row["sender_id"] > 0:
+        candidate["sender_id"] = row["sender_id"]
+    if type(reference.get("file_size")) is int:
+        candidate["file_size"] = reference["file_size"]
+    return candidate
+
+
+def _known_qa_documents(msg: dict) -> list[dict]:
+    """List bounded document metadata with verified same-room provenance.
+
+    Private file ids stay in chat_history. These public descriptors let the
+    model choose an exact message id; they do not fetch ambient documents.
+    """
+    chat_id = (msg.get("chat") or {}).get("id") if isinstance(msg, dict) else None
+    topic_id = msg.get("message_thread_id") if isinstance(msg, dict) else None
+    is_forum_topic = msg.get("is_topic_message") is True if isinstance(msg, dict) else False
+    current_id = msg.get("message_id") if isinstance(msg, dict) else None
+    if chat_id is None:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_MAX_RECENT_QA_CONTEXT_AGE_S)).isoformat()
+    selected: list[dict] = []
+    seen_ids: set[int] = set()
+
+    # Exact reply ancestry comes first and may be older than the ambient window.
+    next_id = _reply_to_message_id(msg)
+    for _ in range(_MAX_REQUEST_CONTEXT_MESSAGES):
+        if next_id is None or next_id in seen_ids:
+            break
+        row = _chat_history_reply_edge(chat_id, topic_id, next_id)
+        if row is None:
+            break
+        candidate = _public_document_candidate(row, "exact_reply_chain")
+        if candidate is not None:
+            selected.append(candidate)
+            seen_ids.add(next_id)
+            if len(selected) >= _MAX_KNOWN_DOCUMENTS:
+                return selected
+        try:
+            next_id = int(row["reply_to_msg_id"]) if row["reply_to_msg_id"] is not None else None
+        except (TypeError, ValueError):
+            break
+
+    conn = None
+    try:
+        conn = sqlite3.connect(str(DB_FILE), timeout=5)
+        conn.row_factory = sqlite3.Row
+        if is_forum_topic and type(topic_id) is int and topic_id > 0:
+            scope = "is_forum_topic=1 AND (topic_id=? OR (topic_id IS NULL AND msg_id=?))"
+            scope_params = (topic_id, topic_id)
+        else:
+            scope = "is_forum_topic=0"
+            scope_params = ()
+        rows = conn.execute(
+            "SELECT msg_id, sender_id, sender_username, document_ref_json, timestamp "
+            "FROM chat_history WHERE chat_id=? AND msg_id!=? AND document_ref_json IS NOT NULL "
+            "AND " + scope + " AND timestamp>=? ORDER BY id DESC LIMIT ?",
+            (chat_id, current_id or 0, *scope_params, cutoff, _MAX_KNOWN_DOCUMENTS * 2),
+        ).fetchall()
+        for row in rows:
+            message_id = row["msg_id"]
+            if message_id in seen_ids:
+                continue
+            candidate = _public_document_candidate(row, "same_room_recent")
+            if candidate is None:
+                continue
+            selected.append(candidate)
+            seen_ids.add(message_id)
+            if len(selected) >= _MAX_KNOWN_DOCUMENTS:
+                break
+    except sqlite3.Error:
+        log.warning("Known-document context lookup failed")
+    finally:
+        if conn:
+            conn.close()
+    return selected
+
+
+def _known_documents_from_json(raw: object) -> list[dict]:
+    """Decode metadata-only document candidates defensively."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [entry for entry in value[:_MAX_KNOWN_DOCUMENTS] if isinstance(entry, dict)]
+
+
+def known_qa_document_message(job_uuid: str, message_id: int) -> "dict | None":
+    """Resolve one model-selected candidate after exact job-scope validation.
+
+    The returned Telegram-shaped message is suitable for the existing bounded
+    text-document downloader. Selection does not itself download or authorize
+    any write action.
+    """
+    try:
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return None
+    if message_id <= 0:
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        job = conn.execute(
+            "SELECT chat_id, topic_id, is_forum_topic, known_documents_json "
+            "FROM qa_job WHERE job_uuid=? LIMIT 1",
+            (job_uuid,),
+        ).fetchone()
+        if job is None:
+            return None
+        if job["is_forum_topic"] is None:
+            return None
+        allowed = {
+            item.get("message_id"): item for item in
+            _known_documents_from_json(job["known_documents_json"])
+            if type(item.get("message_id")) is int
+        }
+        descriptor = allowed.get(message_id)
+        if descriptor is None:
+            return None
+        if not job["is_forum_topic"]:
+            row = conn.execute(
+                "SELECT msg_id, chat_id, topic_id, sender_id, sender_username, document_ref_json "
+                "FROM chat_history WHERE chat_id=? AND is_forum_topic=0 AND msg_id=? LIMIT 1",
+                (job["chat_id"], message_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT msg_id, chat_id, topic_id, sender_id, sender_username, document_ref_json "
+                "FROM chat_history WHERE chat_id=? AND msg_id=? AND "
+                "is_forum_topic=1 AND (topic_id=? OR (topic_id IS NULL AND msg_id=?)) LIMIT 1",
+                (job["chat_id"], message_id, job["topic_id"], job["topic_id"]),
+            ).fetchone()
+        if row is None:
+            return None
+        reference = _document_reference_from_json(row["document_ref_json"])
+        if reference is None:
+            return None
+        expected_sender_id = descriptor.get("sender_id")
+        if type(expected_sender_id) is int and row["sender_id"] != expected_sender_id:
+            return None
+        return {
+            "message_id": row["msg_id"],
+            "chat": {"id": row["chat_id"]},
+            "message_thread_id": row["topic_id"],
+            "from": {"id": row["sender_id"], "username": row["sender_username"]},
+            "document": reference,
+        }
+    except sqlite3.Error:
+        log.warning("Known-document selection lookup failed")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+
+def download_known_qa_document(job_uuid: str, message_id: int) -> dict:
+    """Read only a candidate recorded for this admitted QA job."""
+    msg = known_qa_document_message(job_uuid, message_id)
+    if msg is None:
+        return {"error": "document_reference_unavailable"}
+    try:
+        return download_telegram_text_document(msg)
+    except TelegramDocumentIntakeError as exc:
+        return {"error": "document_intake_failed", "reason": str(exc)}
 
 
 def _reply_context_prompt(context: list[dict]) -> str:
@@ -1913,7 +2310,7 @@ def _document_intake_failure(document: dict, reason: str) -> str:
 
 
 def download_telegram_text_document(msg: dict) -> dict:
-    """Download one safe, bounded UTF-8 text-like Telegram document.
+    """Download and decode bounded text or a ZIP's readable text members.
 
     The returned mapping contains only the display filename and decoded body.
     The file id, authenticated file URL, token, and body are never logged.
@@ -1934,20 +2331,18 @@ def download_telegram_text_document(msg: dict) -> dict:
             f"`{extension or '[no extension]'}` is not an accepted text type "
             f"(accepted: {allowed})."
         )
-    if mime_type and mime_type not in _TELEGRAM_TEXT_DOCUMENT_MIME_TYPES:
-        raise TelegramDocumentIntakeError(
-            f"Telegram labelled it `{mime_type}`, not a supported text MIME type."
-        )
+    # MIME metadata is advisory. Actual bounded decoding decides readability.
+    download_limit = TELEGRAM_ARCHIVE_MAX_BYTES if extension == ".zip" else TELEGRAM_TEXT_DOCUMENT_MAX_BYTES
 
     declared_size = document.get("file_size")
     try:
         declared_size = int(declared_size) if declared_size is not None else None
     except (TypeError, ValueError):
         declared_size = None
-    if declared_size is not None and declared_size > TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:
+    if declared_size is not None and declared_size > download_limit:
         raise TelegramDocumentIntakeError(
             f"it is {declared_size:,} bytes; the review limit is "
-            f"{TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:,} bytes."
+            f"{download_limit:,} bytes."
         )
 
     file_id = document.get("file_id")
@@ -1963,10 +2358,10 @@ def download_telegram_text_document(msg: dict) -> dict:
         if not file_path:
             raise TelegramDocumentIntakeError("Telegram returned no file path.")
         resolved_size = file_result.get("file_size")
-        if resolved_size is not None and int(resolved_size) > TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:
+        if resolved_size is not None and int(resolved_size) > download_limit:
             raise TelegramDocumentIntakeError(
                 f"Telegram reports {int(resolved_size):,} bytes; the review limit is "
-                f"{TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:,} bytes."
+                f"{download_limit:,} bytes."
             )
 
         # This authenticated URL must never enter logs, exceptions, or SQLite.
@@ -1975,7 +2370,7 @@ def download_telegram_text_document(msg: dict) -> dict:
             url, headers={"User-Agent": "leviathan-commodore-bot"}
         )
         with urllib.request.urlopen(request, timeout=20) as response:
-            raw = response.read(TELEGRAM_TEXT_DOCUMENT_MAX_BYTES + 1)
+            raw = response.read(download_limit + 1)
     except TelegramDocumentIntakeError:
         raise
     except Exception:
@@ -1985,23 +2380,21 @@ def download_telegram_text_document(msg: dict) -> dict:
             "Telegram's file service could not retrieve it; please retry."
         ) from None
 
-    if len(raw) > TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:
+    if len(raw) > download_limit:
         raise TelegramDocumentIntakeError(
             f"the downloaded body exceeds the "
-            f"{TELEGRAM_TEXT_DOCUMENT_MAX_BYTES:,}-byte review limit."
+            f"{download_limit:,}-byte review limit."
         )
     try:
-        body = raw.decode("utf-8-sig", errors="strict")
-    except UnicodeDecodeError:
-        raise TelegramDocumentIntakeError(
-            "it is not valid UTF-8 text; please export it as UTF-8 Markdown or plain text."
-        ) from None
-    if "\x00" in body:
-        raise TelegramDocumentIntakeError(
-            "it contains binary NUL bytes rather than plain text."
-        )
-
-    return {"name": name, "text": body, "size": len(raw)}
+        decoded = decode_document(name, raw, TELEGRAM_TEXT_DOCUMENT_MAX_BYTES)
+    except DocumentIntakeError as exc:
+        raise TelegramDocumentIntakeError(str(exc)) from None
+    if decoded.get("members"):
+        coverage = {"read_members": decoded["members"], "skipped_members": decoded.get("skipped", [])}
+        decoded["text"] = "Archive coverage (untrusted filenames): " + json.dumps(coverage, ensure_ascii=False) + "\n\n" + decoded["text"]
+        if len(decoded["text"].encode("utf-8")) > _TELEGRAM_TEXT_DOCUMENT_HARD_MAX_BYTES:
+            raise TelegramDocumentIntakeError("the decoded archive and its coverage notes exceed the review limit.")
+    return {"name": name, **decoded, "size": len(raw)}
 
 
 def _levsec_alert_status_reply(msg: dict) -> "str | None":
@@ -3994,6 +4387,7 @@ def _claim_qa_job(msg, question: str,
     chat_id = msg.get("chat", {}).get("id", 0)
     topic_id = msg.get("message_thread_id")
     request_msg_id = msg.get("message_id")
+    is_forum_topic = int(msg.get("is_topic_message") is True)
     reply_context = _reply_chain_context(msg)
     if _reply_context_unavailable(msg, reply_context):
         from qa_worker import MISSING_REPLY_CONTEXT
@@ -4001,6 +4395,8 @@ def _claim_qa_job(msg, question: str,
     reply_context_json = json.dumps(reply_context, ensure_ascii=False)
     recent_context = [] if attachment else _recent_qa_context(msg, recent_messages)
     recent_context_json = json.dumps(recent_context, ensure_ascii=False)
+    request_context_json = json.dumps(_request_qa_context(msg), ensure_ascii=False)
+    known_documents_json = json.dumps(_known_qa_documents(msg), ensure_ascii=False)
 
     # Per-user cooldown.
     last = _qa_cooldown_by_user.get(requester_id, 0.0)
@@ -4031,15 +4427,17 @@ def _claim_qa_job(msg, question: str,
                 """INSERT INTO qa_job
                    (job_uuid, chat_id, topic_id, requester_id, requester_username,
                     request_msg_id, question, attachment_name, attachment_text,
-                    reply_context_json, recent_context_json, status,
+                    reply_context_json, recent_context_json, request_context_json,
+                    known_documents_json, is_forum_topic, status,
                     idempotency_key, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
                 (
                     job_uuid, chat_id, topic_id, requester_id, requester_username,
                     request_msg_id, question[:4000],
                     (attachment or {}).get("name"),
                     (attachment or {}).get("text"),
-                    reply_context_json, recent_context_json, idem, _now_iso(),
+                    reply_context_json, recent_context_json, request_context_json,
+                    known_documents_json, is_forum_topic, idem, _now_iso(),
                 ),
             )
             conn.commit()
@@ -4674,13 +5072,13 @@ def _qa_failure_detail(error: str, *, detail: str = "", result=None, proc=None) 
             # never copy a raw model excerpt into the operator page or ledger.
             reason = result.get("failure_reason")
             payload["failure_reason"] = (
-                reason if reason in {"qa response was empty or unparseable", "provider unavailable"}
+                reason if reason in {"qa response was empty or unparseable", "provider unavailable", "qa response contract could not be satisfied"}
                 else "worker reported failure"
             )
             codex_class = result.get("provider_failure")
             if codex_class in {"provider_auth_failed", "provider_rate_limited", "provider_timeout",
                                "provider_unavailable", "provider_protocol_error", "provider_no_output",
-                               "provider_health_unavailable"}:
+                               "provider_health_unavailable", "broker_contract_error"}:
                 payload["provider_failure"] = codex_class
                 return json.dumps(payload, sort_keys=True)
             excerpt = str(result.get("claude_excerpt") or "").lower()
@@ -4709,8 +5107,11 @@ def _qa_failure_detail(error: str, *, detail: str = "", result=None, proc=None) 
     return _scrub_secrets_for_db(json.dumps(payload, sort_keys=True))[:500]
 
 
-def _qa_outage_reply(operator_alerted: bool) -> str:
+def _qa_outage_reply(operator_alerted: bool, failure_class: str = "") -> str:
     """A direct, truthful Telegram failure sentence with no persona costume."""
+    if failure_class in {"broker_contract_error", "provider_protocol_error", "unparseable_output", "empty_output"}:
+        ending = "the operator has been alerted." if operator_alerted else "the operator could not be alerted."
+        return "I couldn't finish processing this request; " + ending
     if operator_alerted:
         return "My review service is down; the operator has been alerted."
     return "My review service is down; the operator could not be alerted."
@@ -4726,9 +5127,13 @@ def _fail_qa_service(
     )
     conn.commit()
     operator_alerted = _alert_operator_qa_down(failure_detail)
+    try:
+        failure_class = json.loads(failure_detail).get("provider_failure", "")
+    except (ValueError, AttributeError):
+        failure_class = ""
     send_message_with_wal(
         "qa_job", job_uuid, OutgoingAction.QA_FAILURE,
-        chat_id, _qa_outage_reply(operator_alerted),
+        chat_id, _qa_outage_reply(operator_alerted, failure_class),
         thread_id=topic_id, reply_to=request_msg_id,
     )
 
@@ -5028,8 +5433,18 @@ def _process_qa(job_uuid: str) -> None:
                 "attachment_text": row["attachment_text"],
                 "reply_context": _reply_context_from_json(row["reply_context_json"]),
                 "recent_context": _recent_context_from_json(row["recent_context_json"]),
+                "request_context": _request_context_from_json(row["request_context_json"]),
+                "known_documents": _known_documents_from_json(row["known_documents_json"]),
                 "requester": row["requester_username"] or "unknown",
                 "channel": chat_id,
+                "tracker_provenance": {
+                    "chat_id": chat_id, "topic_id": None if row["is_forum_topic"] == 0 else topic_id,
+                    "requester_id": row["requester_id"],
+                    "request_msg_id": request_msg_id,
+                    "request_text": row["question"],
+                    "attachment_name": row["attachment_name"] or "",
+                    "attachment_sha256": hashlib.sha256((row["attachment_text"] or "").encode()).hexdigest() if row["attachment_name"] else "",
+                },
             })
             try:
                 proc = subprocess.run(
@@ -5563,7 +5978,7 @@ def _route_update(update: dict, recent_by_chat: dict) -> dict | None:
         enqueue_benthic_pending(msg)
 
     if not should_respond(msg, policy, is_direct):
-        if text:
+        if text or msg.get("document"):
             save_chat_message(msg)
         return
 
@@ -5737,7 +6152,7 @@ def _route_update(update: dict, recent_by_chat: dict) -> dict | None:
             "message_id": _telegram_message_id(result),
         }
     else:
-        if text:
+        if text or msg.get("document"):
             save_chat_message(msg)
 
 

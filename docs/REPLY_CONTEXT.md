@@ -11,11 +11,14 @@ quote, the direct parent's supplied text takes precedence over a stale local
 copy.
 
 Older parents are recovered only by following exact `reply_to_msg_id` edges in
-the local `chat_history` ledger. Every lookup stays within the same chat and
-forum topic. An exact thread root is also valid when its message ID equals
-the current thread ID and the root has no topic ID: Telegram uses this shape
-for ordinary supergroup reply threads. This exception never admits another
-NULL-topic message, a different explicit topic, or another chat.
+the local `chat_history` ledger. Every lookup stays within the same chat and,
+when Telegram sets `is_topic_message=true`, the same forum topic. Telegram's
+[Message contract](https://core.telegram.org/bots/api#message) also uses
+`message_thread_id` for ordinary reply threads; without `is_topic_message`,
+that ID is a reply root and does not partition a normal supergroup into forum
+topics. An exact thread root remains valid when its message ID equals the
+current thread ID and the root has no topic ID. This exception never admits a
+different true forum topic or another chat.
 Cycles, missing edges, invalid IDs, and unavailable ledgers stop
 the walk; recent room messages never substitute for a quoted edge. Quoted
 context contains at most four
@@ -23,8 +26,9 @@ parents, each with at most 500 sanitized text characters and a bounded sender
 label.
 
 An unquoted Q&A follow-up may use a separate snapshot of up to six prior
-messages from the same trusted chat and exact forum topic, spanning no more
-than 24 hours and 2,000 sanitized text characters. The current message is
+messages from the same trusted chat and in-memory thread key, including an
+exact forum topic when `is_topic_message=true`, spanning no more than 24 hours
+and 2,000 sanitized text characters. The current message is
 excluded even though routing has already appended it to the in-memory buffer.
 Messages from bots remain eligible because Fleet receipts often name the
 subject. Cross-chat, cross-topic, future-dated, undated, and older messages
@@ -38,13 +42,35 @@ writes the answer. The current question remains authoritative; an exact reply
 chain takes precedence over recent-room context, including when the exact
 parent is unavailable. There is no deterministic subject or answer matcher.
 
+A separate request-continuity snapshot may contain up to eight prior direct
+requests from the same Telegram actor and trusted chat, spanning no more than
+24 hours and 8,000 sanitized characters. True forum messages remain confined
+to their topic. Ordinary non-forum reply roots do not divide the room, which
+allows a terse reply to a newly supplied document to retain an earlier task.
+Each entry carries its verified actor ID and `authorization=none`: inferred
+history helps interpret the current turn but never grants write authority.
+The current request still wins over any older task.
+
+Q&A may also receive at most six metadata-only document candidates from an
+exact reply chain or recent verified room scope. Each candidate includes its
+message ID, actor provenance, bounded filename/type/size metadata, relationship,
+and `read_only=true`; Telegram file IDs and contents do not enter the model
+prompt. The model chooses a supplied message ID through the
+`telegram_document` broker request. The host then rechecks the claimed job,
+chat, true forum topic when present, candidate allowlist, and actor provenance
+before performing the existing bounded text-document download. Fleet never
+fetches an arbitrary ambient file.
+
 Accepted bot replies and incoming replies persist their exact edge. Startup
-adds nullable `chat_history.reply_to_msg_id`, `qa_job.reply_context_json`, and
-`qa_job.recent_context_json` columns idempotently; historical rows remain valid
-and are not guessed or backfilled. Q&A snapshots context with the claimed job
-and forwards each context class separately as untrusted data to the configured
-provider. Both Q&A providers put that untrusted context before a separately
-labelled, final current question, so a
+idempotently adds reply, actor, direct-address, true-forum, and private
+document-reference fields to `chat_history`, and reply, recent-room, request,
+known-document, and true-forum context fields to `qa_job`. These fields apply
+to observations made after migration. Historical rows remain valid; missing
+actor IDs, direct-address evidence, forum classification, and document
+references are not invented or backfilled from usernames. Q&A snapshots
+context with the claimed job and forwards each supported context class
+separately as untrusted data. The Codex broker puts that untrusted context
+before a separately labelled, final current question, so a
 terse correction cannot be overridden by a parent's stale concrete referent.
 
 When a reply exists but no safe referent can be recovered, Fleet supplies that
@@ -63,14 +89,36 @@ explicitly says pixels are unavailable. A text-only worker uses the caption
 and request, and asks for a page URL or description when required. Selected
 quotes remain limited to the selected text, including on image messages.
 
+Text-document intake accepts the configured UTF-8 text types and ZIP bundles
+of those types. Plain text and combined readable ZIP output use the 128 KiB
+default `TELEGRAM_TEXT_DOCUMENT_MAX_BYTES` budget, configurable only up to the
+hard 256 KiB ceiling. ZIP downloads are capped at 4 MiB compressed and 256
+entries, decoded in memory without extraction. Unsafe, binary, unsupported,
+encrypted, duplicate, corrupt, or over-budget members receive explicit skip
+notes; readable members remain available with partial-coverage disclosure.
+
+Attachment text remains untrusted evidence. Model-native tools, shell,
+filesystem, and unrestricted network access stay disabled, while the bounded
+host broker may still perform repository search/read, read-only SQL, GitHub
+reads, and a model-selected verified Telegram document lookup. If the user
+asks to update Beads or GitHub, `tracker_propose` may save an immutable
+proposal-only record for `leviathan-news/squid-bot`. It never invokes `bd`,
+writes GitHub, confirms acceptance, or starts implementation. The read-only
+local inspection/export surface is
+[`bin/tracker-proposals`](../bin/tracker-proposals). No automatic canonical
+consumer is implemented, so Fleet reports application as pending and never
+claims the tracker changed.
+
 Authorized conversational hails enter the normal model-job path. There is no
 presence phrase matcher, deterministic conversational reply, or intent-to-stock-
 text mapping. The LLM interprets the current request and writes its own response.
 For ordinary conversation, Codex Q&A returns `status=conversational` and an
 `answer`; the host delivers that model-authored text under the existing send
 contract. Conversation needs no external citation and does not attest provider
-or fleet-wide health. The conversational result cannot review attachments,
-carry citations or extra fields, or replace a completed evidence lookup.
+or fleet-wide health. An attachment does not invalidate ordinary conversation
+or a needed clarification. A substantive attachment request gets a corrective
+model turn if it initially yields only conversation. Conversational results
+cannot carry citations or extra fields, or replace a completed evidence lookup.
 Substantive questions still use the ordinary grounded answer contract,
 including when paired with a conversational hail. This distinction uses model
 judgment, not a host keyword classifier or proof of semantic correctness.
@@ -104,7 +152,9 @@ the model for correction within the existing four-step budget. The semantic
 choice still belongs to the LLM; this provenance check is not a keyword filter
 or proof that every factual assertion is correct. If live retrieval fails,
 the model must explain that limitation, not substitute old documented activity.
-Attachment review cannot request GitHub evidence.
+Attachment review may request the same bounded host evidence when the user's
+task needs current project facts; attachment text itself remains reference
+material rather than proof of current state.
 
 Q&A uses the installed Codex CLI's `--output-schema` contract to enforce the
 message structure, including integer PR numbers. The schema is written only
@@ -129,6 +179,13 @@ updates, durable incoming/outgoing edges, nullable migration compatibility,
 current corrections, chat/topic isolation, selected-quote bounds, malformed
 selected quotes, bounded unquoted same-room subject resolution, and forwarding
 through conversation and persisted Codex Q&A.
+`tests/test_document_reply_continuity.py` covers same-actor task recovery across
+ordinary reply roots, true forum isolation, metadata-only document selection,
+actor provenance, and the separate worker payload fields.
+`tests/test_document_intake.py` covers bounded plain-text and ZIP decoding,
+member safety, partial coverage, and archive limits.
+`tests/test_tracker_proposals.py` covers validation, idempotency, scope-bound
+inspection, and proposal-only state.
 All provider and Telegram calls in these tests are mocked. They do not prove
 live provider or production behavior.
 

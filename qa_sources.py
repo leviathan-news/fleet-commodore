@@ -37,6 +37,10 @@ def citation_markdown(source: str) -> str:
         return f"[{label}]({url})"
     if source.startswith("database:"):
         return "Read-only database observation"
+    if re.fullmatch(r"tracker-proposal:tp_[a-f0-9]{24}", source):
+        return "Tracker proposal " + source.split(":", 1)[1]
+    if re.fullmatch(r"telegram-document:[1-9][0-9]*", source):
+        return "Telegram document, message " + source.split(":", 1)[1]
     return "Unrecognized source"
 
 

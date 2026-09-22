@@ -120,21 +120,38 @@ The same request works as a direct reply to a preceding document-only message;
 the reply remains the request while its parent's document is reviewed.
 
 Intake accepts UTF-8 `.md`, `.markdown`, `.txt`, `.rst`, `.json`, `.csv`,
-`.yaml`, and `.yml` files with compatible text MIME metadata. The default limit
-is 128 KiB and `TELEGRAM_TEXT_DOCUMENT_MAX_BYTES` may lower it or raise it only
-up to the hard 256 KiB ceiling. The worker receives the attachment separately
-from the asker's question and labels it untrusted data; text inside the file is
-never treated as instructions. Attachment-review turns use a **no-tools**
-provider profile: no document retrieval, web fetch, database wrapper, shell, filesystem, or
-network access. Rejections and retrieval failures acknowledge that the
-attachment arrived and state the safe reason, without logging the bot token,
-authenticated file URL, or document body.
+`.yaml`, and `.yml` files, plus `.zip` bundles containing those text types. A
+plain document has a 128 KiB default text budget;
+`TELEGRAM_TEXT_DOCUMENT_MAX_BYTES` may lower it or raise it only to the hard
+256 KiB ceiling. A ZIP may be at most 4 MiB compressed, is decoded in memory
+without filesystem extraction, may contain at most 256 entries, and shares the
+same configurable text budget across readable members. Unsafe, binary,
+unsupported, encrypted, duplicate, or over-budget entries are skipped with
+explicit coverage notes. Readable members are still reviewed when coverage is
+partial.
+
+The worker receives attachment text separately from the asker's request and
+labels it untrusted data. Model-native tools, shell, filesystem, and unrestricted
+network access remain disabled. The host's bounded read-only evidence broker
+remains available for repository documents, SQL, GitHub observations, and a
+model-selected Telegram document already verified in the same room scope. A
+request to update Beads or GitHub can create only an immutable proposal in the
+local tracker inbox; it performs no Beads or GitHub write and starts no work. The
+read-only inspection/export CLI is
+[`bin/tracker-proposals`](bin/tracker-proposals); automatic application by a
+canonical tracker consumer is not implemented. Rejections and retrieval
+failures acknowledge that the attachment arrived and state the safe reason,
+without logging the bot token, authenticated file URL, or document body.
 
 ## Reply context
 
 Conversation and Q&A use the message's exact reply referent, not whichever PR
 was mentioned most recently. Selected Telegram quotes stay selected; older
-parents come only from same-chat, same-topic reply edges in the local ledger.
+parents come only from verified reply edges in the local ledger. Telegram's
+`is_topic_message` distinguishes a real forum topic from an ordinary
+supergroup reply thread, whose `message_thread_id` is a reply root rather than
+a room boundary. Terse follow-ups may also receive bounded same-actor request
+context and metadata-only document candidates; neither supplies authority.
 See [Reply context contract](docs/REPLY_CONTEXT.md) for bounds, migrations,
 failure behavior, and release acceptance.
 
