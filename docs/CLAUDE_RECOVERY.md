@@ -21,22 +21,28 @@ does not send Telegram. `codex login status` alone is not a transport proof.
 Codex chat calls are bounded to 60 seconds. Failures open an external SQLite
 health cooldown: ten minutes for authentication/quota, one minute otherwise.
 Subsequent calls fail promptly with an honest outage reply and deduplicated
-operator alert. Recovery after cooldown is demand-driven. Chat is still
-synchronous; asynchronous intake and supervised helm remain separate work.
+operator alert. Recovery after cooldown is demand-driven. Ordinary durable
+intake polls independently of the FIFO routing worker; provider calls do not
+block Telegram polling. Supervised helm remains a separate, dormant mode.
 
 Codex itself has no tools. Q&A uses a host broker with at most four model rounds
-in 225 seconds, each call capped at 55 seconds. Typed requests can search/read
-the existing allowlisted documentation or run one query through the existing
-read-only `commodore-db` wrapper in a disposable reviewer container. Database
-credentials go only to that container, never to the model process. Queries
-retain the reader role, sensitive-table denylist, three-second statement
-timeout and 500-row cap; container output/lifetime are capped at 128 KiB/15s.
+for an ordinary turn, or eight when recent-room context or an attachment needs
+additional resolution, within the same 225-second deadline; each call is capped
+at 55 seconds. Typed requests can search/read the existing allowlisted
+documentation, read bounded GitHub or verified same-room Telegram evidence, or
+run one query through the existing read-only `commodore-db` wrapper in a
+disposable reviewer container. Database credentials go only to that container,
+never to the model process. Queries retain the reader role, sensitive-table
+denylist, three-second statement timeout and 500-row cap; container
+output/lifetime are capped at 128 KiB/15s.
 
 Answers must cite identifiers actually retrieved by the broker. This rejects
 invented source identifiers, not every possible misinterpretation of evidence.
 SQL evidence carries an observation time; a document mtime is not deployment
-proof. Attachment review has no retrieval tools. General shell, ORM execution,
-web fetching, actions and writes are unavailable on the Codex Q&A route.
+proof. Attachment review can use the same bounded host broker as text Q&A; it
+does not gain model-native tools or direct access to credentials. General shell,
+ORM execution, web fetching, and direct external actions or writes remain
+unavailable on the Codex Q&A route.
 
 ## Explicit legacy Claude route
 
