@@ -77,6 +77,26 @@ def test_trusted_qa_retains_question_context_and_reply_target(monkeypatch):
     assert saved == [(message, {"our_reply": "Queued for review."})]
 
 
+def test_direct_followup_without_question_mark_stays_in_grounded_llm_lane(monkeypatch):
+    message = _message(commodore.LEV_DEV_GROUP_ID,
+                       "@commodore_lev_bot here is receipt #86 for the arm comparison")
+    questions = []
+    monkeypatch.setattr(commodore, "_responded", set())
+    monkeypatch.setattr(commodore, "_last_reply_to", {})
+    monkeypatch.setattr(commodore, "should_respond", lambda *_args: True)
+    monkeypatch.setattr(commodore, "QA_ENABLED", True)
+    monkeypatch.setattr(commodore, "generate_response", _unexpected)
+    monkeypatch.setattr(commodore, "handle_qa", lambda _msg, question, **_kwargs:
+                        questions.append(question) or "Queued for review.")
+    monkeypatch.setattr(commodore, "send_message", lambda *_args, **_kwargs:
+                        {"ok": True, "result": {"message_id": 9002}})
+    monkeypatch.setattr(commodore, "save_chat_message", lambda *_args, **_kwargs: None)
+
+    commodore._route_update({"message": message}, {})
+
+    assert questions == ["here is receipt #86 for the arm comparison"]
+
+
 def test_empty_direct_generation_is_visible_and_retained_not_no_reply(monkeypatch):
     message = _message(commodore.LEV_DEV_GROUP_ID, "@commodore_lev_bot please explain")
     monkeypatch.setattr(commodore, "should_respond", lambda *_args: True)

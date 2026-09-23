@@ -23,6 +23,7 @@ RESPONSE_SCHEMA = _object({"message": {"anyOf": [
              "citations": {"type": "array", "items": TEXT}}),
     _object({"request": _enum("search", "sql"), "query": TEXT}),
     _object({"request": _enum("read"), "path": TEXT}),
+    _object({"request": _enum("x_experiment_report"), "experiment_key": _text(80, 1)}),
     _object({"request": _enum("github_pulls"), "repository": TEXT,
              "state": _enum("all", "open", "closed"),
              "sort": _enum("created", "updated")}),

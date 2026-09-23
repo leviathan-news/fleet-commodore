@@ -6079,8 +6079,9 @@ def _route_update(update: dict, recent_by_chat: dict) -> dict | None:
     # callers receive an in-character decline rather than silence.
     #
     # Order matters: ship/abandon/plan are slash-command-y and
-    # narrow; Q&A is broad and goes last so it catches anything
-    # ending in `?` that wasn't claimed by the other paths.
+    # narrow; the grounded LLM lane goes last for direct messages in rooms
+    # with Q&A access. A follow-up can supply evidence without asking another
+    # literal question, and must retain the previous Q&A task and tools.
     if response is None and is_direct:
         stripped = text.strip()
         # Strip leading mention so regexes anchor cleanly.
@@ -6106,6 +6107,8 @@ def _route_update(update: dict, recent_by_chat: dict) -> dict | None:
                 stripped_no_mention,
                 has_attachment=attachment is not None,
             )
+            if question is None and stripped_no_mention and _can_qa(msg):
+                question = stripped_no_mention
             if question is not None:
                 response = handle_qa(
                     msg, question, attachment=attachment,

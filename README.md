@@ -135,7 +135,14 @@ labels it untrusted data. Model-native tools, shell, filesystem, and unrestricte
 network access remain disabled. The host's bounded read-only evidence broker
 remains available for repository documents, SQL, GitHub observations, and a
 model-selected Telegram document already verified in the same room scope. A
-request to update Beads or GitHub can create only an immutable proposal in the
+named X experiment's current arm results are available through a bounded
+read-only report in that broker; the model still writes the comparison. One
+outcome card is one receipt, not a cohort summary. A no-reply arm has no source
+reply CTR. Direct messages in Q&A-enabled rooms also use this lane when they
+are follow-ups without a question mark, so supplied evidence can continue the
+same task.
+
+A request to update Beads or GitHub can create only an immutable proposal in the
 local tracker inbox; it performs no Beads or GitHub write and starts no work. The
 read-only inspection/export CLI is
 [`bin/tracker-proposals`](bin/tracker-proposals); automatic application by a

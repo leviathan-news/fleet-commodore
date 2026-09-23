@@ -41,6 +41,7 @@ ARTIFACT_FILES = (
     "qa_schema.py",
     "qa_sources.py",
     "qa_sql.py",
+    "qa_experiments.py",
     "bin/provider-probe.py",
     "bin/launch-qa-container",
     "bin/commodore-db",
