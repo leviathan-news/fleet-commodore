@@ -30,11 +30,21 @@ for an ordinary turn, or eight when recent-room context or an attachment needs
 additional resolution, within the same 225-second deadline; each call is capped
 at 55 seconds. Typed requests can search/read the existing allowlisted
 documentation, read bounded GitHub or verified same-room Telegram evidence, or
-run one query through the existing read-only `commodore-db` wrapper in a
+retrieve a named X experiment's current per-arm outcome report. The experiment
+report aggregates only posted analysis-eligible receipts with collected nominal
++24h outcomes, and exposes missing and late counts. The model interprets and
+cites those measurements. General SQL requests still run through the existing
+read-only `commodore-db` wrapper in a
 disposable reviewer container. Database credentials go only to that container,
 never to the model process. Queries retain the reader role, sensitive-table
 denylist, three-second statement timeout and 500-row cap; container
 output/lifetime are capped at 128 KiB/15s.
+
+In a room with read-only Q&A access, direct messages that fall past the
+specialized ship/review/plan routes enter this same grounded LLM lane even
+without a question mark. A follow-up that supplies an outcome card therefore
+keeps its verified request context and evidence tools; the model decides
+whether the message needs a factual answer or ordinary conversation.
 
 Answers must cite identifiers actually retrieved by the broker. This rejects
 invented source identifiers, not every possible misinterpretation of evidence.

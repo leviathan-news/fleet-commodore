@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from codex_runtime import ask
 from qa_knowledge import KnowledgeReader
 from qa_sql import execute_sql
+from qa_experiments import report_x_experiment
 from qa_github import DEFAULT_REPOSITORY, REPOSITORIES, retrieve as retrieve_github
 from qa_schema import RESPONSE_SCHEMA
 from qa_worker import MISSING_REPLY_CONTEXT, matches_hostile
@@ -127,6 +128,19 @@ GitHub or SQL observations that support them. Use basis=reference for historical
 or documentation questions. The broker checks current-source provenance; a
 reference document is not a current observation even if recently modified.
 For live quantities obtain current SQL evidence; don't substitute remembered facts.
+For results, progress, or a comparison of a named X posting experiment, request
+x_experiment_report FIRST. It returns current per-arm +24h measurements,
+missing outcomes, and the experiment expiry through the read-only database
+role. One Telegram outcome card is one receipt, not an experiment comparison.
+The report supplies measurements; explain them in your own words and cite its
+database source. A small or incomplete cohort does not establish a statistical
+winner. A no-reply arm has no source-reply CTR; do not call it zero. Use a
+reference document if you need the treatment definitions. For an arm comparison,
+prefer per-measured-root averages over raw impression or reaction totals when
+the arms have different sample sizes, and state those sample sizes. If the user
+asks to wrap up, say whether the configured experiment has expired and whether
+outcomes are still missing before treating a read as final.
+Return {"request":"x_experiment_report","experiment_key":"a supplied experiment slug"}.
 Questions about what remains, how much longer, whether something is still
 active, or an end/due point relative to now are current-state questions even
 when the user does not say "current" or "latest". A reference document may
@@ -335,7 +349,7 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
             return {**base, "status": "answered", "answer": text[:3500],
                     "citations": [] if attachment_answer else citations[:3], "tools_used": used_tools}
         tool = decision.get("request")
-        allowed_tools = {"search", "read", "sql", "github_pulls", "github_pull", "telegram_document", "tracker_propose", "tracker_status"}
+        allowed_tools = {"search", "read", "sql", "x_experiment_report", "github_pulls", "github_pull", "telegram_document", "tracker_propose", "tracker_status"}
         if (isinstance(tool, str)
                 and tool in allowed_tools and step == max_steps - 1):
             return {**base, "status": "declined", "declined_reason":
@@ -365,6 +379,14 @@ def answer(job: dict, *, timeout: int = 225) -> dict:
                 if not isinstance(path, str) or path not in sources:
                     break
                 result = reader.read(path)
+            elif tool == "x_experiment_report":
+                key = decision.get("experiment_key")
+                result = report_x_experiment(key)
+                if "error" not in result:
+                    source = "database:" + hashlib.sha256(f"x_experiment_report:{key}".encode()).hexdigest()[:12]
+                    result.update(source=source, observed_at=time.time())
+                    sources.add(source)
+                    current_sources.add(source)
             elif tool == "telegram_document":
                 selected = decision.get("message_id")
                 candidates = job.get("known_documents") or []

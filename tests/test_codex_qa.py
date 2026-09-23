@@ -112,6 +112,34 @@ def test_live_sql_result_is_provided_with_receipt(monkeypatch, tmp_path):
     assert result["tools_used"] == ["sql"]
 
 
+def test_named_experiment_report_reaches_model_as_current_evidence(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(codex_qa, "report_x_experiment", lambda key: {
+        "experiment": key,
+        "arms": {"arm_1": {"nominal_reads": 29}, "arm_2": {"nominal_reads": 30}},
+    })
+
+    def ask(prompt, **_kwargs):
+        value = json.loads(prompt)
+        prompts.append(value)
+        if not value["evidence"]:
+            return json.dumps({"request": "x_experiment_report", "experiment_key": "alex-zero-x-v3"})
+        report = value["evidence"][0]["result"]
+        assert report["arms"]["arm_1"]["nominal_reads"] == 29
+        assert report["arms"]["arm_2"]["nominal_reads"] == 30
+        return json.dumps({"status": "answered", "basis": "current",
+                           "answer": "Arm 1 has 29 measured posts; Arm 2 has 30.",
+                           "citations": [report["source"]]})
+
+    monkeypatch.setattr(codex_qa, "ask", ask)
+    result = codex_qa.answer({"question": "Wrap up the alex-zero-x-v3 A/B results"})
+
+    assert result["status"] == "answered"
+    assert result["tools_used"] == ["x_experiment_report"]
+    assert result["citations"] == [prompts[1]["evidence"][0]["result"]["source"]]
+    assert "29 measured posts" in result["answer"]
+
+
 def test_recent_room_context_resolves_subject_but_requires_current_sql(monkeypatch):
     calls = []
     source = "postgresql://commodore-reader/current-observation"
