@@ -14,9 +14,9 @@
 #
 # Rebuild whenever DigitalOcean rotates the DB host.
 
-FROM alpine:3.20
+FROM alpine:3.20.10
 
-RUN apk add --no-cache socat ca-certificates
+RUN apk upgrade --no-cache musl && apk add --no-cache socat ca-certificates
 
 ARG DB_HOST
 ARG DB_PORT=25060

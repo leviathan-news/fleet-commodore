@@ -8,9 +8,9 @@
 # This sidecar runs on commodore-qa-egress (a separate Docker bridge from
 # commodore-egress), set up by bin/setup-commodore-qa-egress-network.sh.
 
-FROM alpine:3.20
+FROM alpine:3.20.10
 
-RUN apk add --no-cache tinyproxy ca-certificates
+RUN apk upgrade --no-cache musl && apk add --no-cache tinyproxy ca-certificates
 
 COPY egress/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
 COPY egress/qa-filter      /etc/tinyproxy/filter

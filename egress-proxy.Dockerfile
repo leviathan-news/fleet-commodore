@@ -12,9 +12,9 @@
 # Lifecycle: one long-running container started by
 # bin/setup-commodore-egress-network.sh, --restart unless-stopped.
 
-FROM alpine:3.20
+FROM alpine:3.20.10
 
-RUN apk add --no-cache tinyproxy ca-certificates
+RUN apk upgrade --no-cache musl && apk add --no-cache tinyproxy ca-certificates
 
 COPY egress/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
 COPY egress/filter         /etc/tinyproxy/filter
